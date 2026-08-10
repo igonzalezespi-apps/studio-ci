@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+# Public repo — private-reference guard.
+#
+# Blocks any reference to a private project before it is committed. The denylist
+# is PRIVATE (it lives only in the maintainer's studio repo), so this guard is a
+# no-op off-studio — on a fork or any machine where ~/work is absent it exits 0
+# and lets the commit through. It carries no private names itself.
+#
+# Armed per clone by bootstrap.sh (`git config core.hooksPath .githooks`); run that after
+# cloning, or set it by hand if you skip the bootstrap.
+set -eu
+
+GUARD="${STUDIO_ROOT:-$HOME/work}/security/check-private-refs.sh"
+if [ -x "$GUARD" ]; then
+  STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+  # Explicit if, not `[ -n ... ] && guard`: that one-liner was the LAST command of the
+  # script, so an empty STAGED (e.g. `git commit --allow-empty`) made the whole hook exit 1
+  # and abort a commit it had nothing to scan. Same latent bug already fixed in the sibling
+  # public repo's pre-push.
+  if [ -n "$STAGED" ]; then
+    "$GUARD" $STAGED
+  fi
+fi

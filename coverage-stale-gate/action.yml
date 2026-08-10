@@ -1,0 +1,62 @@
+name: coverage-stale-gate
+description: >-
+  Stateless throttle for an activity-driven coverage workflow. Queries this repo's own run history
+  for the target coverage workflow on the target branch and reports stale=true when the last
+  qualifying success is older than max-age-days (default 7) or there has never been one. Set `job`
+  to the gated coverage job's display name whenever the gate lives in the same workflow it measures
+  (the standard pattern): a throttled run still completes successfully, so only that job's own
+  conclusion distinguishes a real coverage run from a skipped one. Lets a push-triggered coverage
+  job run at most once per window with no cron and no state file — built for self-hosted desktop
+  runners that are off at night. The calling job needs actions:read.
+
+inputs:
+  workflow:
+    description: "Coverage workflow file name or id (e.g. coverage.yml)."
+    required: true
+  job:
+    description: >-
+      Display name of the job that runs the real coverage (the one gated on stale == 'true').
+      Required in practice when gate and coverage share a workflow: without it, throttled runs
+      (coverage job skipped, run still green) reset the staleness clock on every push and real
+      coverage never goes stale again. When set, staleness is measured from the last run where this
+      job concluded success. A name that never matches is treated as never-run -> always stale
+      (fails open: extra coverage runs, never a silently disabled gate). Empty = run-level success.
+    required: false
+    default: ""
+  branch:
+    description: "Branch whose last successful coverage run we measure."
+    required: false
+    default: develop
+  max-age-days:
+    description: "Run coverage only if the last success is at least this many days old."
+    required: false
+    default: "7"
+  github-token:
+    description: "Token with actions:read (defaults to the job's GITHUB_TOKEN)."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  stale:
+    description: "'true' -> coverage should run; 'false' -> throttled (a recent success exists)."
+    value: ${{ steps.check.outputs.stale }}
+  last-success:
+    description: >-
+      ISO-8601 timestamp of the last qualifying success (run-level, or of `job` when set), or empty
+      if never.
+    value: ${{ steps.check.outputs.last_success }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check staleness
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        WF: ${{ inputs.workflow }}
+        JOB: ${{ inputs.job }}
+        BRANCH: ${{ inputs.branch }}
+        MAX_AGE_DAYS: ${{ inputs.max-age-days }}
+      run: bash "${{ github.action_path }}/check.sh"

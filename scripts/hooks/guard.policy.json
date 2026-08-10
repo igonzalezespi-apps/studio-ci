@@ -1,0 +1,7 @@
+{
+  "agent_may_merge": false,
+  "protected_branch": "main",
+  "integration_branch": "",
+  "generated_trees": [],
+  "egress_allow": ["localhost", "127.0.0.1", "::1"]
+}

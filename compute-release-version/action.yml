@@ -1,0 +1,61 @@
+name: compute-release-version
+description: >-
+  Compute the next semver from the highest semver:* label across PRs merged into develop since the
+  last release tag. Stack-agnostic: it reads PR labels via the API, never touches a manifest. Each
+  in-range PR must carry at least one semver:major|minor|patch|none label (zero labels hard-fails);
+  a PR may carry several (e.g. a grouped bot PR) and the highest wins (major>minor>patch>none), per
+  PR and across the range. No in-range PRs -> bump=none and should-release=false.
+
+inputs:
+  current-version:
+    description: "The current released version, X.Y.Z (e.g. read from the manifest on develop)."
+    required: true
+  base-ref:
+    description: "Last release tag to measure from. Empty = latest tag matching tag-prefix*, or all merged PRs if none."
+    required: false
+    default: ""
+  base-branch:
+    description: "Branch the release PRs merged into. Products are develop→main; trunk→main repos (config) must pass 'main'."
+    required: false
+    default: "develop"
+  tag-prefix:
+    description: "Tag prefix for release tags."
+    required: false
+    default: "v"
+  github-token:
+    description: "Token with contents:read + pull-requests:read (lists merged PRs and tags via the API)."
+    required: true
+
+outputs:
+  bump:
+    description: "major | minor | patch | none."
+    value: ${{ steps.compute.outputs.bump }}
+  next-version:
+    description: "The next X.Y.Z (equals current-version when bump is none)."
+    value: ${{ steps.compute.outputs.next-version }}
+  next-tag:
+    description: "tag-prefix + next-version (e.g. v1.3.0)."
+    value: ${{ steps.compute.outputs.next-tag }}
+  should-release:
+    description: "'true' unless bump is none."
+    value: ${{ steps.compute.outputs.should-release }}
+  pr-numbers:
+    description: "Space-separated PR numbers in the release range."
+    value: ${{ steps.compute.outputs.pr-numbers }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute next version
+      id: compute
+      shell: bash
+      env:
+        CURRENT_VERSION: ${{ inputs.current-version }}
+        BASE_REF: ${{ inputs.base-ref }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        bash "${{ github.action_path }}/compute.sh"

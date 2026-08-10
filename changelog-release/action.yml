@@ -1,0 +1,42 @@
+name: changelog-release
+description: >-
+  Promote a Keep-a-Changelog [Unreleased] section to a versioned heading. It inserts a fresh empty
+  [Unreleased] on top and moves the existing entries under a new ## [X.Y.Z] - YYYY-MM-DD heading, and
+  outputs the moved body as `notes` for gh release --notes. Missing changelog -> no-op with a warning
+  and empty notes (never fails the job).
+
+inputs:
+  version:
+    description: "The version to cut, X.Y.Z."
+    required: true
+  changelog-path:
+    description: "Path to the Keep-a-Changelog file."
+    required: false
+    default: "CHANGELOG.md"
+  date:
+    description: "Release date YYYY-MM-DD. Empty = today (UTC)."
+    required: false
+    default: ""
+  github-token:
+    description: "Unused by the logic; accepted for a uniform call signature with the other release actions."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  notes:
+    description: "The promoted section body (the moved Unreleased entries), for gh release --notes."
+    value: ${{ steps.promote.outputs.notes }}
+
+runs:
+  using: composite
+  steps:
+    - name: Promote Unreleased section
+      id: promote
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        CHANGELOG_PATH: ${{ inputs.changelog-path }}
+        DATE: ${{ inputs.date }}
+      run: |
+        set -euo pipefail
+        bash "${{ github.action_path }}/promote.sh"

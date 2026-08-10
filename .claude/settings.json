@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && scripts/hooks/bash-guard.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "core-dev@ivan": true,
+    "studio-policy@ivan": true
+  },
+  "extraKnownMarketplaces": {
+    "ivan": {
+      "source": {
+        "source": "github",
+        "repo": "igonzalezespi/claude-plugins"
+      }
+    }
+  }
+}

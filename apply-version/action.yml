@@ -1,0 +1,41 @@
+name: apply-version
+description: >-
+  Write a version into a repo's manifests, switching on the stack `kind`. npm-root sets the root
+  package.json; npm-monorepo sets every workspace package.json in lockstep; flutter sets pubspec.yaml
+  to X.Y.Z+N from a committed build-number counter (incrementing it); expo sets both the root
+  package.json and apps/movies/app.config.ts (no build number). Outputs files-changed for git add.
+
+inputs:
+  version:
+    description: "The version to write, X.Y.Z."
+    required: true
+  kind:
+    description: "Stack: npm-root | npm-monorepo | flutter | expo."
+    required: true
+  build-number-file:
+    description: "flutter only: path to the committed build-number counter (absent -> starts at 1)."
+    required: false
+    default: ""
+  github-token:
+    description: "Unused by the logic; accepted for a uniform call signature with the other release actions."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  files-changed:
+    description: "Space-separated list of files written, for the caller to git add."
+    value: ${{ steps.apply.outputs.files-changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Apply version
+      id: apply
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        KIND: ${{ inputs.kind }}
+        BUILD_NUMBER_FILE: ${{ inputs.build-number-file }}
+      run: |
+        set -euo pipefail
+        bash "${{ github.action_path }}/apply.sh"

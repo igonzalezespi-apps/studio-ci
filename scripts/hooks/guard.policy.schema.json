@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/igonzalezespi/claude-plugins/core-dev/guard.policy.schema.json",
+  "title": "bash-guard policy",
+  "description": "Repo-specific parameters for the vendored bash-guard.sh. Everything here is per-repo; the guard core is identical across repos. Strict defaults apply when a key (or the whole file) is absent: an absent policy never weakens the guard.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "agent_may_merge": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the agent may merge a PR whose base is the integration branch. A merge whose base is the protected branch is ALWAYS denied (human-only), regardless of this flag. false → the agent may not merge any PR (e.g. trunk→main repos, where the only base is the protected branch)."
+    },
+    "protected_branch": {
+      "type": "string",
+      "default": "main",
+      "description": "The reviewed/released line. Direct push is forbidden and merging a PR into it is human-only. Universal value 'main' in this fleet."
+    },
+    "integration_branch": {
+      "type": "string",
+      "default": "",
+      "description": "The live integration branch a merge may target when agent_may_merge is true (e.g. 'develop' for the products). Empty for trunk→main repos."
+    },
+    "generated_trees": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "description": "Paths of auto-generated trees that must not be hand-edited (e.g. a Prisma output dir). Empty → all generated-tree checks are skipped (short-circuit: an empty tree must never match every write)."
+    },
+    "generated_regen_hint": {
+      "type": "string",
+      "default": "",
+      "description": "The command/instruction to regenerate the tree, shown in the deny message (e.g. 'edit schema.prisma and run pnpm build')."
+    },
+    "egress_allow": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["localhost", "127.0.0.1", "::1"],
+      "description": "Hosts curl/wget may reach. Universal policy: network egress is restricted to this allow-list in every repo. Extend per-repo only with a ratified reason."
+    },
+    "set_phase_cmd": {
+      "type": "string",
+      "default": "",
+      "description": "How sdd-gate.sh names the sanctioned phase mutator in its deny messages. Absent → it names the core-dev plugin's scripts/opsx/set-phase.sh, which is the right answer for a repo on the plugin-only engine. Set it only where the repo still vendors its own mutator and the deny must point somewhere else."
+    },
+    "pr_score": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Thresholds for the pr-score gate (scripts/gate.py). Absent → strict defaults (total_min 22, axis_min 4). Merge permission is NOT here — it is agent_may_merge above, which the gate also honors (false → a passing score still escalates to the human).",
+      "properties": {
+        "total_min": {
+          "type": "integer",
+          "default": 22,
+          "description": "Minimum sum across the 5 axes (each 1-5, max 25) for an auto-merge verdict."
+        },
+        "axis_min": {
+          "type": "integer",
+          "default": 4,
+          "description": "Minimum score every single axis must reach for an auto-merge verdict."
+        }
+      }
+    }
+  }
+}

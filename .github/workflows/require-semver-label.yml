@@ -1,0 +1,62 @@
+# Adaptado del workflow homólogo de los productos, con DOS cambios que no son cosméticos:
+#
+#  1. `branches: [main]`, no `[develop]`. Este repo es trunk→main y no tiene `develop`, así que
+#     copiarlo tal cual daría un workflow que no se dispara NUNCA — verde permanente por no
+#     ejecutarse jamás, que es la peor forma de estar verde.
+#
+#  2. `runs-on: ubuntu-latest` fijo, NUNCA `vars.RUNNER_TARGET`. Este repo se gobierna como
+#     público, y apuntar `runs-on` a una máquina propia del estudio desde un repo público es una
+#     brecha, no una preferencia de facturación: una PR desde un fork ejecuta el workflow DEL
+#     FORK, o sea código de un tercero, en esa máquina. `security/check-no-selfhosted.sh` lo
+#     audita cada semana — y busca el literal, así que este comentario lo evita a propósito:
+#     el guard prefiere un falso positivo a un patrón debilitado, y lleva escrito desde su
+#     creación que la respuesta correcta es reescribir la prosa, no relajar la búsqueda.
+
+name: Require semver label
+
+# Toda PR a `main` debe llevar al menos una etiqueta semver:* — la más alta
+# (major>minor>patch>none) decide el salto de versión del siguiente release.
+#
+# Esto es un AVISO, no una barrera: no hay branch protection en ningún repo de la flota (decisión
+# explícita), así que un rojo aquí no impide mergear. El respaldo real es el fallo EN DURO de
+# `compute-release-version`, que se niega a cortar un release si alguna PR del rango no lleva
+# etiqueta. Este workflow existe para que eso se sepa al abrir la PR y no meses después, cuando
+# el release se muere y hay que retroetiquetar a mano — que es exactamente lo que hubo que hacer
+# el 2026-08-09 con 62 PRs ya mergeadas.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, labeled, unlabeled, synchronize]
+
+concurrency:
+  group: require-semver-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  require-semver-label:
+    name: require-semver-label
+    runs-on: ubuntu-latest
+    steps:
+      - name: At least one semver:* label
+        shell: bash
+        env:
+          # github.event.pull_request.labels is the live label set for the PR.
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          count="$(printf '%s' "$LABELS_JSON" | node -e '
+            const names = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const semver = names.filter((n) => /^semver:(major|minor|patch|none)$/.test(n));
+            console.log(semver.length);
+          ')"
+          if [ "$count" -ge 1 ]; then
+            echo "OK: ${count} semver:* label(s) present; the highest (major>minor>patch>none) drives the release bump."
+            exit 0
+          fi
+          echo "::error::This PR has no semver:* label; at least one of semver:major|minor|patch|none is required."
+          echo "Add one of: semver:major, semver:minor, semver:patch, semver:none."
+          echo "Use semver:none for changes that do not affect consumers (docs, CI, internal chore)."
+          exit 1

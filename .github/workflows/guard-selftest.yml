@@ -1,0 +1,64 @@
+name: guard-selftest
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  guard:
+    name: vendored bash-guard self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The vendored guard extracts the command and reads its policy via node,
+      # so node must be present for the suite to exercise real verdicts.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: guard table suite
+        run: bash scripts/hooks/bash-guard.test.sh
+
+      - name: liveness — a forbidden push must deny (exit 2)
+        run: |
+          input='{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}'
+          rc=0
+          printf '%s' "$input" | BASH_GUARD_BRANCH=feature/1-x bash scripts/hooks/bash-guard.sh >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ne 2 ]; then
+            echo "FAIL: forbidden 'git push origin main' returned exit $rc (expected 2) — the guard is INERT"
+            exit 1
+          fi
+          echo "OK: forbidden push denied (exit 2), guard fires"
+
+      - name: liveness — a benign command must be allowed (exit 0)
+        run: |
+          input='{"tool_name":"Bash","tool_input":{"command":"git status"}}'
+          rc=0
+          printf '%s' "$input" | BASH_GUARD_BRANCH=feature/1-x bash scripts/hooks/bash-guard.sh >/dev/null 2>&1 || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "FAIL: benign 'git status' returned exit $rc (expected 0)"
+            exit 1
+          fi
+          echo "OK: benign command allowed (exit 0)"
+
+      - name: wiring — guard is cabled as a PreToolUse Bash hook
+        run: |
+          node -e '
+            const fs = require("fs");
+            const s = JSON.parse(fs.readFileSync(".claude/settings.json", "utf8"));
+            const pre = (s.hooks && s.hooks.PreToolUse) || [];
+            const cabled = pre.some(g =>
+              (g.matcher || "").split("|").includes("Bash") &&
+              (g.hooks || []).some(h => typeof h.command === "string" && h.command.includes("bash-guard.sh")));
+            if (!cabled) { console.error("FAIL: bash-guard.sh is not cabled as a PreToolUse Bash hook in .claude/settings.json"); process.exit(1); }
+            console.log("OK: bash-guard.sh cabled as a PreToolUse Bash hook");
+          '

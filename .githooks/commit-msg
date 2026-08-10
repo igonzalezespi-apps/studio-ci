@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+# Public repo — private-reference guard, on the COMMIT MESSAGE itself.
+#
+# The rule "a public repo never names a private project" has always covered commit messages,
+# but until 2026-07-21 the guard only ever ran over FILES: pre-commit scans the staged paths
+# and nothing looked at the message text, so a message naming a private project passed every
+# local gate. Found the hard way, by writing one. This hook closes that gap; $1 is the file
+# git hands us with the message being authored.
+#
+# Same degradation as pre-commit: the denylist is PRIVATE (it lives only in the maintainer's
+# studio repo), so this is a no-op off-studio — on a fork or any machine where ~/work is
+# absent it exits 0 and lets the commit through. It carries no private names itself.
+#
+# Enable it per clone (it is not auto-installed — this repo has no node tooling):
+#   git config core.hooksPath .githooks
+set -eu
+
+GUARD="${STUDIO_ROOT:-$HOME/work}/security/check-private-refs.sh"
+if [ -x "$GUARD" ]; then
+  "$GUARD" "$1"
+fi

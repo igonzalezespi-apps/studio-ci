@@ -1,0 +1,118 @@
+name: detect-changes
+description: >-
+  Classify a PR's changed files into canonical change-class buckets so each downstream job can
+  gate on its class: a docs-only PR runs only doc checks, and e2e/heavy jobs are skipped when no
+  functional code changed. Bi-stack defaults (JS/TS monorepos and Flutter). Wraps dorny/paths-filter.
+  A repo overrides only the path roots that differ via the `filters` input.
+
+inputs:
+  base:
+    description: "Base ref to diff against. Empty = the event's default (PR base / before-sha)."
+    required: false
+    default: ""
+  filters:
+    description: "Optional YAML override of the bucket filters. Empty = the canonical defaults below."
+    required: false
+    default: ""
+
+outputs:
+  docs:
+    description: "Docs / markdown / spec-proposal / agent files only."
+    value: ${{ steps.filter.outputs.docs }}
+  ci:
+    description: "Workflows / Dockerfiles / compose."
+    value: ${{ steps.filter.outputs.ci }}
+  deps:
+    description: "Lockfiles / manifests."
+    value: ${{ steps.filter.outputs.deps }}
+  code:
+    description: "Functional source."
+    value: ${{ steps.filter.outputs.code }}
+  e2e_relevant:
+    description: "User-facing / runtime surfaces (gate e2e)."
+    value: ${{ steps.filter.outputs.e2e_relevant }}
+  db_migration:
+    description: "DB schema / migrations (escalates to a human)."
+    value: ${{ steps.filter.outputs.db_migration }}
+  i18n:
+    description: "Locale catalogs."
+    value: ${{ steps.filter.outputs.i18n }}
+  assets:
+    description: "Bundled human-authored assets."
+    value: ${{ steps.filter.outputs.assets }}
+  functional:
+    description: "true when any non-(docs|ci-only) bucket matched → run the full suite."
+    value: ${{ steps.functional.outputs.value }}
+
+runs:
+  using: composite
+  steps:
+    - name: Write default filters
+      id: defaults
+      shell: bash
+      run: |
+        cat > "$RUNNER_TEMP/detect-filters.yml" <<'YML'
+        docs:
+          - '**/*.md'
+          - 'docs/**'
+          - 'openspec/changes/*/proposal.md'
+          - '.claude/**'
+        ci:
+          - '.github/**'
+          - 'Dockerfile*'
+          - 'docker-compose*'
+        deps:
+          - '**/pnpm-lock.yaml'
+          - '**/package.json'
+          - 'pubspec.yaml'
+          - 'pubspec.lock'
+        code:
+          - 'apps/**'
+          - 'packages/**'
+          - 'src/**'
+          - 'lib/**'
+        e2e_relevant:
+          - 'apps/**/app/**'
+          - 'apps/**/src/**'
+          - 'lib/features/**'
+        db_migration:
+          - '**/prisma/migrations/**'
+          - '**/schema.prisma'
+          - '**/database/**'
+        i18n:
+          - '**/locales/**'
+          - '**/i18n/**'
+          - '**/*.arb'
+        assets:
+          - 'assets/**'
+        YML
+        echo "file=$RUNNER_TEMP/detect-filters.yml" >> "$GITHUB_OUTPUT"
+
+    - name: Detect
+      id: filter
+      uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+      with:
+        base: ${{ inputs.base }}
+        # A caller override is passed inline; otherwise the default-filters file.
+        filters: ${{ inputs.filters != '' && inputs.filters || steps.defaults.outputs.file }}
+
+    - name: Compute "functional"
+      id: functional
+      shell: bash
+      run: |
+        # functional = anything but a pure docs change. A CI/deps change is included on
+        # purpose (fail-safe: it can break the build, so run the full suite).
+        f=false
+        for b in code deps ci e2e_relevant db_migration i18n assets; do
+          case "$b" in
+            code)         v='${{ steps.filter.outputs.code }}' ;;
+            deps)         v='${{ steps.filter.outputs.deps }}' ;;
+            ci)           v='${{ steps.filter.outputs.ci }}' ;;
+            e2e_relevant) v='${{ steps.filter.outputs.e2e_relevant }}' ;;
+            db_migration) v='${{ steps.filter.outputs.db_migration }}' ;;
+            i18n)         v='${{ steps.filter.outputs.i18n }}' ;;
+            assets)       v='${{ steps.filter.outputs.assets }}' ;;
+          esac
+          [ "$v" = "true" ] && f=true
+        done
+        echo "value=$f" >> "$GITHUB_OUTPUT"

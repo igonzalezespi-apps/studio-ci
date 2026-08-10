@@ -1,0 +1,47 @@
+#!/usr/bin/env sh
+# PUBLIC repo: last local gate before anything reaches the remote.
+#
+# pre-commit and commit-msg already scan the staged files and the message being written, but
+# both are skippable with --no-verify and neither exists for commits authored before they were
+# added. A commit only becomes public when it is PUSHED, so this is the gate that actually
+# decides what the world sees — and it is the one that was missing.
+#
+# It was missing when it mattered: a commit whose MESSAGE named private projects sat on this
+# repo family's default branch from 2026-06-09, past every other control, because nothing
+# scanned messages on the way out.
+#
+# Scans two surfaces of the outgoing commits: the files they change, and their messages.
+# The denylist is private (studio repo only); this is a no-op off-studio, e.g. on a fork.
+#
+# Enable per clone via bootstrap.sh (git config core.hooksPath .githooks).
+set -eu
+
+GUARD="${STUDIO_ROOT:-$HOME/work}/security/check-private-refs.sh"
+[ -x "$GUARD" ] || exit 0
+
+git fetch origin main --quiet 2>/dev/null || true
+# No upstream yet (fresh repo / detached): nothing to compare against, so nothing to gate.
+git rev-parse --verify --quiet origin/main >/dev/null 2>&1 || exit 0
+
+RANGE="origin/main..HEAD"
+
+# 1. Files touched by the outgoing commits.
+CHANGED=$(git diff --name-only --diff-filter=ACM "origin/main...HEAD" 2>/dev/null || true)
+if [ -n "$CHANGED" ]; then
+  # shellcheck disable=SC2086 # deliberate word splitting: one path per argument
+  "$GUARD" $CHANGED
+fi
+
+# 2. Messages of the outgoing commits. Written to a file because the guard takes paths.
+MSGS=$(git log --format='%B' "$RANGE" 2>/dev/null || true)
+if [ -n "$MSGS" ]; then
+  MSGDIR=$(mktemp -d) || exit 1
+  printf '%s\n' "$MSGS" > "$MSGDIR/outgoing-commit-messages.txt"
+  if ! "$GUARD" "$MSGDIR"; then
+    echo "^ the hit above is in a COMMIT MESSAGE, not in a file." >&2
+    echo "  Reword it with 'git rebase -i' or 'git commit --amend' — a message is published as widely as the code." >&2
+    rm -rf "$MSGDIR"
+    exit 1
+  fi
+  rm -rf "$MSGDIR"
+fi

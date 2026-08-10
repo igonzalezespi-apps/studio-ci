@@ -1,0 +1,34 @@
+name: ci-gate
+description: >-
+  Single aggregate gate for a workflow's jobs. Call it from a final job that needs every other
+  job and runs if-always, passing toJSON(needs) as the needs-json input. Fails iff any job ended
+  in failure or cancelled; skipped and success both pass — so path/label-gated jobs that were
+  skipped never wedge the one required check. One canonical implementation for every project.
+
+inputs:
+  needs-json:
+    description: "The gate job's toJSON(needs) (every other job listed in its needs)."
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve gate
+      shell: bash
+      env:
+        NEEDS_JSON: ${{ inputs.needs-json }}
+      run: |
+        printf '%s' "$NEEDS_JSON" | node -e '
+          const needs = JSON.parse(require("fs").readFileSync(0, "utf8") || "{}");
+          const entries = Object.entries(needs);
+          const all = entries.map(([k, v]) => k + "=" + (v && v.result)).join(", ");
+          const bad = entries
+            .filter(([, v]) => v && (v.result === "failure" || v.result === "cancelled"))
+            .map(([k, v]) => k + "=" + v.result);
+          if (bad.length) {
+            console.error("❌ ci-gate: a required job did not pass → " + bad.join(", "));
+            console.error("   (all results: " + all + ")");
+            process.exit(1);
+          }
+          console.log("✅ ci-gate: all jobs passed or were skipped (" + all + ")");
+        '
