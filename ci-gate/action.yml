@@ -17,18 +17,43 @@ runs:
       shell: bash
       env:
         NEEDS_JSON: ${{ inputs.needs-json }}
+      # jq, NOT `node -e`, and the difference is not stylistic.
+      #
+      # A composite action runs on WHATEVER runner its caller uses, and it cannot declare a
+      # toolchain — there is no `runs.using: node20` for composite steps, and nothing here can
+      # make the caller add `actions/setup-node`. So every binary this step names is an
+      # undeclared requirement placed on every consumer.
+      #
+      # `node` looked free because GitHub-hosted runners ship it preinstalled. Self-hosted
+      # runners ship whatever their operator put there, and a sensible operator does NOT install
+      # a system-wide Node precisely so each repo pins its own via setup-node. Measured
+      # 2026-08-10, first real run of a consumer on its own runner:
+      #
+      #     line 1: node: command not found
+      #     ##[error]Process completed with exit code 127
+      #
+      # …and it failed in the AGGREGATE gate, i.e. the one check meant to summarise all the
+      # others. Every other job had already passed.
+      #
+      # jq is the right dependency for the job — this step only reads a JSON object — and it is
+      # present on hosted runners and on any box that can run a runner at all.
+      #
+      # The empty-input default is written on two lines on purpose: `${NEEDS_JSON:-{}}` makes the
+      # closing brace ambiguous to the shell parser, and the original tolerated an empty string
+      # (`readFileSync(0) || "{}"`). Losing that would turn "no needs" into a crash.
       run: |
-        printf '%s' "$NEEDS_JSON" | node -e '
-          const needs = JSON.parse(require("fs").readFileSync(0, "utf8") || "{}");
-          const entries = Object.entries(needs);
-          const all = entries.map(([k, v]) => k + "=" + (v && v.result)).join(", ");
-          const bad = entries
-            .filter(([, v]) => v && (v.result === "failure" || v.result === "cancelled"))
-            .map(([k, v]) => k + "=" + v.result);
-          if (bad.length) {
-            console.error("❌ ci-gate: a required job did not pass → " + bad.join(", "));
-            console.error("   (all results: " + all + ")");
-            process.exit(1);
-          }
-          console.log("✅ ci-gate: all jobs passed or were skipped (" + all + ")");
-        '
+        set -euo pipefail
+        json="${NEEDS_JSON:-}"
+        [ -n "$json" ] || json='{}'
+        all="$(printf '%s' "$json" \
+          | jq -r 'to_entries | map("\(.key)=\(.value.result)") | join(", ")')"
+        bad="$(printf '%s' "$json" \
+          | jq -r '[to_entries[]
+                    | select(.value.result == "failure" or .value.result == "cancelled")
+                    | "\(.key)=\(.value.result)"] | join(", ")')"
+        if [ -n "$bad" ]; then
+          echo "❌ ci-gate: a required job did not pass → $bad" >&2
+          echo "   (all results: $all)" >&2
+          exit 1
+        fi
+        echo "✅ ci-gate: all jobs passed or were skipped ($all)"
