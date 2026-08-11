@@ -3,7 +3,7 @@
 Shared, reusable **composite GitHub Actions** for the maintainer's CI: `apply-version`,
 `changelog-release`, `ci-gate`, `compute-release-version`, `coverage-stale-gate`,
 `detect-changes`. Public (MIT). Consumed by the maintainer's other repos via
-`uses: igonzalezespi/studio-ci/<action>@<ref>`.
+`uses: igonzalezespi-apps/studio-ci/<action>@<ref>`.
 
 ## Rules
 
