@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>igonzalezespi/renovate-config"],
+  "extends": ["github>igonzalezespi-apps/renovate-config"],
   "baseBranchPatterns": ["main"],
   "platformAutomerge": false,
   "packageRules": [

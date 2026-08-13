@@ -20,7 +20,7 @@
     "ivan": {
       "source": {
         "source": "github",
-        "repo": "igonzalezespi/claude-plugins"
+        "repo": "igonzalezespi-apps/claude-plugins"
       }
     }
   }
