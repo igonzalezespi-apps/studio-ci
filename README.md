@@ -2,8 +2,8 @@
 
 Shared CI building blocks for the [igonzalezespi](https://github.com/igonzalezespi) studio,
 consumed by **pinned git reference** the same way as
-[`@studio/eslint-config`](https://github.com/igonzalezespi/eslint-config) and
-[`@studio/tsconfig`](https://github.com/igonzalezespi/tsconfig) — so every project's CI shares one
+[`@studio/eslint-config`](https://github.com/igonzalezespi-apps/eslint-config) and
+[`@studio/tsconfig`](https://github.com/igonzalezespi-apps/tsconfig) — so every project's CI shares one
 source of truth instead of drifting per-repo copies.
 
 Public because the logic isn't secret (no tokens, IPs, or anything sensitive), and a public
@@ -26,7 +26,7 @@ jobs:
     needs: [lint, typecheck, test, build] # list EVERY job
     runs-on: ubuntu-latest
     steps:
-      - uses: igonzalezespi/studio-ci/ci-gate@v0.1.2
+      - uses: igonzalezespi-apps/studio-ci/ci-gate@v0.1.2
         with:
           needs-json: ${{ toJSON(needs) }}
 ```
@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: d
-        uses: igonzalezespi/studio-ci/detect-changes@v0.1.2
+        uses: igonzalezespi-apps/studio-ci/detect-changes@v0.1.2
 
   e2e:
     needs: changes
@@ -73,7 +73,7 @@ as functional on purpose (fail-safe: a workflow or lockfile change can break the
 full suite). Override the defaults:
 
 ```yaml
-      - uses: igonzalezespi/studio-ci/detect-changes@v0.1.2
+      - uses: igonzalezespi-apps/studio-ci/detect-changes@v0.1.2
         with:
           filters: |
             e2e_relevant:
@@ -111,7 +111,7 @@ jobs:
       stale: ${{ steps.gate.outputs.stale }}
     steps:
       - id: gate
-        uses: igonzalezespi/studio-ci/coverage-stale-gate@v0.3.2
+        uses: igonzalezespi-apps/studio-ci/coverage-stale-gate@v0.3.2
         with:
           workflow: coverage.yml   # this file
           job: coverage            # display name of the gated job below
@@ -174,7 +174,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: v
-        uses: igonzalezespi/studio-ci/compute-release-version@v0.3.0
+        uses: igonzalezespi-apps/studio-ci/compute-release-version@v0.3.0
         with:
           current-version: ${{ steps.read.outputs.version }}  # however you read the manifest
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -198,7 +198,7 @@ Output: `notes` — the promoted section body (multiline-safe).
 
 ```yaml
       - id: cl
-        uses: igonzalezespi/studio-ci/changelog-release@v0.3.0
+        uses: igonzalezespi-apps/studio-ci/changelog-release@v0.3.0
         with:
           version: ${{ needs.version.outputs.next }}
       # ... commit the changelog, then:
@@ -229,7 +229,7 @@ Output: `files-changed` — space-separated list of files written, for `git add`
 
 ```yaml
       - id: apply
-        uses: igonzalezespi/studio-ci/apply-version@v0.3.0
+        uses: igonzalezespi-apps/studio-ci/apply-version@v0.3.0
         with:
           version: ${{ needs.version.outputs.next }}
           kind: flutter
