@@ -1,25 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>igonzalezespi-apps/renovate-config"],
-  "baseBranchPatterns": ["main"],
-  "platformAutomerge": false,
-  "packageRules": [
-    {
-      "description": "Everything defaults to human review.",
-      "matchPackageNames": ["*"],
-      "automerge": false
-    },
-    {
-      "description": "Scoped automerge (decision 2026-08-01): devDependencies patch/minor merge themselves once checks are green. Majors stay human.",
-      "matchDepTypes": ["devDependencies"],
-      "matchUpdateTypes": ["patch", "minor"],
-      "automerge": true
-    },
-    {
-      "description": "Scoped automerge (decision 2026-08-01): github-actions patch/minor/digest updates.",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["patch", "minor", "digest", "pinDigest"],
-      "automerge": true
-    }
+  "extends": [
+    "github>igonzalezespi-apps/renovate-config:config-repo"
   ]
 }
