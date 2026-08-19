@@ -29,10 +29,11 @@ case "$1" in
     echo ""
     ;;
   pr)
-    # One merged PR carrying semver:minor. If the base filter is wrong, the real
-    # gh would return nothing — so the stub returns this ONLY for the expected base.
+    # One merged PR carrying STUB_LABEL (semver:minor unless a test says otherwise). If the base
+    # filter is wrong, the real gh would return nothing — so the stub returns this ONLY for the
+    # expected base.
     if printf '%s' "$*" | grep -q -- "--base $EXPECT_BASE"; then
-      echo '[{"number":1,"labels":[{"name":"semver:minor"}],"mergedAt":"2026-07-01T00:00:00Z","title":"feat: x"}]'
+      printf '[{"number":1,"labels":[{"name":"%s"}],"mergedAt":"2026-07-01T00:00:00Z","title":"chore(deps): x"}]\n' "${STUB_LABEL:-semver:minor}"
     else
       echo '[]'
     fi
@@ -89,6 +90,66 @@ if grep -q '^bump=none' <<<"$out" && grep -q '^should-release=false' <<<"$out"; 
   ok "base equivocada => none/false, y en silencio (el fallo original)"
 else
   bad "base equivocada => none/false" "$(tr '\n' ' ' <<<"$out")"
+fi
+
+echo
+echo "compute-release-version · techo del major"
+
+# run_major <current-version> <allow-major|""> -> imprime GITHUB_OUTPUT, deja el stderr en $TMP/err
+run_major() {
+  export GH_CALLS="$TMP/calls.txt"; : >"$GH_CALLS"
+  export EXPECT_BASE=develop
+  export STUB_LABEL=semver:major
+  local out="$TMP/output.txt"; : >"$out"
+  env PATH="$TMP/bin:$PATH" \
+      CURRENT_VERSION="$1" \
+      GITHUB_REPOSITORY=owner/repo \
+      GITHUB_OUTPUT="$out" \
+      GH_TOKEN=stub \
+      ${2:+ALLOW_MAJOR="$2"} \
+      bash "$HERE/compute.sh" >/dev/null 2>"$TMP/err"
+  unset STUB_LABEL
+  cat "$out"
+}
+
+# 5 · el caso que costó un 1.0.0: una PR de Renovate con semver:major, y por defecto
+#     el producto NO salta de major. 0.2.0 -> 0.3.0, nunca 1.0.0.
+out="$(run_major 0.2.0 "")"
+if grep -q '^bump=minor' <<<"$out" && grep -q '^next-version=0.3.0' <<<"$out"; then
+  ok "por defecto semver:major se capa a minor (0.2.0 -> 0.3.0, no 1.0.0)"
+else
+  bad "por defecto semver:major se capa" "$(tr '\n' ' ' <<<"$out")"
+fi
+
+# 6 · y lo capado se DICE, no se traga: quien pidió el major sigue visible en la salida.
+if grep -q '^bump-requested=major' <<<"$out" && grep -q '^major-capped=true' <<<"$out"; then
+  ok "el cap se declara (bump-requested=major, major-capped=true)"
+else
+  bad "el cap se declara" "$(tr '\n' ' ' <<<"$out")"
+fi
+
+# 7 · y el log nombra la PR concreta. Un cap silencioso es como se coló el primero.
+if grep -q 'MAJOR CAPPED' "$TMP/err" && grep -q '#1' "$TMP/err"; then
+  ok "el log avisa y nombra la PR que pidió el major"
+else
+  bad "el log avisa y nombra la PR" "$(tr '\n' ' ' <"$TMP/err")"
+fi
+
+# 8 · el contraste que hace válido al test 5: con el mismo input y allow-major=true,
+#     SÍ sale major. Si esto no cambiara, el test 5 estaría pasando por otra razón.
+out="$(run_major 0.2.0 true)"
+if grep -q '^bump=major' <<<"$out" && grep -q '^next-version=1.0.0' <<<"$out" && grep -q '^major-capped=false' <<<"$out"; then
+  ok "con allow-major=true el major pasa (0.2.0 -> 1.0.0), así que el cap es lo que decide"
+else
+  bad "con allow-major=true el major pasa" "$(tr '\n' ' ' <<<"$out")"
+fi
+
+# 9 · el cap NO toca nada por debajo de major: un minor sigue siendo minor.
+out="$(run_compute develop)"
+if grep -q '^bump=minor' <<<"$out" && grep -q '^major-capped=false' <<<"$out"; then
+  ok "el cap no toca los bumps por debajo de major"
+else
+  bad "el cap no toca los bumps por debajo de major" "$(tr '\n' ' ' <<<"$out")"
 fi
 
 printf '\n%s pasan, %s fallan\n' "$PASS" "$FAIL"

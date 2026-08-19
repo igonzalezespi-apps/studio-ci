@@ -6,11 +6,12 @@
 #   BASE_REF         last release tag, or "" → auto-detect latest tag matching TAG_PREFIX*
 #   BASE_BRANCH      branch the release PRs merged into (default "develop")
 #   TAG_PREFIX       tag prefix (default "v")
+#   ALLOW_MAJOR      "true" lets a semver:major label bump the MAJOR (default "false" → cap at minor)
 #   GH_TOKEN         token for gh (required)
 #   GITHUB_REPOSITORY  owner/repo (provided by Actions)
 #   GITHUB_OUTPUT      output file (provided by Actions)
 #
-# Emits: bump, next-version, next-tag, should-release, pr-numbers.
+# Emits: bump, bump-requested, major-capped, next-version, next-tag, should-release, pr-numbers.
 set -euo pipefail
 
 : "${CURRENT_VERSION:?CURRENT_VERSION is required}"
@@ -21,6 +22,14 @@ TAG_PREFIX="${TAG_PREFIX:-v}"
 # It is an INPUT because trunk→main repos have no develop at all, and there the
 # hardcoded value made this action silently unusable — see the note below.
 BASE_BRANCH="${BASE_BRANCH:-develop}"
+# Default "false" ON PURPOSE, and it is the whole point of this knob: a dependency's major is not
+# the product's major. Renovate labels every major dependency bump `semver:major` (correctly — it
+# describes the DEPENDENCY), and this action folds the highest label in range into the PRODUCT's
+# version. With nothing in between, one `actions/setup-node@v6→v7` cut a 1.0.0 on a product whose
+# owner had decided the day before that 1.0 was reserved for the first working MVP. Capping at
+# minor keeps a pre-1.0 product inside 0.x no matter what the bots merge, because 0.x can never
+# reach 1.0.0 by minor bumps — so reaching 1.0.0 becomes an explicit act instead of an accident.
+ALLOW_MAJOR="${ALLOW_MAJOR:-false}"
 
 # --- validate current version is X.Y.Z -------------------------------------
 if [[ ! "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -147,6 +156,7 @@ parsed=$(CUTOFF="$cutoff" node -e '
 # and across the range. Only ZERO labels is an error (a mislabeled PR).
 best="none"
 pr_numbers=""
+major_prs=""
 had_pr=false
 
 if [ -n "$parsed" ]; then
@@ -161,6 +171,9 @@ if [ -n "$parsed" ]; then
     pr_numbers="${pr_numbers:+$pr_numbers }$num"
     # take this PR's highest-ranked label, then fold into the range best.
     for lbl in $labels; do
+      if [ "$lbl" = "major" ]; then
+        major_prs="${major_prs:+$major_prs }#$num"
+      fi
       if [ "$(rank "$lbl")" -gt "$(rank "$best")" ]; then
         best="$lbl"
       fi
@@ -173,7 +186,23 @@ if [ "$had_pr" != true ]; then
   best="none"
 fi
 
+bump_requested="$best"
+
+# --- the major cap ----------------------------------------------------------
+# Deliberately AFTER the fold and never before it: `bump-requested` must keep saying what the
+# labels actually asked for, so the log can name the PRs instead of silently swallowing them. A
+# cap that hides what it capped is how this went unnoticed the first time.
+major_capped=false
 bump="$best"
+if [ "$bump" = "major" ] && [ "$ALLOW_MAJOR" != "true" ]; then
+  bump="minor"
+  major_capped=true
+  echo "compute-release-version: MAJOR CAPPED -> minor (allow-major=$ALLOW_MAJOR)" >&2
+  echo "  asked for major: ${major_prs:-<unknown>}" >&2
+  echo "  A dependency's major is not the product's major. To cut a real major, set" >&2
+  echo "  allow-major: true on this repo's release job, deliberately, for that release." >&2
+fi
+
 next_version=$(apply_bump "$CURRENT_VERSION" "$bump")
 next_tag="${TAG_PREFIX}${next_version}"
 
@@ -184,10 +213,12 @@ else
 fi
 
 emit "bump"           "$bump"
+emit "bump-requested" "$bump_requested"
+emit "major-capped"   "$major_capped"
 emit "next-version"   "$next_version"
 emit "next-tag"       "$next_tag"
 emit "should-release" "$should_release"
 emit "pr-numbers"     "$pr_numbers"
 
 echo "compute-release-version: range base='${base_tag:-<none>}' cutoff='${cutoff:-<none>}'"
-echo "compute-release-version: in-range PRs='${pr_numbers:-<none>}' bump=$bump $CURRENT_VERSION -> $next_version (tag $next_tag, should-release=$should_release)"
+echo "compute-release-version: in-range PRs='${pr_numbers:-<none>}' bump=$bump (requested=$bump_requested, major-capped=$major_capped) $CURRENT_VERSION -> $next_version (tag $next_tag, should-release=$should_release)"

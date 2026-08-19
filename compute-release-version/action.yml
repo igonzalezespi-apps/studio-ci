@@ -22,14 +22,31 @@ inputs:
     description: "Tag prefix for release tags."
     required: false
     default: "v"
+  allow-major:
+    description: >-
+      Whether a `semver:major` label in range may bump the MAJOR. Default "false": the bump is
+      capped at `minor` and the PRs that asked for major are named in the log. A dependency's
+      major is not the product's major — every repo here is pre-1.0, and leaving this open is
+      what cut a 1.0.0 nobody asked for. Set it to "true" in the one repo, on the one release,
+      where the major is a deliberate act.
+    required: false
+    default: "false"
   github-token:
     description: "Token with contents:read + pull-requests:read (lists merged PRs and tags via the API)."
     required: true
 
 outputs:
   bump:
-    description: "major | minor | patch | none."
+    description: "major | minor | patch | none — AFTER the allow-major cap."
     value: ${{ steps.compute.outputs.bump }}
+  bump-requested:
+    description: >-
+      The bump the labels asked for, BEFORE the cap. Differs from `bump` only when allow-major is
+      false and something in range carried `semver:major`.
+    value: ${{ steps.compute.outputs.bump-requested }}
+  major-capped:
+    description: "'true' when the cap actually changed the outcome."
+    value: ${{ steps.compute.outputs.major-capped }}
   next-version:
     description: "The next X.Y.Z (equals current-version when bump is none)."
     value: ${{ steps.compute.outputs.next-version }}
@@ -54,6 +71,7 @@ runs:
         BASE_REF: ${{ inputs.base-ref }}
         BASE_BRANCH: ${{ inputs.base-branch }}
         TAG_PREFIX: ${{ inputs.tag-prefix }}
+        ALLOW_MAJOR: ${{ inputs.allow-major }}
         GH_TOKEN: ${{ inputs.github-token }}
         GITHUB_REPOSITORY: ${{ github.repository }}
       run: |
