@@ -150,16 +150,26 @@ mislabeled PR can never silently miscount a bump). A PR may carry several (e.g. 
 auto-labeled `semver:minor` + `semver:patch`); the highest wins (`major>minor>patch>none`), per PR and
 across the range. No in-range PRs → `bump=none`, `should-release=false`, version unchanged.
 
+**The MAJOR is capped by default.** A dependency's major is not the product's major: bots label a
+major dependency bump `semver:major` (correctly — it describes the *dependency*), and folding that
+into the *product* version is how a repo cuts a `1.0.0` nobody asked for. So with `allow-major` at
+its default `false`, a `major` in range is capped to `minor`, `major-capped` goes `true`, and the log
+names the PRs that asked for it. A pre-1.0 project stays inside `0.x` no matter what the bots merge,
+because `0.x` never reaches `1.0.0` by minor bumps — cutting a real major becomes a deliberate act.
+
 | input | required | default | description |
 |---|---|---|---|
 | `current-version` | yes | — | current released version, `X.Y.Z` (e.g. read from the manifest on `develop`) |
 | `base-ref` | no | `""` | last release tag to measure from; empty = latest tag matching `tag-prefix*`, or all merged PRs if none |
+| `base-branch` | no | `develop` | branch the release PRs merged into; trunk→main repos MUST pass `main` |
 | `tag-prefix` | no | `v` | tag prefix for release tags |
+| `allow-major` | no | `false` | `true` lets a `semver:major` label bump the MAJOR; default caps it at `minor` |
 | `github-token` | yes | — | token with `contents:read` + `pull-requests:read` |
 
-Outputs: `bump` (`major|minor|patch|none`), `next-version` (`X.Y.Z`; equals current when `none`),
-`next-tag` (`tag-prefix`+`next-version`), `should-release` (`true` unless `bump==none`), `pr-numbers`
-(space-separated).
+Outputs: `bump` (`major|minor|patch|none`, **after** the cap), `bump-requested` (what the labels asked
+for, before the cap), `major-capped` (`true` when the cap changed the outcome), `next-version` (`X.Y.Z`;
+equals current when `none`), `next-tag` (`tag-prefix`+`next-version`), `should-release` (`true` unless
+`bump==none`), `pr-numbers` (space-separated).
 
 ```yaml
 jobs:
