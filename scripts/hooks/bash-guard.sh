@@ -357,6 +357,27 @@ check_gh() {
     check_pr_merge "$merge_arg"
   fi
 
+  # `gh pr create` without a label. The label is what the release gate reads, and putting it in a
+  # SECOND command run afterwards is how it goes missing: measured 2026-08-14, five of ~20 PRs
+  # opened in one session shipped unlabelled, each one red on its repo's require-semver-label gate.
+  #
+  # This denies the shape that loses the label, not the tool: `gh pr create --label X` passes
+  # straight through. `pr-create.sh` is the comfortable path — it also checks the label EXISTS
+  # (gh accepts a non-existent one, warns on stdout and still exits 0) and re-reads the PR
+  # afterwards to prove it stuck.
+  if [ "$sub1" = "pr" ] && [ "$sub2" = "create" ]; then
+    local has_label=0
+    for a in "${tok[@]:1}"; do
+      case "$a" in
+        --label | --label=* | -l) has_label=1 ;;
+      esac
+    done
+    if [ "$has_label" -eq 0 ]; then
+      deny "gh pr create without --label leaves the release gate's label to a second command, which is how it gets forgotten" \
+        "pass it here (gh pr create --label semver:<x> ...) or use core-dev's pr-create.sh, which also verifies the label actually landed"
+    fi
+  fi
+
   # Raw API merges are never the sanctioned path (pr-score uses `gh pr merge`),
   # so they are denied regardless of agent_may_merge.
   if [ "$sub1" = "api" ]; then

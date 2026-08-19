@@ -154,7 +154,12 @@ CASES=(
   'allow|git fetch origin && git rebase origin/main'
   'allow|git merge origin/main'
   'allow|gh pr view 123'
-  'allow|gh pr create --title "t" --body "b"'
+  # `gh pr create` WITH its label passes straight through; without it, denied. El par importa: sin
+  # las dos mitades, "no denegó" no se distingue de una regla que dejó de mirar.
+  'allow|gh pr create --title "t" --body "b" --label semver:patch'
+  'allow|gh pr create --title "t" --body "b" --label=semver:none'
+  'deny|gh pr create --title "t" --body "b"'
+  'deny|gh pr create --repo o/r --base main --title "fix(x): y" --body-file b.md'
   'allow|gh api repos/owner/repo/pulls/123'
   'allow|cat .env.example'
   'allow|cat apps/api/.env.example'
