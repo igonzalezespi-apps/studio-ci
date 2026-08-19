@@ -160,6 +160,18 @@ CASES=(
   'allow|gh pr create --title "t" --body "b" --label=semver:none'
   'deny|gh pr create --title "t" --body "b"'
   'deny|gh pr create --repo o/r --base main --title "fix(x): y" --body-file b.md'
+  # El caso que faltaba, y por eso el fallo salio a produccion: la pareja de arriba tenia
+  # parentesis en el titulo SOLO en la variante sin label, asi que pasaba por la razon
+  # equivocada. Un titulo Conventional Commits lleva parentesis SIEMPRE, y el troceo por
+  # `(` los partia: el segmento con `pr create` se quedaba sin ver el `--label` posterior.
+  # Medido 2026-08-19: cuatro sesiones independientes chocaron con esto el mismo dia.
+  'allow|gh pr create --title "chore(guard): sincronizar el guard" --label semver:patch'
+  'allow|gh pr create --repo o/r --base main --title "feat(release): x" --body-file b.md --label semver:minor'
+  'deny|gh pr create --title "chore(guard): sin etiqueta" --body "b"'
+  # Y la cobertura NO se cambia por comodidad: lo entrecomillado se sigue analizando,
+  # porque `bash -c "..."` se ejecuta de verdad. Antes de este arreglo esto NO se denegaba:
+  # el troceo partia la cadena en trozos que ya no parecian un `git push --force`.
+  'deny|bash -c "git push --force origin main"'
   'allow|gh api repos/owner/repo/pulls/123'
   'allow|cat .env.example'
   'allow|cat apps/api/.env.example'

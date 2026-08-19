@@ -25,6 +25,20 @@ jobs:
         with:
           node-version: "24"
 
+      - name: bash-guard self-test (all cases pass, suite never shrinks)
+        # Este repo VENDORIZA el guard y hasta ahora no corria su suite: solo comprobaba disparo y
+        # cableado. Un guard que se rompe no da error, deja de denegar — y eso el disparo puntual no
+        # lo ve. El total NO va clavado: la asercion `grep -q 'OK: 100/100'` de los repos hermanos se
+        # ponia roja cada vez que el guard GANABA casos. Se comprueba `pass == total` mas un suelo.
+        run: |
+          set -o pipefail
+          bash scripts/hooks/bash-guard.test.sh | tee "$RUNNER_TEMP/bash-guard.out"
+          res=$(sed -nE 's/^OK: ([0-9]+)\/([0-9]+) cases pass.*/\1 \2/p' "$RUNNER_TEMP/bash-guard.out" | tail -1)
+          [ -n "$res" ] || { echo "::error::bash-guard self-test printed no result line at all"; exit 1; }
+          pass=${res% *}; total=${res#* }
+          [ "$pass" = "$total" ] || { echo "::error::bash-guard self-test: only $pass of $total cases pass"; exit 1; }
+          [ "$total" -ge 107 ] || { echo "::error::bash-guard self-test SHRANK to $total cases (floor is 107)"; exit 1; }
+
       - name: guard table suite
         run: bash scripts/hooks/bash-guard.test.sh
 

@@ -599,13 +599,77 @@ function stripHeredocs(src) {
   return out;
 }
 
-let s = stripHeredocs(cmd);
-// Command substitutions and subshells are opened as their own segments so that
-// what they run inside is analyzed too.
-s = s.replace(/\$\(/g, "\n").replace(/`/g, "\n");
-for (const seg of s.split(/\|\||&&|;|\||&|\n|\(|\)/)) {
-  const t = seg.trim();
-  if (t) process.stdout.write(t + "\n");
+// Split into segments on shell operators — but QUOTE-AWARE, which the previous
+// regex split was not. It cut on `(` and `)` everywhere, including inside a quoted
+// string, and that broke the rule it was feeding: this repo's own convention makes
+// every PR title `type(scope): ...`, so
+//
+//     gh pr create --title "chore(guard): x" --label semver:patch
+//
+// was cut after `--title "chore`, and the segment holding `pr create` no longer saw
+// the `--label` that came later. The guard denied a command that DID carry the label.
+// Measured 2026-08-19: four independent sessions hit it within minutes of the rule
+// shipping, each one working around it by reordering flags. A guard whose false
+// positive is routine gets routed around, and then it is not a guard.
+//
+// Rules, mirroring the shell:
+//   - inside '...'  nothing is special until the closing quote;
+//   - inside "..."  operators are literal, but `$(` and a backtick still open a
+//     command substitution, so those DO split — that is real code and must be seen;
+//   - outside quotes, everything splits as before.
+// Coverage is ADDITIVE, never traded away: the quoted span is emitted as its own extra
+// segment too. So `bash -c "git push --force …"` is still analyzed — the string really
+// does get executed — while `gh pr create --title "chore(x): y" --label z` keeps its
+// label in the same segment as `pr create`. Nothing that was detected before stops being
+// detected; what stops is cutting a command in half at a quoted parenthesis.
+function splitSegments(str) {
+  const out = [];
+  const inner = [];
+  let cur = "";
+  let buf = "";     // text inside the current quoted span
+  let q = null;     // null | "'" | '"'
+  const push = () => { const t = cur.trim(); if (t) out.push(t); cur = ""; };
+  const closeQuote = () => { const t = buf.trim(); if (t) inner.push(t); buf = ""; q = null; };
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    const next = str[i + 1];
+    // The quote characters themselves stay in the segment: downstream rules match on
+    // the segment text, so rewriting it here would be a second, invisible change.
+    if (q === "'") { cur += c; if (c === "'") closeQuote(); else buf += c; continue; }
+    if (q === '"') {
+      if (c === "\\" && next) { cur += c + next; buf += c + next; i++; continue; }
+      if (c === '"') { cur += c; closeQuote(); continue; }
+      if (c === "$" && next === "(") { push(); i++; continue; }
+      if (c === "`") { push(); continue; }
+      cur += c; buf += c;
+      continue;
+    }
+    if (c === "\\" && next) { cur += c + next; i++; continue; }
+    if (c === "'" || c === '"') { q = c; cur += c; buf = ""; continue; }
+    if (c === "$" && next === "(") { push(); i++; continue; }
+    if (c === "`") { push(); continue; }
+    if (c === "|" || c === "&") {
+      if (next === c) i++; // || and && are one operator, not two
+      push();
+      continue;
+    }
+    if (c === ";" || c === "\n" || c === "(" || c === ")") { push(); continue; }
+    cur += c;
+  }
+  push();
+  // An unterminated quote leaves text in buf; analyze it rather than drop it.
+  if (buf.trim()) inner.push(buf.trim());
+  // The quoted spans are re-split with the same rules, so an operator inside a quoted
+  // command still separates the commands it joins.
+  for (const t of inner) {
+    if (t === str.trim()) continue; // no progress: would recurse forever
+    for (const s of splitSegments(t)) out.push(s);
+  }
+  return out;
+}
+
+for (const seg of splitSegments(stripHeredocs(cmd))) {
+  process.stdout.write(seg + "\n");
 }
 JS
 

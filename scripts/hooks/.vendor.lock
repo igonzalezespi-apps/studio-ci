@@ -1,5 +1,5 @@
 # vendored from core-dev bash-guard — regenerate with guard-sync.sh
-# source: igonzalezespi-apps/claude-plugins@b5a076b
-a2a28b0b78da0dded4d14c80a27e7cb65dcdc8b59765d4d8f005418d161bac84  bash-guard.sh
-cc27776d15e1a8403987edef35efb10938a4be24aa24dde26d7a561ebb1c74b4  bash-guard.test.sh
+# source: igonzalezespi-apps/claude-plugins@c0a0849
+22bfc43a8998e69e47a7912b7b214df3ce04ca04839f74de2375692b1cfed087  bash-guard.sh
+7846da69eca09bef3d7e5a2f263094d287a8ca7d3801c30dac44746091c5698b  bash-guard.test.sh
 59c30a7864d82a1ab8c4508b5b84c8b5b8b127435f7cb9ff41a4e1114694d031  guard-parity.test.sh
