@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/igonzalezespi/claude-plugins/core-dev/guard.policy.schema.json",
+  "$id": "https://github.com/igonzalezespi-apps/claude-plugins/core-dev/guard.policy.schema.json",
   "title": "bash-guard policy",
   "description": "Repo-specific parameters for the vendored bash-guard.sh. Everything here is per-repo; the guard core is identical across repos. Strict defaults apply when a key (or the whole file) is absent: an absent policy never weakens the guard.",
   "type": "object",
