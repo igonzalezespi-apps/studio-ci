@@ -637,6 +637,9 @@ function splitSegments(str) {
     // the segment text, so rewriting it here would be a second, invisible change.
     if (q === "'") { cur += c; if (c === "'") closeQuote(); else buf += c; continue; }
     if (q === '"') {
+      // A backslash-newline is a LINE CONTINUATION: bash removes it before the word ever
+      // exists. Keeping it turned one command into two segments (see the unquoted branch).
+      if (c === "\\" && next === "\n") { cur += " "; buf += " "; i++; continue; }
       if (c === "\\" && next) { cur += c + next; buf += c + next; i++; continue; }
       if (c === '"') { cur += c; closeQuote(); continue; }
       if (c === "$" && next === "(") { push(); i++; continue; }
@@ -644,6 +647,14 @@ function splitSegments(str) {
       cur += c; buf += c;
       continue;
     }
+    // A backslash-newline is a line continuation, not two characters: bash joins the lines
+    // before parsing. The guard used to keep the pair verbatim, so the segment carried a raw
+    // newline into the shell's line-based read loop below and got TORN IN HALF. Measured
+    // 2026-08-21: `gh pr create --repo r --head b \\<newline>  --label semver:none ...` was
+    // denied for "without --label", because the first half of the torn segment genuinely had
+    // no --label in it. Every rule that requires a flag to be PRESENT somewhere in the command
+    // has the same hole, in both directions: a false deny here, a missed deny elsewhere.
+    if (c === "\\" && next === "\n") { cur += " "; i++; continue; }
     if (c === "\\" && next) { cur += c + next; i++; continue; }
     if (c === "'" || c === '"') { q = c; cur += c; buf = ""; continue; }
     if (c === "$" && next === "(") { push(); i++; continue; }
@@ -669,7 +680,12 @@ function splitSegments(str) {
 }
 
 for (const seg of splitSegments(stripHeredocs(cmd))) {
-  process.stdout.write(seg + "\n");
+  // One segment, one line. The shell reads this back with `while read -r`, so a segment
+  // carrying a literal newline (only possible from inside a quoted span) would arrive as two
+  // segments and each half would be matched on its own. Collapsing to a space keeps the
+  // segment whole; the quoted span is still re-split on its own by the `inner` pass above, so
+  // nothing that used to be caught stops being caught.
+  process.stdout.write(seg.replace(/\n/g, " ") + "\n");
 }
 JS
 

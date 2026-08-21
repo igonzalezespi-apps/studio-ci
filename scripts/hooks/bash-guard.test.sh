@@ -168,6 +168,20 @@ CASES=(
   'allow|gh pr create --title "chore(guard): sincronizar el guard" --label semver:patch'
   'allow|gh pr create --repo o/r --base main --title "feat(release): x" --body-file b.md --label semver:minor'
   'deny|gh pr create --title "chore(guard): sin etiqueta" --body "b"'
+  # Tercera vez que el TROCEO —no la regla— decide el veredicto de `gh pr create`. Ahora la
+  # continuacion de linea: `\` + salto es una CONTINUACION, bash junta las lineas antes de
+  # parsear. El guard guardaba el par tal cual, el segmento viajaba con un salto de linea
+  # dentro, y el `while read -r` de abajo lo partia en dos. La primera mitad no tenia
+  # `--label`, asi que un comando correcto salia denegado. Medido 2026-08-21 abriendo una PR
+  # real. La pareja importa: sin la variante sin etiqueta, el arreglo podria haber apagado la
+  # regla entera y el verde no lo distinguiria.
+  "$(printf 'allow|gh pr create --repo o/r --base main --head b \\\n  --label semver:none \\\n  --title "chore(x): y" --body-file b.md')"
+  "$(printf 'deny|gh pr create --repo o/r --base main --head b \\\n  --title "chore(x): y" --body-file b.md')"
+  # Y la direccion peligrosa del mismo fallo: si el segmento se parte, una regla que exige ver
+  # una bandera deja de verla, pero tambien una prohibicion puede quedar en la mitad que nadie
+  # mira. Con la continuacion resuelta, esto se sigue denegando.
+  "$(printf 'deny|git push --force \\\n  origin main')"
+  "$(printf 'deny|git commit \\\n  --no-verify -m "wip"')"
   # Y la cobertura NO se cambia por comodidad: lo entrecomillado se sigue analizando,
   # porque `bash -c "..."` se ejecuta de verdad. Antes de este arreglo esto NO se denegaba:
   # el troceo partia la cadena en trozos que ya no parecian un `git push --force`.
