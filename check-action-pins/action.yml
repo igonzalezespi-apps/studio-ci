@@ -1,0 +1,46 @@
+name: check-action-pins
+description: >-
+  Audita la higiene de los pins de GitHub Actions de un repo: SHA de 40 hex, comentario presente,
+  el tag existe aguas arriba, el tag resuelve a ese SHA, y —la que ningun verificador de la flota
+  tenia— que el comentario NO sea un alias flotante (`# v7`) cuando existe el nombre exacto
+  (`# v7.0.1`). Stack-agnostico: es shell + `gh api`, no necesita Node, Dart ni Flutter.
+
+inputs:
+  workflows-dir:
+    description: "Directorio con los workflows a auditar."
+    required: false
+    default: ".github/workflows"
+  github-token:
+    description: >-
+      Token con `contents: read`. Resuelve tags de repositorios PUBLICOS de terceros
+      (actions/checkout y demas), asi que el `GITHUB_TOKEN` por defecto basta.
+    required: true
+
+outputs:
+  violations:
+    description: "Numero de violaciones encontradas."
+    value: ${{ steps.scan.outputs.violations }}
+
+runs:
+  using: composite
+  steps:
+    # `bash` explicito: sin `shell:` una composite action no arranca, y el fallo llega en tiempo
+    # de ejecucion con un mensaje que no menciona la causa.
+    - id: scan
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        WF_DIR: ${{ inputs.workflows-dir }}
+      run: |
+        set -uo pipefail
+        # `$GITHUB_ACTION_PATH` es la raiz de ESTA action, no la del repo que la usa: sin el, el
+        # script se busca en el checkout del consumidor y no esta.
+        out=$(bash "$GITHUB_ACTION_PATH/check.sh" "$WF_DIR" 2>&1); rc=$?
+        printf '%s\n' "$out"
+        n=$(printf '%s' "$out" | sed -nE 's/.*, ([0-9]+) violacion\(es\).*/\1/p' | tail -1)
+        echo "violations=${n:-0}" >> "$GITHUB_OUTPUT"
+        {
+          echo "### check-action-pins"
+          printf '```\n%s\n```\n' "$out"
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit $rc
