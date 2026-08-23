@@ -296,13 +296,23 @@ check_git_merge() {
 # call. Fails CLOSED: if the base cannot be determined, return the protected
 # branch so the merge is denied.
 pr_base_branch() {
-  local pr="$1"
+  local pr="$1" repo="${2:-}"
   if [ -n "${BASH_GUARD_PR_BASE:-}" ]; then
     printf '%s' "$BASH_GUARD_PR_BASE"
     return 0
   fi
   local base
-  base="$(gh pr view "$pr" --json baseRefName -q .baseRefName 2>/dev/null || true)"
+  # The `--repo` of the original command MUST be forwarded. The hook runs with
+  # `cd "$CLAUDE_PROJECT_DIR"`, so without it `gh pr view` resolves the number
+  # against the SESSION's repo, not the PR's. Measured from ~/work against a
+  # product PR: "Could not resolve to a PullRequest with the number of 439",
+  # which the fail-closed branch below turns into the protected branch — so
+  # every cross-repo merge was denied no matter what the policy said.
+  if [ -n "$repo" ]; then
+    base="$(gh pr view "$pr" --repo "$repo" --json baseRefName -q .baseRefName 2>/dev/null || true)"
+  else
+    base="$(gh pr view "$pr" --json baseRefName -q .baseRefName 2>/dev/null || true)"
+  fi
   if [ -z "$base" ]; then
     printf '%s' "$PROTECTED_BRANCH"
     return 0
@@ -314,11 +324,11 @@ pr_base_branch() {
 # (human-only, per contract). Merging into the integration branch is allowed
 # only when the policy grants agent_may_merge; otherwise denied.
 check_pr_merge() {
-  local pr="$1" base
+  local pr="$1" repo="${2:-}" base
   if [ "$AGENT_MAY_MERGE" != "true" ]; then
     deny_human_merge "gh pr merge merges the PR from the CLI"
   fi
-  base="$(pr_base_branch "$pr")"
+  base="$(pr_base_branch "$pr" "$repo")"
   if [ "$base" = "$PROTECTED_BRANCH" ]; then
     deny_human_merge "gh pr merge would merge a PR whose base is ${PROTECTED_BRANCH} (protected)"
   fi
@@ -329,11 +339,23 @@ check_gh() {
   # Locate the first two subcommands, skipping global flags. Also capture the
   # first positional after `pr merge` (the PR number/URL/branch), for the
   # base-branch check.
-  local i=1 sub1="" sub2="" a merge_arg=""
+  local i=1 sub1="" sub2="" a merge_arg="" repo_arg=""
   while [ "$i" -lt "${#tok[@]}" ]; do
     a="${tok[i]}"
     case "$a" in
-      -R | --repo | --hostname)
+      -R | --repo)
+        # Captured, not just skipped: pr_base_branch needs it to look the PR up
+        # in the RIGHT repo. See the note there.
+        repo_arg="${tok[i + 1]:-}"
+        i=$((i + 2))
+        continue
+        ;;
+      -R=* | --repo=*)
+        repo_arg="${a#*=}"
+        i=$((i + 1))
+        continue
+        ;;
+      --hostname)
         i=$((i + 2))
         continue
         ;;
@@ -346,15 +368,18 @@ check_gh() {
       sub1="$a"
     elif [ -z "$sub2" ]; then
       sub2="$a"
-    else
+    elif [ -z "$merge_arg" ]; then
+      # Do NOT stop here. This used to `break`, and `--repo` almost always comes
+      # AFTER the PR number (`gh pr merge 123 --repo owner/name --squash`), so
+      # the flag was never reached and repo_arg stayed empty. Keep scanning to
+      # the end; only the FIRST positional after `pr merge` is the PR.
       merge_arg="$a"
-      break
     fi
     i=$((i + 1))
   done
 
   if [ "$sub1" = "pr" ] && [ "$sub2" = "merge" ]; then
-    check_pr_merge "$merge_arg"
+    check_pr_merge "$merge_arg" "$repo_arg"
   fi
 
   # `gh pr create` without a label. The label is what the release gate reads, and putting it in a

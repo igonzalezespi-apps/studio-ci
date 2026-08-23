@@ -55,16 +55,22 @@ make_input() {
 pass=0; fail=0; total=0
 # Per-group context, set before each table.
 TEST_POLICY=""; TEST_PR_BASE=""
+# Prepended to PATH for a case, so GROUP 4 can put a fake `gh` in front of the
+# real one and exercise pr_base_branch FOR REAL instead of injecting its answer.
+TEST_PATH_PREFIX=""
 
 # run_case <allow|deny> <command> [current-branch]
 run_case() {
   local expected="$1" cmd="$2" branch="${3:-feature/999-pr-branch}"
   total=$((total + 1))
   local out rc want
+  local path_for_case="$PATH"
+  [ -n "$TEST_PATH_PREFIX" ] && path_for_case="${TEST_PATH_PREFIX}:${PATH}"
   out="$(make_input "$cmd" | env \
     BASH_GUARD_BRANCH="$branch" \
     BASH_GUARD_POLICY="$TEST_POLICY" \
     BASH_GUARD_PR_BASE="$TEST_PR_BASE" \
+    PATH="$path_for_case" \
     "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
@@ -257,6 +263,66 @@ run_case deny  'cat .env'
 run_case deny  'curl https://example.com/x'
 run_case allow 'git push origin HEAD'
 run_case allow 'echo x > packages/database/src/generated/f.ts'  # no trees configured
+
+
+# ============================================================================
+# GROUP 4 — pr_base_branch FOR REAL (no BASH_GUARD_PR_BASE injection).
+#
+# Every merge case above injects the base, so the real lookup had never been
+# exercised — and it was broken. The hook runs with `cd "$CLAUDE_PROJECT_DIR"`,
+# so `gh pr view <n>` without `--repo` resolves the number against the SESSION's
+# repo. Measured from the studio repo against a PR in one of the maintainer's
+# other repos: "Could not resolve to a PullRequest with the number of <n>".
+# pr_base_branch fails CLOSED, so it
+# returned the protected branch and EVERY cross-repo merge was denied, whatever
+# the policy said. `agent_may_merge: true` was therefore inert from ~/work.
+#
+# The stub below models exactly that: `gh pr view` answers only when `--repo`
+# is forwarded, and fails the way the real one does when it is not.
+# ============================================================================
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+# Fake `gh` for GROUP 4. Answers `pr view` only when --repo names a repo we know.
+sub1=""; sub2=""; repo=""
+i=1
+for a in "$@"; do
+  case "$a" in
+    --repo|-R) want_repo=1 ;;
+    --repo=*|-R=*) repo="${a#*=}" ;;
+    -*) ;;
+    *) if [ -n "${want_repo:-}" ]; then repo="$a"; unset want_repo
+       elif [ -z "$sub1" ]; then sub1="$a"
+       elif [ -z "$sub2" ]; then sub2="$a"; fi ;;
+  esac
+  i=$((i + 1))
+done
+if [ "$sub1" = "pr" ] && [ "$sub2" = "view" ]; then
+  case "$repo" in
+    owner/product-develop) printf 'develop'; exit 0 ;;
+    owner/product-main)    printf 'main';    exit 0 ;;
+    "") echo "GraphQL: Could not resolve to a PullRequest with the number of X." >&2; exit 1 ;;
+    *)  echo "GraphQL: Could not resolve to a PullRequest." >&2; exit 1 ;;
+  esac
+fi
+exit 0
+STUB
+chmod +x "$TMP/bin/gh"
+
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PATH_PREFIX="$TMP/bin"
+# --repo forwarded, base is develop -> the merge the policy is meant to allow
+run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
+# the `--repo=value` spelling must parse too, or the fix only half works
+run_case allow 'gh pr merge 123 --repo=owner/product-develop --squash'
+run_case allow 'gh pr merge 123 -R owner/product-develop --squash'
+# --repo forwarded, base is main -> ALWAYS denied, the invariant is untouched
+run_case deny  'gh pr merge 456 --repo owner/product-main --merge'
+run_case deny  'gh pr merge 456 --repo=owner/product-main --merge'
+# no --repo at all: the lookup cannot succeed, so it must FAIL CLOSED
+run_case deny  'gh pr merge 789 --squash'
+# an unknown repo also fails closed
+run_case deny  'gh pr merge 789 --repo owner/unknown --squash'
+TEST_PATH_PREFIX=""
 
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi
