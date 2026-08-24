@@ -26,6 +26,23 @@
 # ============================================================================
 set -uo pipefail
 
+# HERMETICO FRENTE AL ENTORNO DE GIT. Esta suite crea repos de usar y tirar bajo `mktemp -d` y
+# ejecuta `git init`, `git commit`, `git branch -M` y `git update-ref` dentro de ellos. Eso es
+# seguro cuando se lanza a mano — y DEJA DE SERLO cuando lo lanza un git hook.
+#
+# Durante un `git commit`, git exporta `GIT_DIR` (y `GIT_INDEX_FILE`, y a veces `GIT_WORK_TREE`)
+# al entorno del hook. **`GIT_DIR` gana sobre el directorio actual**: un `cd /tmp/xxx && git init`
+# no crea un repo en /tmp, REINICIA el repo al que apunta `GIT_DIR`. Medido el 2026-08-24 en
+# claude-plugins: la suite dejo `core.bare=true`, reescribio `refs/heads/main` a un commit de
+# fixture y machaco `refs/remotes/origin/main`. El remoto no se toco, pero el repo local quedo
+# inservible y hubo que reconstruirlo desde `origin`.
+#
+# Un subshell `( cd … )` NO protege de esto: acota el directorio, no el entorno. Lo unico que lo
+# acota es limpiar las variables, y hay que hacerlo aqui —en la suite— y no solo en el hook,
+# porque la suite es lo que se vendoriza a nueve repos y puede llamarla cualquiera.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+unset GIT_COMMON_DIR GIT_PREFIX GIT_NAMESPACE GIT_CEILING_DIRECTORIES GIT_CONFIG GIT_CONFIG_GLOBAL
+
 CANON="${1:-}"
 ROOT="${2:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 [ -n "$CANON" ] && [ -f "$CANON" ] || { echo "usage: guard-parity.test.sh <canonical bash-guard.sh> [repo-root]" >&2; exit 1; }
