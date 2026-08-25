@@ -65,7 +65,7 @@ corre() {
   monta "$R" "$linea"
   [ -z "$fx" ] || "$fx" "$R"
   local out rc
-  out=$(cd "$R" && GH_API="$LAB/bin/fakegh api" FIX="$R/fix" bash "$CHECK" .github/workflows 2>&1); rc=$?
+  out=$(cd "$R" && GH_API="$LAB/bin/fakegh api" FIX="$R/fix" LAB="$LAB" LAB_INTENTOS="$LAB/intentos" bash "$CHECK" .github/workflows 2>&1); rc=$?
   if [ "$rc" -ne "$quiero" ]; then
     bad "$etiqueta" "esperaba exit $quiero, salio $rc"; printf '%s\n' "$out" | sed 's/^/         /'; return
   fi
@@ -90,6 +90,44 @@ fx_tag_ausente() { refs "$1" 'v9.9.9' '[]'; }
 # La llamada FALLA: el `gh` simulado sale con 1 cuando no hay fichero. El repo SI existe, que es
 # justo la combinacion que fabricaba una violacion inventada.
 fx_api_falla()   { rm -f "$1/fix/repos_acme_act_git_matching-refs_tags_v7.0.1.json"; }
+# La API falla SIEMPRE y con un mensaje por stderr: ese mensaje tiene que llegar al informe. Sin el,
+# "no se pudo medir" es un callejon sin salida — fue exactamente lo que obligo a adivinar el
+# 2026-08-25, con dos pins de un repo publico saliendo sin medir de forma repetible.
+fx_api_grita()   {
+  rm -f "$1/fix/repos_acme_act_git_matching-refs_tags_v7.0.1.json"
+  cat > "$LAB/bin/fakegh" <<'GHEOF'
+#!/usr/bin/env bash
+ruta="$2"; clave=$(printf '%s' "$ruta" | tr '/' '_'); f="$FIX/$clave.json"
+if [ ! -f "$f" ]; then echo "HTTP 403: API rate limit exceeded" >&2; exit 1; fi
+if [ "${3:-}" = "--jq" ]; then jq -r "$4" < "$f"; else cat "$f"; fi
+GHEOF
+  chmod +x "$LAB/bin/fakegh"
+}
+# Falla la PRIMERA vez y funciona la segunda: el reintento tiene que salvarlo. Un verificador
+# fail-closed que se rinde al primer hipo se convierte en ruido, y el ruido se ignora.
+fx_api_hipo()    {
+  fx_exacto "$1"
+  printf '0' > "$LAB/intentos"
+  cat > "$LAB/bin/fakegh" <<'GHEOF'
+#!/usr/bin/env bash
+ruta="$2"; clave=$(printf '%s' "$ruta" | tr '/' '_'); f="$FIX/$clave.json"
+case "$ruta" in *matching-refs*)
+  n=$(cat "$LAB_INTENTOS" 2>/dev/null || echo 0)
+  if [ "$n" = "0" ]; then echo 1 > "$LAB_INTENTOS"; echo "HTTP 502: bad gateway" >&2; exit 1; fi ;;
+esac
+[ -f "$f" ] || exit 1
+if [ "${3:-}" = "--jq" ]; then jq -r "$4" < "$f"; else cat "$f"; fi
+GHEOF
+  chmod +x "$LAB/bin/fakegh"
+}
+# El `gh` simulado se restaura para que un caso no contamine al siguiente.
+fx_restaura() { fx_exacto "$1"; cat > "$LAB/bin/fakegh" <<'GHEOF'
+#!/usr/bin/env bash
+ruta="$2"; clave=$(printf '%s' "$ruta" | tr '/' '_'); f="$FIX/$clave.json"
+[ -f "$f" ] || exit 1
+if [ "${3:-}" = "--jq" ]; then jq -r "$4" < "$f"; else cat "$f"; fi
+GHEOF
+  chmod +x "$LAB/bin/fakegh"; }
 
 echo "== 1. el ref tiene que ser un SHA de 40 hex =="
 corre "pineado con un tag mutable -> 1" 1 "acme/act@v7.0.1 # v7.0.1" fx_exacto "no es un SHA de 40 hex"
@@ -113,6 +151,9 @@ corre "el comentario nombra un tag inexistente -> 1" 1 "acme/act@$SHA_A # v9.9.9
 # no "ese tag no existe". Antes se deducia preguntando por OTRO endpoint (`repos/<owner>/<repo>`),
 # y si ese si contestaba, salia una VIOLACION INVENTADA sobre un tag que existe.
 corre "la API falla pero el repo existe -> 2 (NO MEDIDO), no 1" 2 "acme/act@$SHA_A # v7.0.1" fx_api_falla "no se pudo consultar la API"
+corre "el motivo del fallo LLEGA al informe" 2 "acme/act@$SHA_A # v7.0.1" fx_api_grita "rate limit exceeded"
+corre "un hipo de la API lo salva el reintento -> 0" 0 "acme/act@$SHA_A # v7.0.1" fx_api_hipo
+corre "y el simulado queda restaurado -> 0" 0 "acme/act@$SHA_A # v7.0.1" fx_restaura
 
 echo
 echo "== 4. deriva de etiqueta =="

@@ -35,7 +35,8 @@
 set -uo pipefail
 
 DIR="${1:-.github/workflows}"
-: "${GH_API:=gh api}"          # sustituible por la suite
+: "${GH_API:=gh api}"
+TMPERR=$(mktemp); trap 'rm -f "$TMPERR"' EXIT INT TERM          # sustituible por la suite
 
 VIOL=0
 ERRS=0
@@ -108,9 +109,26 @@ for f in "${FILES[@]}"; do
     #
     # Ahora: rc distinto de 0 -> NO MEDIDO, sin inferir nada de un endpoint que no es el que
     # fallo. rc = 0 y `[]` -> el tag no existe de verdad, y eso si es una violacion.
-    refs=$($GH_API "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>/dev/null); rc_refs=$?
+    # EL ERROR DE LA API SE IMPRIME, NO SE TIRA. El `2>/dev/null` que habia aqui convertia
+    # cualquier fallo en "no se pudo medir" a secas: sin codigo HTTP, sin mensaje, sin nada que
+    # permitiera saber si era un limite de peticiones, un permiso o un repo movido. Medido el
+    # 2026-08-25: dos pins de un repo publico salieron "sin medir" en CI de forma REPETIBLE, y no
+    # habia manera de averiguar por que sin tocar el script. Un diagnostico que no se puede leer
+    # obliga a adivinar, y adivinar es como se llega a "el contador de GitHub esta atascado".
+    #
+    # Y UN REINTENTO antes de rendirse. La mayoria de estos fallos son transitorios —un 502, un
+    # limite secundario por rafaga— y un verificador fail-closed que se pone rojo al primer
+    # hipo se convierte en ruido. Uno solo: si el segundo tambien falla, es que pasa algo de
+    # verdad y hay que verlo.
+    err=""
+    for intento in 1 2; do
+      refs=$($GH_API "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>"$TMPERR"); rc_refs=$?
+      [ "$rc_refs" -eq 0 ] && break
+      err=$(tr '\n' ' ' < "$TMPERR" | cut -c1-200)
+      [ "$intento" = "1" ] && sleep 2
+    done
     if [ "$rc_refs" -ne 0 ]; then
-      oops "$where — no se pudo consultar la API para '$tag' (la llamada salio con $rc_refs)"
+      oops "$where — no se pudo consultar la API para '$tag' tras 2 intentos (rc=$rc_refs): ${err:-<sin mensaje>}"
       continue
     fi
     if [ -z "$refs" ] || [ "$refs" = "[]" ]; then
