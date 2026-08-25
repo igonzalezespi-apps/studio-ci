@@ -35,7 +35,22 @@ runs:
         set -uo pipefail
         # `$GITHUB_ACTION_PATH` es la raiz de ESTA action, no la del repo que la usa: sin el, el
         # script se busca en el checkout del consumidor y no esta.
-        out=$(bash "$GITHUB_ACTION_PATH/check.sh" "$WF_DIR" 2>&1); rc=$?
+        # `|| rc=$?` Y NO `out=$(...); rc=$?`. El shell por defecto de un `run:` es
+        # `bash --noprofile --norc -e -o pipefail {0}`: **`-e` viene puesto DESDE FUERA**, y el
+        # `set -uo pipefail` de arriba no lo quita. Con `-e`, una asignacion cuyo comando
+        # substituido sale distinto de 0 ABORTA EL PASO ahi mismo — antes del `printf` que imprime
+        # lo que encontro.
+        #
+        # O sea que esta accion NO PODIA INFORMAR DE UNA VIOLACION: salia con exit 1 y CERO salida,
+        # justo en el unico caso para el que existe. Con 0 violaciones funcionaba, que es por lo
+        # que paso desapercibida al cablearla en nueve repos limpios; el decimo tenia un hallazgo y
+        # lo unico que se vio fue `Process completed with exit code 1`.
+        #
+        # La suite de `check.sh` no podia cazarlo: prueba el SCRIPT, y el fallo esta en el
+        # ENVOLTORIO. Por eso ahora hay `action.test.sh`, que ejecuta este cuerpo con el mismo
+        # shell que usa GitHub.
+        rc=0
+        out=$(bash "$GITHUB_ACTION_PATH/check.sh" "$WF_DIR" 2>&1) || rc=$?
         printf '%s\n' "$out"
         n=$(printf '%s' "$out" | sed -nE 's/.*, ([0-9]+) violacion\(es\).*/\1/p' | tail -1)
         echo "violations=${n:-0}" >> "$GITHUB_OUTPUT"
