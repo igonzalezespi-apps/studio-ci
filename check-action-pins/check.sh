@@ -93,15 +93,28 @@ for f in "${FILES[@]}"; do
     fi
 
     # --- 3/4/5. resolucion aguas arriba --------------------------------------
-    refs=$($GH_API "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>/dev/null)
+    # EL `rc` DE ESTA LLAMADA ES LA RESPUESTA, y estaba tirandose a la basura.
+    #
+    # Medido: `git/matching-refs/tags/<tag>` devuelve `[]` con **rc=0** cuando el tag no existe, y
+    # **rc distinto de 0** cuando no se pudo preguntar. Son dos respuestas distintas y la API ya
+    # las distingue. Aqui se juntaban en una sola condicion (`vacio O []`) y despues se DEDUCIA
+    # cual era preguntando por OTRO endpoint, `repos/<owner>/<repo>`.
+    #
+    # Esa deduccion falla en el peor momento: si la llamada se estrangula por limite de peticiones
+    # —lo normal cuando un repo tiene 68 pins externos y varias PRs a la vez— pero la consulta
+    # barata del repo si contesta (o viene de cache), el resultado es una VIOLACION INVENTADA. Un
+    # verificador que grita "ese tag no existe" sobre un tag que existe es peor que no tenerlo:
+    # ensena a ignorarlo.
+    #
+    # Ahora: rc distinto de 0 -> NO MEDIDO, sin inferir nada de un endpoint que no es el que
+    # fallo. rc = 0 y `[]` -> el tag no existe de verdad, y eso si es una violacion.
+    refs=$($GH_API "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>/dev/null); rc_refs=$?
+    if [ "$rc_refs" -ne 0 ]; then
+      oops "$where — no se pudo consultar la API para '$tag' (la llamada salio con $rc_refs)"
+      continue
+    fi
     if [ -z "$refs" ] || [ "$refs" = "[]" ]; then
-      # Se distingue "no existe" de "no se pudo preguntar": lo primero es una violacion, lo
-      # segundo es no medido. Sin la distincion, una API caida se lee como flota rota.
-      if $GH_API "repos/$owner/$api_repo" >/dev/null 2>&1; then
-        viol "$where — el comentario dice '$tag' y ese tag NO existe aguas arriba"
-      else
-        oops "$where — no se pudo consultar la API para '$tag'"
-      fi
+      viol "$where — el comentario dice '$tag' y ese tag NO existe aguas arriba"
       continue
     fi
 
