@@ -54,7 +54,7 @@ make_input() {
 
 pass=0; fail=0; total=0
 # Per-group context, set before each table.
-TEST_POLICY=""; TEST_PR_BASE=""
+TEST_POLICY=""; TEST_PR_BASE=""; TEST_PR_HEAD=""
 # Prepended to PATH for a case, so GROUP 4 can put a fake `gh` in front of the
 # real one and exercise pr_base_branch FOR REAL instead of injecting its answer.
 TEST_PATH_PREFIX=""
@@ -70,6 +70,7 @@ run_case() {
     BASH_GUARD_BRANCH="$branch" \
     BASH_GUARD_POLICY="$TEST_POLICY" \
     BASH_GUARD_PR_BASE="$TEST_PR_BASE" \
+    BASH_GUARD_PR_HEAD="$TEST_PR_HEAD" \
     PATH="$path_for_case" \
     "$GUARD" 2>&1)"
   rc=$?
@@ -284,23 +285,54 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # Fake `gh` for GROUP 4. Answers `pr view` only when --repo names a repo we know.
-sub1=""; sub2=""; repo=""
+sub1=""; sub2=""; repo=""; fields=""
 i=1
 for a in "$@"; do
   case "$a" in
     --repo|-R) want_repo=1 ;;
     --repo=*|-R=*) repo="${a#*=}" ;;
+    --json) want_fields=1 ;;
+    --json=*) fields="${a#*=}" ;;
     -*) ;;
     *) if [ -n "${want_repo:-}" ]; then repo="$a"; unset want_repo
+       elif [ -n "${want_fields:-}" ]; then fields="$a"; unset want_fields
        elif [ -z "$sub1" ]; then sub1="$a"
        elif [ -z "$sub2" ]; then sub2="$a"; fi ;;
   esac
   i=$((i + 1))
 done
+# The double must implement the invariant it is standing in for, or the caller
+# can stop asking for a field and the suite will not notice. Real `gh` with
+# `-q '.baseRefName + "\t" + .headRefName'` errors out when headRefName was not
+# requested (string + null), printing nothing and exiting non-zero.
+case "$fields" in
+  *headRefName*) ;;
+  *) echo "jq: error: null and string cannot be added" >&2; exit 1 ;;
+esac
+# The guard asks for BOTH refs in one lookup and expects "<base><TAB><head>";
+# a stub that answered only the base would make every case fail closed and hide
+# whatever the head check does. Repo name encodes the pair under test.
 if [ "$sub1" = "pr" ] && [ "$sub2" = "view" ]; then
   case "$repo" in
-    owner/product-develop) printf 'develop'; exit 0 ;;
-    owner/product-main)    printf 'main';    exit 0 ;;
+    owner/product-develop)   printf 'develop\tfeature/123-work'; exit 0 ;;
+    owner/product-main)      printf 'main\tdevelop';             exit 0 ;;
+    # the incident shape: a back-merge opened with main as the HEAD
+    owner/backmerge-badhead) printf 'develop\tmain';             exit 0 ;;
+    # the correct shape: the same back-merge from a throwaway branch
+    owner/backmerge-ok)      printf 'develop\tchore/back-merge-main-a-develop'; exit 0 ;;
+    # a head that is long-lived only because the POLICY names it
+    owner/policy-longlived)  printf 'develop\trelease/lts';       exit 0 ;;
+    # a repo whose own integration branch is the head
+    owner/head-is-integration) printf 'feature/parent\tdevelop';  exit 0 ;;
+    # under a policy that names NEITHER main NOR develop: only the built-in
+    # floor can deny this one
+    owner/exotic-head-main)  printf 'stable\tmain';               exit 0 ;;
+    # ...and here only the integration_branch rule can, since `stable` is not
+    # in the built-in floor
+    owner/exotic-head-integ) printf 'feature/parent\tstable';     exit 0 ;;
+    # a release PR that RESOLVES fine: base protected, head long-lived. The
+    # deny must name the protected base, not claim the PR was unresolvable.
+    owner/exotic-release)    printf 'trunk\tstable';              exit 0 ;;
     "") echo "GraphQL: Could not resolve to a PullRequest with the number of X." >&2; exit 1 ;;
     *)  echo "GraphQL: Could not resolve to a PullRequest." >&2; exit 1 ;;
   esac
@@ -309,7 +341,7 @@ exit 0
 STUB
 chmod +x "$TMP/bin/gh"
 
-TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PATH_PREFIX="$TMP/bin"
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
 # --repo forwarded, base is develop -> the merge the policy is meant to allow
 run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
 # the `--repo=value` spelling must parse too, or the fix only half works
@@ -322,6 +354,105 @@ run_case deny  'gh pr merge 456 --repo=owner/product-main --merge'
 run_case deny  'gh pr merge 789 --squash'
 # an unknown repo also fails closed
 run_case deny  'gh pr merge 789 --repo owner/unknown --squash'
+
+# --- the HEAD branch, which delete_branch_on_merge destroys -----------------
+# The real incident: base develop (allowed), head main. Merging it deleted
+# `main` and every tag reachable only from it. The base check cannot catch this
+# — the base was the integration branch, which is exactly what the agent may
+# merge.
+run_case deny  'gh pr merge 465 --repo owner/backmerge-badhead --merge --delete-branch'
+# ...and the deny must not depend on --delete-branch being spelled out: the repo
+# setting deletes the branch anyway.
+run_case deny  'gh pr merge 465 --repo owner/backmerge-badhead --merge'
+# the same back-merge done right (throwaway branch cut from main) still passes,
+# or the rule would have banned the operation instead of the dangerous shape
+run_case allow 'gh pr merge 126 --repo owner/backmerge-ok --merge --delete-branch'
+# head is the integration branch: also long-lived, also denied
+run_case deny  'gh pr merge 127 --repo owner/head-is-integration --rebase'
+# a policy-declared long-lived head is denied only when the policy names it...
+run_case allow 'gh pr merge 128 --repo owner/policy-longlived --squash'
+TEST_PATH_PREFIX=""
+
+# ============================================================================
+# GROUP 5 — long_lived_branches supplied BY THE POLICY.
+#
+# The built-in floor (main/master/develop/...) cannot be configured away, but a
+# repo may add its own. Same stub, same commands as the last case of GROUP 4:
+# only the policy changes, so the flip in verdict can only come from the policy
+# being read.
+# ============================================================================
+POL_LONGLIVED="$TMP/longlived.json"
+cat > "$POL_LONGLIVED" <<'JSON'
+{ "agent_may_merge": true, "protected_branch": "main", "integration_branch": "develop",
+  "long_lived_branches": ["release/lts"],
+  "generated_trees": [], "egress_allow": ["localhost", "127.0.0.1", "::1"] }
+JSON
+TEST_POLICY="$POL_LONGLIVED"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
+# ...and now that the policy names it, the very same command is denied.
+run_case deny  'gh pr merge 128 --repo owner/policy-longlived --squash'
+# the built-in floor still applies under this policy
+run_case deny  'gh pr merge 465 --repo owner/backmerge-badhead --merge'
+# and a work branch is still allowed
+run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
+TEST_PATH_PREFIX=""
+
+# ============================================================================
+# GROUP 5b — a policy that names NEITHER `main` NOR `develop`.
+#
+# Without this group the built-in floor and the protected/integration rules are
+# indistinguishable: under the normal policy `main` is caught by BOTH, so
+# deleting either one leaves the suite green (measured — three surviving
+# mutants). Here `protected_branch` is `trunk` and `integration_branch` is
+# `stable`, so each rule is the only thing standing between a case and an allow.
+# ============================================================================
+POL_EXOTIC="$TMP/exotic.json"
+cat > "$POL_EXOTIC" <<'JSON'
+{ "agent_may_merge": true, "protected_branch": "trunk", "integration_branch": "stable",
+  "generated_trees": [], "egress_allow": ["localhost", "127.0.0.1", "::1"] }
+JSON
+TEST_POLICY="$POL_EXOTIC"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
+# head `main` under a policy that never mentions main: only the built-in floor
+# can deny it. Remove the floor and this case allows.
+run_case deny  'gh pr merge 200 --repo owner/exotic-head-main --merge'
+# head `stable` is long-lived only because it is this repo's integration branch
+run_case deny  'gh pr merge 201 --repo owner/exotic-head-integ --rebase'
+# and the ordinary work-branch case still passes under the same policy, so the
+# two denies above are not an artefact of the policy being unreadable
+run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
+TEST_PATH_PREFIX=""
+
+# ============================================================================
+# GROUP 6 — the deny REASON for an unresolvable PR.
+#
+# Until now a PR whose refs could not be read was denied with "base is main
+# (protected)", naming a branch the guard never actually read. For a PR based on
+# develop that sends the reader to the wrong problem. Assert the exit code as
+# everywhere else, and — only here — that the message does not lie.
+# ============================================================================
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
+unresolved_msg="$(make_input 'gh pr merge 789 --squash' | env \
+  BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
+  PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
+total=$((total + 1))
+case "$unresolved_msg" in
+  *"could not resolve"*) pass=$((pass + 1)) ;;
+  *) fail=$((fail + 1)); printf 'FAIL  unresolved PR denied with a misleading reason  ::  %s\n' "$unresolved_msg" ;;
+esac
+
+# The mirror image: a PR that resolves PERFECTLY but is based on the protected
+# branch (the release PR) must be denied as protected-base, never as
+# unresolvable. Both exit 2, so only the message separates them — which is why
+# collapsing the two conditions into one went unnoticed by every exit-code case.
+TEST_POLICY="$POL_EXOTIC"
+resolved_msg="$(make_input 'gh pr merge 202 --repo owner/exotic-release --merge' | env \
+  BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
+  PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
+total=$((total + 1))
+case "$resolved_msg" in
+  *"could not resolve"*) fail=$((fail + 1)); printf 'FAIL  resolved release PR reported as unresolvable  ::  %s\n' "$resolved_msg" ;;
+  *"base is trunk"*) pass=$((pass + 1)) ;;
+  *) fail=$((fail + 1)); printf 'FAIL  resolved release PR denied with an unexpected reason  ::  %s\n' "$resolved_msg" ;;
+esac
 TEST_PATH_PREFIX=""
 
 echo "----------------------------------------"

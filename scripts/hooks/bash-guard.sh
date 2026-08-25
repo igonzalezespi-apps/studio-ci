@@ -42,6 +42,8 @@
 # BASH_GUARD_POLICY: override of the policy path, TEST-ONLY.
 # BASH_GUARD_PR_BASE: override of a PR's base branch, TEST-ONLY (avoids a network
 # call to gh in the merge-to-integration check).
+# BASH_GUARD_PR_HEAD: override of a PR's head branch, TEST-ONLY (same lookup).
+# Setting either of the two puts the resolver in test mode; see pr_refs.
 # ============================================================================
 set -euo pipefail
 
@@ -61,12 +63,14 @@ const regen = typeof p.generated_regen_hint === "string" ? p.generated_regen_hin
 const merge = p.agent_may_merge === true ? "true" : "false";
 const prot = typeof p.protected_branch === "string" && p.protected_branch ? p.protected_branch : "main";
 const integ = typeof p.integration_branch === "string" && p.integration_branch ? p.integration_branch : "";
+const longLived = Array.isArray(p.long_lived_branches) ? p.long_lived_branches : [];
 const egress = Array.isArray(p.egress_allow) && p.egress_allow.length
   ? p.egress_allow : ["localhost", "127.0.0.1", "::1"];
 const out = [];
 out.push("MERGE\t" + merge);
 out.push("PROTECTED\t" + prot);
 out.push("INTEGRATION\t" + integ);
+for (const b of longLived) if (typeof b === "string" && b) out.push("LONGLIVED\t" + b);
 out.push("REGEN\t" + regen);
 for (const t of trees) if (typeof t === "string" && t) out.push("TREE\t" + t);
 for (const h of egress) if (typeof h === "string" && h) out.push("EGRESS\t" + h);
@@ -76,6 +80,7 @@ process.stdout.write(out.join("\n") + "\n");
 AGENT_MAY_MERGE=false
 PROTECTED_BRANCH=main
 INTEGRATION_BRANCH=""
+LONG_LIVED_BRANCHES=()
 GEN_REGEN_HINT=""
 GEN_TREES=()
 EGRESS_ALLOW=()
@@ -85,6 +90,7 @@ if [ -n "$POLICY_TSV" ]; then
       MERGE) AGENT_MAY_MERGE="$val" ;;
       PROTECTED) PROTECTED_BRANCH="$val" ;;
       INTEGRATION) INTEGRATION_BRANCH="$val" ;;
+      LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
       REGEN) GEN_REGEN_HINT="$val" ;;
       TREE) [ -n "$val" ] && GEN_TREES+=("$val") ;;
       EGRESS) [ -n "$val" ] && EGRESS_ALLOW+=("$val") ;;
@@ -290,18 +296,36 @@ check_git_merge() {
   return 0
 }
 
-# Resolve a PR's base branch (for `gh pr merge <n>`), so the guard can allow a
-# merge into the integration branch while always denying a merge into the
-# protected branch. TEST-ONLY override BASH_GUARD_PR_BASE avoids the network
-# call. Fails CLOSED: if the base cannot be determined, return the protected
-# branch so the merge is denied.
-pr_base_branch() {
+# Resolve a PR's base AND head branch (for `gh pr merge <n>`) in ONE lookup, so
+# the guard can (a) allow a merge into the integration branch while always
+# denying a merge into the protected branch, and (b) refuse to merge a PR whose
+# HEAD is a long-lived branch. Emits "<base><TAB><head>".
+#
+# Why the head matters, measured: every repo in this fleet has
+# `delete_branch_on_merge: true`, and GitHub deletes the head branch on merge
+# unless it is the repository's DEFAULT branch. In a develop-default repo the
+# release PR (head `develop`) is therefore safe, but a back-merge opened with
+# head `main` deletes `main` on merge. That is not hypothetical: measured in one
+# of the maintainer's repos, a back-merge merged at 2026-08-24T17:47:18Z was
+# followed by `DeleteEvent branch main` three seconds later, taking the release
+# line and every tag reachable only from it. The correct shape is a throwaway
+# branch cut from `main` (`chore/back-merge-main-a-develop`), which a sibling
+# repo used for the very same operation — and why its `main` survived.
+#
+# TEST-ONLY overrides BASH_GUARD_PR_BASE / BASH_GUARD_PR_HEAD avoid the network
+# call. Setting EITHER puts the resolver in test mode; the one left unset falls
+# back to a neutral value (the protected branch for base — fail closed; a work
+# branch for head — so the pre-existing base-only cases keep their verdicts).
+#
+# Fails CLOSED: if the refs cannot be determined, return the protected branch
+# for both, so the merge is denied.
+pr_refs() {
   local pr="$1" repo="${2:-}"
-  if [ -n "${BASH_GUARD_PR_BASE:-}" ]; then
-    printf '%s' "$BASH_GUARD_PR_BASE"
+  if [ -n "${BASH_GUARD_PR_BASE:-}" ] || [ -n "${BASH_GUARD_PR_HEAD:-}" ]; then
+    printf '%s\t%s' "${BASH_GUARD_PR_BASE:-$PROTECTED_BRANCH}" "${BASH_GUARD_PR_HEAD:-feature/test-head}"
     return 0
   fi
-  local base
+  local refs
   # The `--repo` of the original command MUST be forwarded. The hook runs with
   # `cd "$CLAUDE_PROJECT_DIR"`, so without it `gh pr view` resolves the number
   # against the SESSION's repo, not the PR's. Measured from ~/work against a
@@ -309,32 +333,78 @@ pr_base_branch() {
   # which the fail-closed branch below turns into the protected branch — so
   # every cross-repo merge was denied no matter what the policy said.
   if [ -n "$repo" ]; then
-    base="$(gh pr view "$pr" --repo "$repo" --json baseRefName -q .baseRefName 2>/dev/null || true)"
+    refs="$(gh pr view "$pr" --repo "$repo" --json baseRefName,headRefName \
+      -q '.baseRefName + "\t" + .headRefName' 2>/dev/null || true)"
   else
-    base="$(gh pr view "$pr" --json baseRefName -q .baseRefName 2>/dev/null || true)"
+    refs="$(gh pr view "$pr" --json baseRefName,headRefName \
+      -q '.baseRefName + "\t" + .headRefName' 2>/dev/null || true)"
   fi
-  if [ -z "$base" ]; then
-    printf '%s' "$PROTECTED_BRANCH"
-    return 0
-  fi
-  printf '%s' "$base"
+  case "$refs" in
+    # Both fields present and non-empty. Anything else is an unresolved PR.
+    ?*$'\t'?*) printf '%s' "$refs" ;;
+    *) printf '%s\t%s' "$PROTECTED_BRANCH" "$PROTECTED_BRANCH" ;;
+  esac
 }
 
-# A `gh pr merge` attempt. Merging into the protected branch is always denied
-# (human-only, per contract). Merging into the integration branch is allowed
-# only when the policy grants agent_may_merge; otherwise denied.
+# Back-compat shim: the base alone, for callers/tests that only need it.
+pr_base_branch() {
+  local refs
+  refs="$(pr_refs "$1" "${2:-}")"
+  printf '%s' "${refs%%$'\t'*}"
+}
+
+# Is this branch name long-lived — i.e. one whose deletion loses history rather
+# than throwing away a finished work branch? The policy may extend the set via
+# `long_lived_branches`; the floor below is built in and cannot be configured
+# away, because a policy that omits it must never be weaker than one that does.
+is_long_lived_branch() {
+  local b="$1" x
+  [ -z "$b" ] && return 1
+  case "$b" in
+    main | master | develop | development | trunk) return 0 ;;
+  esac
+  [ "$b" = "$PROTECTED_BRANCH" ] && return 0
+  [ -n "$INTEGRATION_BRANCH" ] && [ "$b" = "$INTEGRATION_BRANCH" ] && return 0
+  for x in ${LONG_LIVED_BRANCHES[@]+"${LONG_LIVED_BRANCHES[@]}"}; do
+    [ "$b" = "$x" ] && return 0
+  done
+  return 1
+}
+
+# A `gh pr merge` attempt. Three independent negatives, in this order:
+#   1. the policy does not grant agent_may_merge;
+#   2. the base is the protected branch (human-only, per contract) — this one
+#      does NOT depend on the policy and no configuration can switch it off;
+#   3. the head is a long-lived branch, which `delete_branch_on_merge` would
+#      destroy at merge time.
+# Denying (3) can never block a merge the agent could otherwise perform: the one
+# legitimate PR with a long-lived head is the release (head `develop`, base
+# `main`), and (2) already denies that.
 check_pr_merge() {
-  local pr="$1" repo="${2:-}" base
+  local pr="$1" repo="${2:-}" refs base head
   if [ "$AGENT_MAY_MERGE" != "true" ]; then
     deny_human_merge "gh pr merge merges the PR from the CLI"
   fi
-  base="$(pr_base_branch "$pr" "$repo")"
+  refs="$(pr_refs "$pr" "$repo")"
+  base="${refs%%$'\t'*}"
+  head="${refs#*$'\t'}"
+  if [ "$base" = "$PROTECTED_BRANCH" ] && [ "$head" = "$PROTECTED_BRANCH" ]; then
+    # Both fell back to the protected branch: the PR could not be resolved. Say
+    # so, instead of reporting a base the guard never actually read — a PR based
+    # on the integration branch used to be denied with "base is main", which
+    # sends the reader to look at the wrong thing.
+    deny "gh pr merge could not resolve PR '${pr}'$([ -n "$repo" ] && printf " in %s" "$repo"), so the base branch is unknown" \
+      "pass the PR's repository explicitly (gh pr merge <n> --repo <owner>/<name>) and check the number exists"
+  fi
   if [ "$base" = "$PROTECTED_BRANCH" ]; then
     deny_human_merge "gh pr merge would merge a PR whose base is ${PROTECTED_BRANCH} (protected)"
   fi
+  if is_long_lived_branch "$head"; then
+    deny "gh pr merge would merge a PR whose HEAD branch is '${head}', which is long-lived; with delete_branch_on_merge the merge deletes it" \
+      "re-open the PR from a throwaway branch cut from '${head}' (git switch -c chore/back-merge-${head}-a-${base} origin/${head}) and merge that instead"
+  fi
   return 0
 }
-
 check_gh() {
   # Locate the first two subcommands, skipping global flags. Also capture the
   # first positional after `pr merge` (the PR number/URL/branch), for the
