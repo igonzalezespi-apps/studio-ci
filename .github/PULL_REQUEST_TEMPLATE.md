@@ -17,7 +17,17 @@
 
 ## Merge method
 
-This repository is **squash-only** (enforced by repo settings): every PR lands as one commit
-whose message is the **PR title**. The PR title MUST therefore be a valid Conventional Commit
-(e.g. `fix(preset): correct schedule for lockfile maintenance`) - it drives the computed
-changelog and version.
+<!-- REQUIRED - pick exactly one.
+
+  This repo's convention is **Squash**: every PR lands as one commit whose message is the PR
+  TITLE, which therefore MUST be a valid Conventional Commit
+  (e.g. `fix(setup-node): pin the action to a commit SHA`) - it drives the computed changelog and version.
+
+  That used to be ENFORCED by the repo settings (merge commits and rebase were switched off).
+  Since 2026-08-25 all three methods are enabled here, so this is policy now and nothing stops
+  the wrong one. GitHub also PRESELECTS the method you used last, so check the merge box before
+  clicking. -->
+
+- [ ] Squash (the convention here - the PR TITLE becomes the commit message)
+- [ ] Rebase (only for a multi-commit PR where every commit is a valid Conventional Commit)
+- [ ] Merge commit (only for a stacked parent, or a promotion PR into this branch)
