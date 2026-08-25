@@ -84,6 +84,12 @@ fx_deriva()   { refs "$1" 'v7.0.1' "[{\"ref\":\"refs/tags/v7.0.1\",\"object\":{\
 fx_anotado()  { refs "$1" 'v7.0.1' "[{\"ref\":\"refs/tags/v7.0.1\",\"object\":{\"sha\":\"$SHA_TAGOBJ\",\"type\":\"tag\"}}]"
                 printf '{"object":{"sha":"%s"}}\n' "$SHA_A" > "$1/fix/repos_acme_act_git_tags_$SHA_TAGOBJ.json"; }
 fx_sin_repo() { rm -f "$1/fix/repos_acme_act.json"; }
+# El tag NO existe: la API contesta `[]` con exit 0. Medido contra la API de verdad —
+# `gh api repos/actions/checkout/git/matching-refs/tags/vNOEXISTE` devuelve `[]` y rc=0.
+fx_tag_ausente() { refs "$1" 'v9.9.9' '[]'; }
+# La llamada FALLA: el `gh` simulado sale con 1 cuando no hay fichero. El repo SI existe, que es
+# justo la combinacion que fabricaba una violacion inventada.
+fx_api_falla()   { rm -f "$1/fix/repos_acme_act_git_matching-refs_tags_v7.0.1.json"; }
 
 echo "== 1. el ref tiene que ser un SHA de 40 hex =="
 corre "pineado con un tag mutable -> 1" 1 "acme/act@v7.0.1 # v7.0.1" fx_exacto "no es un SHA de 40 hex"
@@ -96,7 +102,17 @@ corre "SHA con comentario -> 0" 0 "acme/act@$SHA_A # v7.0.1" fx_exacto
 
 echo
 echo "== 3. el tag tiene que existir aguas arriba =="
-corre "el comentario nombra un tag inexistente -> 1" 1 "acme/act@$SHA_A # v9.9.9" "" "NO existe aguas arriba"
+# `[]` con exit 0, que es lo que devuelve la API DE VERDAD cuando el tag no existe. Antes este
+# caso no escribia fixture, o sea que el `gh` simulado salia con 1 — y eso NO es "el tag no
+# existe", es "no se pudo preguntar". El doble ensenaba un contrato que la API no tiene, y con el
+# puesto asi el caso de abajo (la API que falla) no se podia distinguir de este.
+corre "el comentario nombra un tag inexistente -> 1" 1 "acme/act@$SHA_A # v9.9.9" fx_tag_ausente "NO existe aguas arriba"
+
+# LA REGRESION DE HOY, y es la unica que separa un verificador util de uno que miente: si la
+# llamada a `matching-refs` FALLA —limite de peticiones, red, 403 transitorio— eso es NO MEDIDO,
+# no "ese tag no existe". Antes se deducia preguntando por OTRO endpoint (`repos/<owner>/<repo>`),
+# y si ese si contestaba, salia una VIOLACION INVENTADA sobre un tag que existe.
+corre "la API falla pero el repo existe -> 2 (NO MEDIDO), no 1" 2 "acme/act@$SHA_A # v7.0.1" fx_api_falla "no se pudo consultar la API"
 
 echo
 echo "== 4. deriva de etiqueta =="
