@@ -29,8 +29,27 @@ on:
     types: [opened, labeled, unlabeled, synchronize]
 
 concurrency:
+  # `cancel-in-progress: false` NO esta puesto por poner el valor por defecto: ES el arreglo.
+  #
+  # Una PR creada con su etiqueta en la MISMA llamada (`gh pr create --label`, que es lo que hace
+  # el envoltorio del estudio) dispara DOS eventos, `opened` y `labeled`, y por tanto dos runs en
+  # este mismo grupo. Con `cancel-in-progress: true` una MATA a la otra — y el check `cancelled`
+  # que deja NO desaparece: se queda pegado al commit, la PR pasa a `UNSTABLE` y GitHub la pinta
+  # en rojo aunque el gate haya salido verde. Medido el 2026-08-25 sobre el historial de este
+  # workflow en los OCHO repos que lo tienen: entre el 16% y el 56% de las runs acaban
+  # `cancelled`, y en dos de ellos hay MAS cancelled que success. Un check que sale rojo la mitad
+  # de las veces sin que pase nada deja de significar nada: entrena a ignorar el rojo.
+  #
+  # Cancelar aqui no ahorra nada que valga ese precio: el job es un `curl` y un `jq`, ~20 s. Con
+  # `false` las runs del grupo se SERIALIZAN en vez de matarse, asi que la ultima en reportar
+  # sigue siendo la del ultimo evento —lo unico que la cancelacion aportaba— y no se fabrica
+  # ningun `cancelled`.
+  #
+  # Y NO se arregla quitando `opened` de los `types`: una PR abierta SIN etiqueta no dispararia
+  # nada, el check no existiria y el gate desapareceria en silencio. Un fail-open es peor que un
+  # rojo.
   group: require-semver-label-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
