@@ -21,6 +21,23 @@ jobs:
 
       # The vendored guard extracts the command and reads its policy via node,
       # so node must be present for the suite to exercise real verdicts.
+      - name: PINS — ninguna accion clavada a un alias flotante
+        # La sexta comprobacion es la razon de que esta accion exista, y no la tenia ningun
+        # verificador de la flota: un pin comentado como `# v7` cuando existe `# v7.0.1`.
+        # Renovate trata el primero como cambio de DIGEST, que no lleva `releaseTimestamp`, asi
+        # que con `minimumReleaseAgeBehaviour` en su valor por defecto esa actualizacion NO PUEDE
+        # satisfacer la reja de edad jamas — y no da rojo: la PR se queda parada en silencio.
+        #
+        # Va en este workflow y no en uno propio porque es lo mismo que el resto: higiene del
+        # repo comprobada DISPARANDO, sobre el checkout que ya esta hecho, sin un runner mas.
+        #
+        # Su contrato de salida distingue las tres respuestas: 0 sanos, 1 al menos una violacion,
+        # y 2 NO SE PUDO MEDIR (sin `gh`, API caida, o cero workflows — un glob roto no es un
+        # verde). Los tres hacen lo correcto aqui: solo el 0 deja pasar.
+        uses: igonzalezespi-apps/studio-ci/check-action-pins@bab8a68625f3f0299041a07afb273a0b997c2b81 # v0.6.0
+        with:
+          github-token: ${{ github.token }}
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
