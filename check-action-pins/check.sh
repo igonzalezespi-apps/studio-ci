@@ -36,15 +36,27 @@ set -uo pipefail
 
 DIR="${1:-.github/workflows}"
 : "${GH_API:=gh api}"
+# Consulta SIN credencial, solo como ultimo recurso (ver el bloque que la usa). Inyectable para que
+# la suite pueda ejercerla sin red; por defecto `curl`, porque `gh` EXIGE un token y aqui la gracia
+# es justamente no llevarlo.
+: "${GH_API_ANON:=}"
+api_anon() { # api_anon <ruta>
+  if [ -n "$GH_API_ANON" ]; then PINS_RUTA="$1" bash -c "$GH_API_ANON"; return $?; fi
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -sSf --max-time 20 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"
+}
 TMPERR=$(mktemp); trap 'rm -f "$TMPERR"' EXIT INT TERM          # sustituible por la suite
 
 VIOL=0
 ERRS=0
+NOTAS=0
 SCANNED=0
 EXTERNAL=0
 
 viol() { printf '  ✖ %s\n' "$1" >&2; VIOL=$((VIOL + 1)); }
 oops() { printf '  ! %s\n' "$1" >&2; ERRS=$((ERRS + 1)); }
+# Ni violacion ni no-medido: se MIDIO, pero por una via que conviene que se vea en el informe.
+nota() { printf '  ~ %s\n' "$1" >&2; NOTAS=$((NOTAS + 1)); }
 
 if [ ! -d "$DIR" ]; then
   echo "::error::no existe el directorio de workflows: $DIR" >&2
@@ -127,9 +139,32 @@ for f in "${FILES[@]}"; do
       err=$(tr '\n' ' ' < "$TMPERR" | cut -c1-200)
       [ "$intento" = "1" ] && sleep 2
     done
+    # ULTIMO RECURSO: PREGUNTAR SIN CREDENCIAL.
+    #
+    # Medido el 2026-08-25: dos pins de `aquasecurity/trivy-action`, un repo PUBLICO con el tag
+    # existiendo, salian "no medido" de forma repetible desde el runner propio del estudio. El
+    # mensaje, una vez que se imprimio (v0.6.2), lo dijo entero:
+    #
+    #   gh: Although you appear to have the correct authorization credentials, the `aquasecurity`
+    #   organization has an IP allow list enabled, and your IP address is not permitted to access
+    #   this resource.
+    #
+    # La lista blanca de IPs de una organizacion restringe el acceso AUTENTICADO a sus recursos.
+    # Un repo publico se puede leer SIN credencial, y esa consulta no pasa por esa comprobacion.
+    #
+    # Y NO ABRE NINGUN AGUJERO, que es la unica pregunta que importa aqui: si el repo fuera
+    # privado, la consulta anonima tambien falla y se sigue reportando "no medido". Esto nunca
+    # convierte un fallo en un verde — solo recupera lo que ya era publico. Se anota en el informe
+    # para que no parezca una verificacion normal.
     if [ "$rc_refs" -ne 0 ]; then
-      oops "$where — no se pudo consultar la API para '$tag' tras 2 intentos (rc=$rc_refs): ${err:-<sin mensaje>}"
-      continue
+      refs=$(api_anon "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>"$TMPERR"); rc_anon=$?
+      if [ "$rc_anon" -eq 0 ] && [ -n "$refs" ]; then
+        nota "$where — '$tag' resuelto SIN credencial: la organizacion de origen bloquea por IP a este runner"
+        rc_refs=0
+      else
+        oops "$where — no se pudo consultar la API para '$tag' tras 2 intentos con credencial y 1 sin ella (rc=$rc_refs): ${err:-<sin mensaje>}"
+        continue
+      fi
     fi
     if [ -z "$refs" ] || [ "$refs" = "[]" ]; then
       viol "$where — el comentario dice '$tag' y ese tag NO existe aguas arriba"
@@ -177,7 +212,7 @@ for f in "${FILES[@]}"; do
   done < <(grep -hE '^\s*-?\s*uses:' "$f" 2>/dev/null)
 done
 
-echo "check-action-pins: $SCANNED linea(s) \`uses:\`, $EXTERNAL externa(s), $VIOL violacion(es), $ERRS sin medir."
+echo "check-action-pins: $SCANNED linea(s) \`uses:\`, $EXTERNAL externa(s), $VIOL violacion(es), $ERRS sin medir, $NOTAS resuelta(s) sin credencial."
 
 # Igual que en el resto de la flota: no haber podido medir NO es estar limpio, y se decide antes
 # que los hallazgos.

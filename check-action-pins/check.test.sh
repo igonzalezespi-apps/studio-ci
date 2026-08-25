@@ -61,11 +61,15 @@ monta() {  # monta <dir> <linea-uses>
 # exactamente asi, porque al seguir adelante caian en "ese tag no existe aguas arriba".
 corre() {
   local etiqueta="$1" quiero="$2" linea="$3" fx="${4:-}" patron="${5:-}"
+  local ANON="${ANON:-}"
   local R="$LAB/c$((PASS+FAIL))"
   monta "$R" "$linea"
   [ -z "$fx" ] || "$fx" "$R"
   local out rc
-  out=$(cd "$R" && GH_API="$LAB/bin/fakegh api" FIX="$R/fix" LAB="$LAB" LAB_INTENTOS="$LAB/intentos" bash "$CHECK" .github/workflows 2>&1); rc=$?
+  # `GH_API_ANON` se inyecta SIEMPRE, y por defecto falla. Sin esto la suite se escapa a la red de
+  # verdad por el camino anonimo —lo hizo— y tres casos pasaron a resolverse contra api.github.com
+  # en vez de contra el doble. Un test que sale a internet no prueba lo que dice probar.
+  out=$(cd "$R" && GH_API="$LAB/bin/fakegh api" GH_API_ANON="${ANON:-exit 7}" FIX="$R/fix" LAB="$LAB" LAB_INTENTOS="$LAB/intentos" bash "$CHECK" .github/workflows 2>&1); rc=$?
   if [ "$rc" -ne "$quiero" ]; then
     bad "$etiqueta" "esperaba exit $quiero, salio $rc"; printf '%s\n' "$out" | sed 's/^/         /'; return
   fi
@@ -153,6 +157,20 @@ corre "el comentario nombra un tag inexistente -> 1" 1 "acme/act@$SHA_A # v9.9.9
 corre "la API falla pero el repo existe -> 2 (NO MEDIDO), no 1" 2 "acme/act@$SHA_A # v7.0.1" fx_api_falla "no se pudo consultar la API"
 corre "el motivo del fallo LLEGA al informe" 2 "acme/act@$SHA_A # v7.0.1" fx_api_grita "rate limit exceeded"
 corre "un hipo de la API lo salva el reintento -> 0" 0 "acme/act@$SHA_A # v7.0.1" fx_api_hipo
+
+# EL CAMINO ANONIMO. Una organizacion con lista blanca de IPs rechaza la consulta AUTENTICADA desde
+# un runner cuya IP no esta en la lista, aunque el repo sea publico y el tag exista. Medido en la
+# flota el 2026-08-25 con `aquasecurity`. Un repo publico se puede leer sin credencial, y esa
+# consulta no pasa por esa comprobacion.
+fx_solo_anon() {
+  rm -f "$1/fix/repos_acme_act_git_matching-refs_tags_v7.0.1.json"
+  printf '[{"ref":"refs/tags/v7.0.1","object":{"sha":"%s","type":"commit"}}]' "$SHA_A" > "$LAB/anon.json"
+}
+ANON="cat $LAB/anon.json" corre "la credencial rebota por lista blanca de IP, el anonimo lo resuelve -> 0" \
+      0 "acme/act@$SHA_A # v7.0.1" fx_solo_anon "resuelto SIN credencial"
+# Y si el anonimo TAMPOCO puede, sigue siendo NO MEDIDO. Este es el caso que impide que el
+# respaldo se convierta en un fail-open: nunca vuelve verde lo que no se ha podido comprobar.
+corre "si el anonimo tampoco puede, sigue siendo 2" 2 "acme/act@$SHA_A # v7.0.1" fx_api_falla "sin ella"
 corre "y el simulado queda restaurado -> 0" 0 "acme/act@$SHA_A # v7.0.1" fx_restaura
 
 echo
