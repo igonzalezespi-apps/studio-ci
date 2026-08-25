@@ -55,6 +55,9 @@ make_input() {
 pass=0; fail=0; total=0
 # Per-group context, set before each table.
 TEST_POLICY=""; TEST_PR_BASE=""; TEST_PR_HEAD=""
+# Cual es el repo de la SESION. Por defecto, uno que el doble de `gh` no conoce, para que
+# todo caso con `--repo` recorra el camino ENTRE REPOS y lea la politica del destino.
+TEST_SESSION_REPO="owner/the-session-repo"
 # Prepended to PATH for a case, so GROUP 4 can put a fake `gh` in front of the
 # real one and exercise pr_base_branch FOR REAL instead of injecting its answer.
 TEST_PATH_PREFIX=""
@@ -71,6 +74,7 @@ run_case() {
     BASH_GUARD_POLICY="$TEST_POLICY" \
     BASH_GUARD_PR_BASE="$TEST_PR_BASE" \
     BASH_GUARD_PR_HEAD="$TEST_PR_HEAD" \
+    BASH_GUARD_SESSION_REPO="$TEST_SESSION_REPO" \
     PATH="$path_for_case" \
     "$GUARD" 2>&1)"
   rc=$?
@@ -284,8 +288,9 @@ run_case allow 'echo x > packages/database/src/generated/f.ts'  # no trees confi
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-# Fake `gh` for GROUP 4. Answers `pr view` only when --repo names a repo we know.
-sub1=""; sub2=""; repo=""; fields=""
+# Fake `gh` for GROUPS 4-6. Answers two calls: `pr view` (the PR's refs) and
+# `api repos/<r>/contents/scripts/hooks/guard.policy.json` (that repo's policy).
+sub1=""; sub2=""; repo=""; fields=""; apipath=""
 i=1
 for a in "$@"; do
   case "$a" in
@@ -297,10 +302,39 @@ for a in "$@"; do
     *) if [ -n "${want_repo:-}" ]; then repo="$a"; unset want_repo
        elif [ -n "${want_fields:-}" ]; then fields="$a"; unset want_fields
        elif [ -z "$sub1" ]; then sub1="$a"
-       elif [ -z "$sub2" ]; then sub2="$a"; fi ;;
+       elif [ -z "$sub2" ]; then sub2="$a"; apipath="$a"; fi ;;
   esac
   i=$((i + 1))
 done
+
+# --- la politica DEL REPO DESTINO -------------------------------------------
+# El guard la pide con `gh api repos/<r>/contents/... --jq .content` y la pasa por
+# `base64 -d`. El doble responde igual: base64 de un guard.policy.json.
+if [ "$sub1" = "api" ]; then
+  case "$apipath" in
+    repos/*/contents/scripts/hooks/guard.policy.json)
+      target="${apipath#repos/}"; target="${target%%/contents/*}"
+      case "$target" in
+        # permisivos: permiten mergear a su rama de integracion
+        owner/product-develop|owner/product-main|owner/backmerge-badhead|owner/backmerge-ok|owner/head-is-integration|owner/head-release-lts)
+          pol='{"agent_may_merge":true,"protected_branch":"main","integration_branch":"develop"}' ;;
+        # el mismo, mas una rama de vida larga declarada POR ESTE REPO
+        owner/policy-longlived)
+          pol='{"agent_may_merge":true,"protected_branch":"main","integration_branch":"develop","long_lived_branches":["release/lts"]}' ;;
+        # no llama `main` ni `develop` a sus dos ramas
+        owner/exotic-head-main|owner/exotic-head-integ|owner/exotic-release)
+          pol='{"agent_may_merge":true,"protected_branch":"trunk","integration_branch":"stable"}' ;;
+        # RESERVA sus merges al humano, diga lo que diga la sesion
+        owner/reserved-to-human)
+          pol='{"agent_may_merge":false,"protected_branch":"main","integration_branch":"develop"}' ;;
+        # sin politica vendorizada: 404, como el real
+        *) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+      esac
+      printf '%s' "$pol" | base64 -w0 2>/dev/null || printf '%s' "$pol" | base64
+      exit 0 ;;
+  esac
+  exit 1
+fi
 # The double must implement the invariant it is standing in for, or the caller
 # can stop asking for a field and the suite will not notice. Real `gh` with
 # `-q '.baseRefName + "\t" + .headRefName'` errors out when headRefName was not
@@ -315,13 +349,18 @@ esac
 if [ "$sub1" = "pr" ] && [ "$sub2" = "view" ]; then
   case "$repo" in
     owner/product-develop)   printf 'develop\tfeature/123-work'; exit 0 ;;
+    # mismo par de refs, pero su politica reserva el merge al humano
+    owner/reserved-to-human) printf 'develop\tfeature/123-work'; exit 0 ;;
     owner/product-main)      printf 'main\tdevelop';             exit 0 ;;
     # the incident shape: a back-merge opened with main as the HEAD
     owner/backmerge-badhead) printf 'develop\tmain';             exit 0 ;;
     # the correct shape: the same back-merge from a throwaway branch
     owner/backmerge-ok)      printf 'develop\tchore/back-merge-main-a-develop'; exit 0 ;;
-    # a head that is long-lived only because the POLICY names it
+    # dos repos con la MISMA cabeza `release/lts`, y la unica diferencia entre
+    # ellos es si su propia politica la declara de vida larga. Ese par es lo que
+    # prueba que `long_lived_branches` se lee del DESTINO.
     owner/policy-longlived)  printf 'develop\trelease/lts';       exit 0 ;;
+    owner/head-release-lts)  printf 'develop\trelease/lts';       exit 0 ;;
     # a repo whose own integration branch is the head
     owner/head-is-integration) printf 'feature/parent\tdevelop';  exit 0 ;;
     # under a policy that names NEITHER main NOR develop: only the built-in
@@ -369,55 +408,116 @@ run_case deny  'gh pr merge 465 --repo owner/backmerge-badhead --merge'
 run_case allow 'gh pr merge 126 --repo owner/backmerge-ok --merge --delete-branch'
 # head is the integration branch: also long-lived, also denied
 run_case deny  'gh pr merge 127 --repo owner/head-is-integration --rebase'
-# a policy-declared long-lived head is denied only when the policy names it...
-run_case allow 'gh pr merge 128 --repo owner/policy-longlived --squash'
+# una cabeza que NO esta en el suelo built-in y que la politica del destino no
+# declara: se permite. Su gemelo —misma cabeza, politica que SI la declara— esta
+# en el GROUP 5, y el par es lo unico que prueba de donde sale la declaracion.
+run_case allow 'gh pr merge 128 --repo owner/head-release-lts --squash'
 TEST_PATH_PREFIX=""
 
 # ============================================================================
-# GROUP 5 — long_lived_branches supplied BY THE POLICY.
+# GROUP 5 — LA POLITICA QUE MANDA ES LA DEL REPO DESTINO, no la de la sesion.
 #
-# The built-in floor (main/master/develop/...) cannot be configured away, but a
-# repo may add its own. Same stub, same commands as the last case of GROUP 4:
-# only the policy changes, so the flip in verdict can only come from the policy
-# being read.
+# Hasta la 1.9.0 mandaba siempre la de la SESION, porque el hook arranca con
+# `cd "$CLAUDE_PROJECT_DIR"` y esa era la unica que habia leido. Era inofensivo
+# SOLO por accidente: los repos cuya politica dice `agent_may_merge: false` no
+# tenian rama de integracion, asi que todas sus PRs apuntaban a la rama protegida
+# — y esa negativa no consulta ninguna politica. En cuanto uno de esos repos gane
+# una rama de integracion, una sesion permisiva podria mergear en el contra su
+# propia politica.
+#
+# Los dos casos de abajo son gemelos y van en DIRECCIONES OPUESTAS. Uno solo no
+# prueba nada: si solo estuviera el restrictivo, un guard que denegara siempre
+# los merges entre repos pasaria; si solo estuviera el permisivo, pasaria uno que
+# ignorase la politica del destino. Hacen falta los dos.
 # ============================================================================
-POL_LONGLIVED="$TMP/longlived.json"
-cat > "$POL_LONGLIVED" <<'JSON'
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
+TEST_SESSION_REPO="owner/the-session-repo"
+# sesion PERMISIVA + destino que RESERVA el merge al humano -> deniega.
+# Con la politica de la sesion mandando, esto seria un allow.
+run_case deny  'gh pr merge 123 --repo owner/reserved-to-human --squash'
+
+TEST_POLICY="$POL_PRISMA"   # agent_may_merge: false — la sesion NO permite mergear
+# sesion RESTRICTIVA + destino permisivo -> permite.
+# Este es el que prueba que de verdad se lee el destino: con la politica de la
+# sesion mandando, seria un deny.
+run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
+# ...y sin `--repo`, la que manda es la de la sesion, que sigue denegando.
+run_case deny  'gh pr merge 123 --squash'
+
+# `--repo` que nombra al PROPIO repo de la sesion: no hay lectura remota, manda
+# la politica ya cargada. Con la restrictiva, deniega.
+TEST_SESSION_REPO="owner/product-develop"
+run_case deny  'gh pr merge 123 --repo owner/product-develop --squash'
+# y con la permisiva, permite — mismo comando, misma sesion, otra politica local.
+TEST_POLICY="$POL_PRODUCT"
+run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
+TEST_SESSION_REPO="owner/the-session-repo"
+
+# Un destino SIN politica vendorizada (404) falla CERRADO: no saber que politica
+# gobierna un repo no puede leerse como "adelante".
+run_case deny  'gh pr merge 123 --repo owner/sin-politica --squash'
+
+# ...y con el MOTIVO correcto. Quitar ese deny deja el exit code intacto —el reset
+# a `agent_may_merge=false` de la linea siguiente lo deniega igual, por otra razon—
+# asi que solo el mensaje separa "no pude leer la politica de ese repo" de "ese
+# repo reserva sus merges al humano". Son dos problemas distintos con dos arreglos
+# distintos, y un mutante que borre el primero pasa desapercibido sin este caso.
+total=$((total + 1))
+sin_pol_msg="$(make_input 'gh pr merge 123 --repo owner/sin-politica --squash' | env \
+  BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
+  BASH_GUARD_SESSION_REPO="owner/the-session-repo" \
+  PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
+case "$sin_pol_msg" in
+  *"could not be read"*) pass=$((pass + 1)) ;;
+  *) fail=$((fail + 1)); printf 'FAIL  destino ilegible denegado con un motivo que no lo explica  ::  %s\n' "$sin_pol_msg" ;;
+esac
+
+# La sesion declara `release/lts` de vida larga; el destino NO. Manda el destino,
+# asi que se permite. Sin resetear las globales antes de leer la politica remota,
+# la declaracion de la SESION sobreviviria y este caso saldria deny.
+POL_SESION_LONGLIVED="$TMP/sesion-longlived.json"
+cat > "$POL_SESION_LONGLIVED" <<'JSON'
 { "agent_may_merge": true, "protected_branch": "main", "integration_branch": "develop",
   "long_lived_branches": ["release/lts"],
   "generated_trees": [], "egress_allow": ["localhost", "127.0.0.1", "::1"] }
 JSON
-TEST_POLICY="$POL_LONGLIVED"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
-# ...and now that the policy names it, the very same command is denied.
+TEST_POLICY="$POL_SESION_LONGLIVED"
+run_case allow 'gh pr merge 128 --repo owner/head-release-lts --squash'
+TEST_POLICY="$POL_PRODUCT"
+
+# Un `cwd` que NO es un repo: `session_repo` no tiene respuesta. Eso NO puede
+# significar "soy el destino" — significa que no se quien soy, y entonces hay que
+# ir a leer la politica del destino igual. Con el destino restrictivo, deniega.
+TEST_SESSION_REPO=""
+run_case deny  'gh pr merge 123 --repo owner/reserved-to-human --squash'
+TEST_SESSION_REPO="owner/the-session-repo"
+
+# `long_lived_branches` lo aporta el DESTINO. Gemelo del ultimo caso del GROUP 4:
+# misma cabeza `release/lts`, misma politica de sesion, y lo unico que cambia es
+# que ESTE repo la declara de vida larga en su propia politica.
 run_case deny  'gh pr merge 128 --repo owner/policy-longlived --squash'
-# the built-in floor still applies under this policy
-run_case deny  'gh pr merge 465 --repo owner/backmerge-badhead --merge'
-# and a work branch is still allowed
-run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
-TEST_PATH_PREFIX=""
 
 # ============================================================================
-# GROUP 5b — a policy that names NEITHER `main` NOR `develop`.
+# GROUP 5b — un destino que NO llama `main` ni `develop` a sus dos ramas.
 #
-# Without this group the built-in floor and the protected/integration rules are
-# indistinguishable: under the normal policy `main` is caught by BOTH, so
-# deleting either one leaves the suite green (measured — three surviving
-# mutants). Here `protected_branch` is `trunk` and `integration_branch` is
-# `stable`, so each rule is the only thing standing between a case and an allow.
+# Sin este grupo, el suelo built-in de ramas de vida larga y las reglas de
+# protected/integration son INDISTINGUIBLES: bajo una politica que llama `main` a
+# su rama protegida y `develop` a la de integracion, `main` lo caza el suelo Y lo
+# caza la regla, asi que se puede borrar cualquiera de las dos con la suite verde
+# (medido: tres mutantes supervivientes). Aqui la politica del destino dice
+# `protected_branch: trunk` e `integration_branch: stable`, asi que cada regla es
+# lo unico que separa a su caso de un allow.
 # ============================================================================
-POL_EXOTIC="$TMP/exotic.json"
-cat > "$POL_EXOTIC" <<'JSON'
-{ "agent_may_merge": true, "protected_branch": "trunk", "integration_branch": "stable",
-  "generated_trees": [], "egress_allow": ["localhost", "127.0.0.1", "::1"] }
-JSON
-TEST_POLICY="$POL_EXOTIC"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
-# head `main` under a policy that never mentions main: only the built-in floor
-# can deny it. Remove the floor and this case allows.
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
+TEST_SESSION_REPO="owner/the-session-repo"
+# cabeza `main` bajo una politica que no menciona `main`: solo el suelo built-in
+# puede denegarlo. Quita el suelo y este caso pasa a allow.
 run_case deny  'gh pr merge 200 --repo owner/exotic-head-main --merge'
-# head `stable` is long-lived only because it is this repo's integration branch
+# cabeza `stable`, que es de vida larga SOLO por ser la rama de integracion de
+# ese repo — y `stable` no esta en el suelo built-in.
 run_case deny  'gh pr merge 201 --repo owner/exotic-head-integ --rebase'
-# and the ordinary work-branch case still passes under the same policy, so the
-# two denies above are not an artefact of the policy being unreadable
+# y el caso de rama de trabajo normal sigue pasando bajo la misma politica, para
+# que los dos deny de arriba no sean un artefacto de una politica ilegible.
 run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
 TEST_PATH_PREFIX=""
 
@@ -432,6 +532,7 @@ TEST_PATH_PREFIX=""
 TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
 unresolved_msg="$(make_input 'gh pr merge 789 --squash' | env \
   BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
+  BASH_GUARD_SESSION_REPO="owner/the-session-repo" \
   PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
 total=$((total + 1))
 case "$unresolved_msg" in
@@ -443,9 +544,11 @@ esac
 # branch (the release PR) must be denied as protected-base, never as
 # unresolvable. Both exit 2, so only the message separates them — which is why
 # collapsing the two conditions into one went unnoticed by every exit-code case.
-TEST_POLICY="$POL_EXOTIC"
+# La politica exotica ya no es un fichero local: la sirve el doble de `gh` como la
+# del repo DESTINO, que es quien manda desde la 1.10.0.
 resolved_msg="$(make_input 'gh pr merge 202 --repo owner/exotic-release --merge' | env \
   BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
+  BASH_GUARD_SESSION_REPO="owner/the-session-repo" \
   PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
 total=$((total + 1))
 case "$resolved_msg" in
@@ -454,6 +557,50 @@ case "$resolved_msg" in
   *) fail=$((fail + 1)); printf 'FAIL  resolved release PR denied with an unexpected reason  ::  %s\n' "$resolved_msg" ;;
 esac
 TEST_PATH_PREFIX=""
+
+# ============================================================================
+# GROUP 7 — session_repo() DE VERDAD, sin el override.
+#
+# Todos los casos de arriba inyectan `BASH_GUARD_SESSION_REPO`, asi que la funcion
+# que deriva "owner/name" de la URL del remoto no se ejecutaba NUNCA — el mismo
+# agujero que tuvo `pr_base_branch` hasta la 1.7.5. Aqui se ejecuta contra un repo
+# de verdad, con las dos formas de URL.
+#
+# El fixture usa `owner/reserved-to-human` a proposito: su politica REMOTA reserva
+# el merge al humano y la LOCAL lo permite, asi que los dos caminos dan verdictos
+# OPUESTOS. Si `session_repo` devolviera cualquier otra cosa (la URL cruda, un
+# vacio), el guard leeria la remota y denegaria.
+#
+# HERMETICO FRENTE AL ENTORNO DE GIT: subshell con GIT_DIR y GIT_WORK_TREE
+# desarmados. Un `git init` dentro de un test lanzado desde un hook hereda el
+# GIT_DIR que git exporta y reinicia el repo real.
+# ============================================================================
+sesion_real() { # sesion_real <url-del-remoto> <allow|deny>
+  local url="$1" expected="$2" out rc want
+  total=$((total + 1))
+  (
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+    d="$(mktemp -d "$TMP/sess.XXXXXX")"
+    git -C "$d" init -q -b main
+    git -C "$d" remote add origin "$url"
+    cd "$d" || exit 3
+    make_input 'gh pr merge 123 --repo owner/reserved-to-human --squash' | env \
+      BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
+      PATH="$TMP/bin:$PATH" "$GUARD" >/dev/null 2>&1
+    exit $?
+  )
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  session_repo real con %-42s esperaba %s (exit %d), salio %d\n' "$url" "$expected" "$want" "$rc"
+}
+# El remoto ES el repo de la PR -> manda la politica LOCAL (permisiva) -> allow.
+sesion_real 'https://github.com/owner/reserved-to-human.git' allow
+sesion_real 'git@github.com:owner/reserved-to-human.git'     allow
+sesion_real 'https://github.com/owner/reserved-to-human'     allow
+# El remoto es OTRO repo -> se lee la politica REMOTA (restrictiva) -> deny.
+sesion_real 'https://github.com/owner/otro-repo.git'         deny
 
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi

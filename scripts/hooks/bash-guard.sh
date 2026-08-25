@@ -54,7 +54,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # defaults: no generated trees, agent may not merge, main protected, egress
 # restricted to localhost. Strict-by-default: an absent policy never weakens.
 POLICY_FILE="${BASH_GUARD_POLICY:-$HERE/guard.policy.json}"
-POLICY_TSV="$(node -e '
+# The reader itself, kept in a variable: the SAME strict-defaults parser has to serve
+# both this repo's policy and (in check_pr_merge) a target repo's. Two copies would
+# drift, and the one that drifted would be the one nobody runs locally.
+POLICY_READER='
 const fs = require("fs");
 let p = {};
 try { p = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) {}
@@ -75,7 +78,8 @@ out.push("REGEN\t" + regen);
 for (const t of trees) if (typeof t === "string" && t) out.push("TREE\t" + t);
 for (const h of egress) if (typeof h === "string" && h) out.push("EGRESS\t" + h);
 process.stdout.write(out.join("\n") + "\n");
-' "$POLICY_FILE" 2>/dev/null || true)"
+'
+POLICY_TSV="$(node -e "$POLICY_READER" "$POLICY_FILE" 2>/dev/null || true)"
 
 AGENT_MAY_MERGE=false
 PROTECTED_BRANCH=main
@@ -371,6 +375,50 @@ is_long_lived_branch() {
   return 1
 }
 
+# Which repo is the SESSION rooted in? The hook runs with `cd "$CLAUDE_PROJECT_DIR"`,
+# so this is the repo whose guard.policy.json was loaded at the top of this file.
+# Emits "<owner>/<name>", or nothing when the cwd is not a git repo with an origin.
+# TEST-ONLY override: BASH_GUARD_SESSION_REPO.
+session_repo() {
+  if [ -n "${BASH_GUARD_SESSION_REPO+x}" ]; then
+    printf '%s' "$BASH_GUARD_SESSION_REPO"
+    return 0
+  fi
+  local url
+  url="$(git config --get remote.origin.url 2>/dev/null || true)"
+  [ -n "$url" ] || return 0
+  # The last two path segments, for both spellings:
+  #   https://github.com/owner/name.git   git@github.com:owner/name.git
+  printf '%s' "$url" | sed -E 's#\.git$##; s#/$##; s#^.*[:/]([^/]+)/([^/]+)$#\1/\2#'
+}
+
+# Turn a guard.policy.json FILE into the same TSV the top of this script parses.
+# Extracted so the identical strict-defaults reader serves both the session's
+# policy and a target repo's — two readers would drift, and the one that drifted
+# would be the one nobody runs locally.
+policy_tsv_from_file() {
+  node -e "$POLICY_READER" "$1" 2>/dev/null || true
+}
+
+# The guard policy of ANOTHER repo, read from its origin. Empty output = could not
+# read it, which the caller MUST treat as a denial.
+# TEST-ONLY override: BASH_GUARD_TARGET_POLICY (a file path).
+target_policy_tsv() {
+  local repo="$1" content tmp tsv
+  if [ -n "${BASH_GUARD_TARGET_POLICY:-}" ]; then
+    policy_tsv_from_file "$BASH_GUARD_TARGET_POLICY"
+    return 0
+  fi
+  content="$(gh api "repos/${repo}/contents/scripts/hooks/guard.policy.json" --jq .content 2>/dev/null \
+    | base64 -d 2>/dev/null || true)"
+  [ -n "$content" ] || return 0
+  tmp="$(mktemp)" || return 0
+  printf '%s' "$content" > "$tmp"
+  tsv="$(policy_tsv_from_file "$tmp")"
+  rm -f "$tmp"
+  printf '%s' "$tsv"
+}
+
 # A `gh pr merge` attempt. Three independent negatives, in this order:
 #   1. the policy does not grant agent_may_merge;
 #   2. the base is the protected branch (human-only, per contract) — this one
@@ -380,10 +428,47 @@ is_long_lived_branch() {
 # Denying (3) can never block a merge the agent could otherwise perform: the one
 # legitimate PR with a long-lived head is the release (head `develop`, base
 # `main`), and (2) already denies that.
+#
+# WHOSE POLICY DECIDES. Until 1.9.0 it was always the SESSION's, because the hook
+# starts with `cd "$CLAUDE_PROJECT_DIR"` and that is the only policy it had read.
+# That was harmless only by accident: the repos whose policy says
+# `agent_may_merge: false` had no integration branch, so every one of their PRs
+# targeted the protected branch — and negative (2) does not consult any policy.
+# The moment such a repo gains an integration branch, a session rooted somewhere
+# permissive could merge into it against that repo's own policy.
+# So a merge naming another repo re-reads THAT repo's guard.policy.json from its
+# origin and decides with it, failing CLOSED when it cannot be read. The globals
+# are reassigned rather than shadowed on purpose: this process exits right after,
+# and threading four values through three helpers would be the kind of change
+# that quietly stops covering one of them.
 check_pr_merge() {
-  local pr="$1" repo="${2:-}" refs base head
+  local pr="$1" repo="${2:-}" refs base head sess tsv
+  sess="$(session_repo)"
+  # No `--repo`, or it names the session's own repo -> the policy already loaded
+  # is the right one. Anything else — including a cwd that is not a repo, where
+  # `sess` is empty and "who am I" has no answer — goes and reads the target's.
+  if [ -n "$repo" ] && [ "$repo" != "$sess" ]; then
+    tsv="$(target_policy_tsv "$repo")"
+    if [ -z "$tsv" ]; then
+      deny "gh pr merge targets ${repo}, whose scripts/hooks/guard.policy.json could not be read, so the policy that governs it is unknown" \
+        "check the repo name, or merge from a session rooted in that repo (a repo with no vendored policy reserves its merges to a human)"
+    fi
+    AGENT_MAY_MERGE=false
+    PROTECTED_BRANCH=main
+    INTEGRATION_BRANCH=""
+    LONG_LIVED_BRANCHES=()
+    while IFS=$'\t' read -r key val; do
+      case "$key" in
+        MERGE) AGENT_MAY_MERGE="$val" ;;
+        PROTECTED) PROTECTED_BRANCH="$val" ;;
+        INTEGRATION) INTEGRATION_BRANCH="$val" ;;
+        LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
+      esac
+    done <<<"$tsv"
+  fi
+
   if [ "$AGENT_MAY_MERGE" != "true" ]; then
-    deny_human_merge "gh pr merge merges the PR from the CLI"
+    deny_human_merge "gh pr merge merges the PR from the CLI$([ -n "$repo" ] && [ "$repo" != "$sess" ] && printf ", and %s reserves its merges to a human" "$repo")"
   fi
   refs="$(pr_refs "$pr" "$repo")"
   base="${refs%%$'\t'*}"
