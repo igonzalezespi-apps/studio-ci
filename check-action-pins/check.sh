@@ -43,7 +43,10 @@ DIR="${1:-.github/workflows}"
 api_anon() { # api_anon <ruta>
   if [ -n "$GH_API_ANON" ]; then PINS_RUTA="$1" bash -c "$GH_API_ANON"; return $?; fi
   command -v curl >/dev/null 2>&1 || return 1
-  curl -sSf --max-time 20 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"
+  # `-L`: un repo renombrado contesta 301, y `-f` NO lo considera error — sin seguirlo, lo que
+  # llega es el cuerpo del redirect, que tampoco es un array. La validacion de forma ya lo caza,
+  # pero es mejor resolverlo que reportarlo.
+  curl -sSfL --max-time 20 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"
 }
 TMPERR=$(mktemp); trap 'rm -f "$TMPERR"' EXIT INT TERM          # sustituible por la suite
 
@@ -158,11 +161,21 @@ for f in "${FILES[@]}"; do
     # para que no parezca una verificacion normal.
     if [ "$rc_refs" -ne 0 ]; then
       refs=$(api_anon "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>"$TMPERR"); rc_anon=$?
-      if [ "$rc_anon" -eq 0 ] && [ -n "$refs" ]; then
+      # SE VALIDA LA FORMA, no que "haya venido algo". Esto es un arreglo de su primera version, y
+      # el fallo es instructivo: se aceptaba cualquier respuesta no vacia, y desde el runner del
+      # estudio la consulta anonima devolvio un OBJETO DE ERROR (`{"message":...}`) en vez de la
+      # lista de refs. El script lo trato como resuelto, `jq` no encontro el tag dentro y lo
+      # reporto como DERIVA — una violacion inventada, con el cuerpo del error incrustado en el
+      # mensaje: «ese tag apunta a {"message":"». Peor que el problema que venia a resolver.
+      #
+      # Una respuesta valida de `matching-refs` es SIEMPRE un array. Cualquier otra cosa es un
+      # fallo disfrazado de exito, y aqui se trata como lo que es: no medido.
+      if [ "$rc_anon" -eq 0 ] && printf '%s' "$refs" | jq -e 'type == "array"' >/dev/null 2>&1; then
         nota "$where — '$tag' resuelto SIN credencial: la organizacion de origen bloquea por IP a este runner"
         rc_refs=0
       else
-        oops "$where — no se pudo consultar la API para '$tag' tras 2 intentos con credencial y 1 sin ella (rc=$rc_refs): ${err:-<sin mensaje>}"
+        cuerpo=$(printf '%s' "$refs" | tr '\n' ' ' | cut -c1-120)
+        oops "$where — no se pudo consultar la API para '$tag' tras 2 intentos con credencial y 1 sin ella (rc=$rc_refs, anon rc=$rc_anon): ${err:-<sin mensaje>}${cuerpo:+ | respuesta anonima: $cuerpo}"
         continue
       fi
     fi

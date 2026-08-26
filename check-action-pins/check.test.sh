@@ -171,6 +171,15 @@ ANON="cat $LAB/anon.json" corre "la credencial rebota por lista blanca de IP, el
 # Y si el anonimo TAMPOCO puede, sigue siendo NO MEDIDO. Este es el caso que impide que el
 # respaldo se convierta en un fail-open: nunca vuelve verde lo que no se ha podido comprobar.
 corre "si el anonimo tampoco puede, sigue siendo 2" 2 "acme/act@$SHA_A # v7.0.1" fx_api_falla "sin ella"
+
+# EL CASO QUE FALTABA, y costo una violacion INVENTADA en produccion: la consulta anonima puede
+# contestar con exito y devolver algo que NO es una lista de refs — un objeto de error, el cuerpo
+# de un redirect. La primera version aceptaba cualquier respuesta no vacia, `jq` no encontraba el
+# tag dentro, y salia como DERIVA con el JSON del error incrustado en el mensaje.
+fx_anon_basura() { rm -f "$1/fix/repos_acme_act_git_matching-refs_tags_v7.0.1.json"; }
+ANON='printf %s "{\"message\":\"Not Found\"}"' corre \
+      "el anonimo contesta algo que NO es una lista de refs -> 2, no una violacion inventada" \
+      2 "acme/act@$SHA_A # v7.0.1" fx_anon_basura "respuesta anonima"
 corre "y el simulado queda restaurado -> 0" 0 "acme/act@$SHA_A # v7.0.1" fx_restaura
 
 echo
