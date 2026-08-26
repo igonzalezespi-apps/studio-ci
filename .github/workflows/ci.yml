@@ -3,7 +3,11 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    # `develop` entra el 2026-08-26 con la FASE 3. Desde hoy el trabajo aterriza ahi y no en `main`:
+    # dejar solo `main` habria hecho que el push que de verdad integra el cambio no ejecutara nada,
+    # y que la primera senal llegara en la release. Las PRs ya lo disparan; esto cubre el push de
+    # despues del merge.
+    branches: [main, develop]
 
 permissions:
   contents: read

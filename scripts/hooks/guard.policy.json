@@ -1,7 +1,7 @@
 {
-  "agent_may_merge": false,
+  "agent_may_merge": true,
   "protected_branch": "main",
-  "integration_branch": "",
+  "integration_branch": "develop",
   "generated_trees": [],
   "egress_allow": ["localhost", "127.0.0.1", "::1"]
 }
