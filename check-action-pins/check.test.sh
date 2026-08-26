@@ -180,6 +180,31 @@ fx_anon_basura() { rm -f "$1/fix/repos_acme_act_git_matching-refs_tags_v7.0.1.js
 ANON='printf %s "{\"message\":\"Not Found\"}"' corre \
       "el anonimo contesta algo que NO es una lista de refs -> 2, no una violacion inventada" \
       2 "acme/act@$SHA_A # v7.0.1" fx_anon_basura "respuesta anonima"
+
+# EL SITIO OLVIDADO: un tag ANOTADO obliga a una SEGUNDA llamada para desreferenciarlo, y esa no
+# tenia ni respaldo ni validacion. Con la credencial rebotando por lista blanca de IP devolvia un
+# cuerpo de error que se acepto COMO SI FUERA UN SHA, y salio como DERIVA: «ese tag apunta a
+# {"message":». Arreglar un sitio de un patron que tiene dos es como no arreglarlo.
+fx_anotado_sin_deref() {
+  refs "$1" 'v7.0.1' "[{\"ref\":\"refs/tags/v7.0.1\",\"object\":{\"sha\":\"$SHA_TAGOBJ\",\"type\":\"tag\"}}]"
+  # EL CUERPO DE ERROR LLEGA CON EXITO, que es lo que hace el caso fiel al fallo real. Con el `gh`
+  # simulado saliendo con error, el codigo viejo tambien lo cazaba —por el `[ -z "$deref" ]`— y el
+  # caso pasaba por un motivo que no era el suyo. Lo que ocurrio de verdad es que la respuesta vino
+  # con rc=0 y con contenido, y se acepto como si fuera un SHA.
+  printf '{"message":"Although you appear to have the correct authorization credentials..."}' \
+    > "$1/fix/repos_acme_act_git_tags_$SHA_TAGOBJ.json"
+}
+ANON='printf %s "{\"message\":\"Not Found\"}"' corre \
+      "tag anotado: la desreferencia tampoco se traga un cuerpo de error -> 2" \
+      2 "acme/act@$SHA_A # v7.0.1" fx_anotado_sin_deref "desreferenciar"
+
+fx_anotado_solo_anon() {
+  fx_anotado_sin_deref "$1"
+  printf '{"object":{"sha":"%s"}}' "$SHA_A" > "$LAB/anon.json"
+}
+ANON="cat $LAB/anon.json" corre \
+      "tag anotado: la desreferencia la salva el anonimo -> 0" \
+      0 "acme/act@$SHA_A # v7.0.1" fx_anotado_solo_anon "SIN credencial"
 corre "y el simulado queda restaurado -> 0" 0 "acme/act@$SHA_A # v7.0.1" fx_restaura
 
 echo

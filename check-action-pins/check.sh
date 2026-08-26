@@ -40,6 +40,42 @@ DIR="${1:-.github/workflows}"
 # la suite pueda ejercerla sin red; por defecto `curl`, porque `gh` EXIGE un token y aqui la gracia
 # es justamente no llevarlo.
 : "${GH_API_ANON:=}"
+# TODO EL PROTOCOLO EN UN SOLO SITIO, y esa es la correccion de fondo.
+#
+# Antes esto estaba escrito a mano en la consulta de `matching-refs` — dos intentos con credencial,
+# respaldo anonimo, validacion de forma — y NO en la que desreferencia un tag anotado. Resultado:
+# `matching-refs` se resolvia por el respaldo, el tag resultaba ser anotado, y la SEGUNDA llamada
+# —autenticada, sin respaldo y sin validar— chocaba con la misma lista blanca de IPs y devolvia un
+# cuerpo de error que se acepto como si fuera un SHA. Salio como DERIVA: «ese tag apunta a
+# {"message":». Arreglar un sitio de un patron que tiene dos es como no arreglarlo.
+#
+# `api_con_respaldo <ruta> <filtro-jq-de-validacion>` — imprime el cuerpo y sale 0 solo si la
+# respuesta PASA la validacion. Cualquier otra cosa es no medido.
+# EL DIAGNOSTICO VIAJA POR FICHERO, no por variable, y esto no es estilo: esta funcion se llama
+# dentro de `$( )`, que es un SUBSHELL — cualquier variable que asigne muere al volver. La primera
+# version usaba variables y el mensaje llegaba siempre como "<sin mensaje>", con el motivo real
+# perdido. Lo cazaron los tests; en produccion habria sido otra vuelta de adivinar.
+api_con_respaldo() {
+  local ruta="$1" valida="$2" cuerpo rc
+  : > "$TMPBODY"; : > "$TMPANON"
+  local intento
+  for intento in 1 2; do
+    cuerpo=$($GH_API "$ruta" 2>"$TMPERR"); rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s' "$cuerpo" | jq -e "$valida" >/dev/null 2>&1; then
+      printf '%s' "$cuerpo"; return 0
+    fi
+    [ "$intento" = "1" ] && sleep 2
+  done
+  # Respaldo sin credencial: una lista blanca de IPs restringe el acceso AUTENTICADO a los recursos
+  # de una organizacion, y un repo publico se lee sin token.
+  cuerpo=$(api_anon "$ruta" 2>>"$TMPERR"); rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$cuerpo" | jq -e "$valida" >/dev/null 2>&1; then
+    printf '%s' "$cuerpo"; echo 1 > "$TMPANON"; return 0
+  fi
+  printf '%s' "$cuerpo" | tr '\n' ' ' | cut -c1-120 > "$TMPBODY"
+  return 1
+}
+
 api_anon() { # api_anon <ruta>
   if [ -n "$GH_API_ANON" ]; then PINS_RUTA="$1" bash -c "$GH_API_ANON"; return $?; fi
   command -v curl >/dev/null 2>&1 || return 1
@@ -48,7 +84,16 @@ api_anon() { # api_anon <ruta>
   # pero es mejor resolverlo que reportarlo.
   curl -sSfL --max-time 20 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"
 }
-TMPERR=$(mktemp); trap 'rm -f "$TMPERR"' EXIT INT TERM          # sustituible por la suite
+TMPERR=$(mktemp); TMPBODY=$(mktemp); TMPANON=$(mktemp)
+trap 'rm -f "$TMPERR" "$TMPBODY" "$TMPANON"' EXIT INT TERM
+# Junta lo que se sepa del ultimo fallo: el stderr de la llamada con credencial y el cuerpo que
+# devolvio la anonima. Sin esto, "no se pudo medir" vuelve a ser un callejon sin salida.
+diagnostico() {
+  local e c
+  e=$(tr '\n' ' ' < "$TMPERR" | cut -c1-200)
+  c=$(cat "$TMPBODY" 2>/dev/null)
+  printf '%s%s' "${e:-<sin mensaje>}" "${c:+ | respuesta anonima: $c}"
+}          # sustituible por la suite
 
 VIOL=0
 ERRS=0
@@ -135,50 +180,12 @@ for f in "${FILES[@]}"; do
     # limite secundario por rafaga— y un verificador fail-closed que se pone rojo al primer
     # hipo se convierte en ruido. Uno solo: si el segundo tambien falla, es que pasa algo de
     # verdad y hay que verlo.
-    err=""
-    for intento in 1 2; do
-      refs=$($GH_API "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>"$TMPERR"); rc_refs=$?
-      [ "$rc_refs" -eq 0 ] && break
-      err=$(tr '\n' ' ' < "$TMPERR" | cut -c1-200)
-      [ "$intento" = "1" ] && sleep 2
-    done
-    # ULTIMO RECURSO: PREGUNTAR SIN CREDENCIAL.
-    #
-    # Medido el 2026-08-25: dos pins de `aquasecurity/trivy-action`, un repo PUBLICO con el tag
-    # existiendo, salian "no medido" de forma repetible desde el runner propio del estudio. El
-    # mensaje, una vez que se imprimio (v0.6.2), lo dijo entero:
-    #
-    #   gh: Although you appear to have the correct authorization credentials, the `aquasecurity`
-    #   organization has an IP allow list enabled, and your IP address is not permitted to access
-    #   this resource.
-    #
-    # La lista blanca de IPs de una organizacion restringe el acceso AUTENTICADO a sus recursos.
-    # Un repo publico se puede leer SIN credencial, y esa consulta no pasa por esa comprobacion.
-    #
-    # Y NO ABRE NINGUN AGUJERO, que es la unica pregunta que importa aqui: si el repo fuera
-    # privado, la consulta anonima tambien falla y se sigue reportando "no medido". Esto nunca
-    # convierte un fallo en un verde — solo recupera lo que ya era publico. Se anota en el informe
-    # para que no parezca una verificacion normal.
-    if [ "$rc_refs" -ne 0 ]; then
-      refs=$(api_anon "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 2>"$TMPERR"); rc_anon=$?
-      # SE VALIDA LA FORMA, no que "haya venido algo". Esto es un arreglo de su primera version, y
-      # el fallo es instructivo: se aceptaba cualquier respuesta no vacia, y desde el runner del
-      # estudio la consulta anonima devolvio un OBJETO DE ERROR (`{"message":...}`) en vez de la
-      # lista de refs. El script lo trato como resuelto, `jq` no encontro el tag dentro y lo
-      # reporto como DERIVA — una violacion inventada, con el cuerpo del error incrustado en el
-      # mensaje: «ese tag apunta a {"message":"». Peor que el problema que venia a resolver.
-      #
-      # Una respuesta valida de `matching-refs` es SIEMPRE un array. Cualquier otra cosa es un
-      # fallo disfrazado de exito, y aqui se trata como lo que es: no medido.
-      if [ "$rc_anon" -eq 0 ] && printf '%s' "$refs" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        nota "$where — '$tag' resuelto SIN credencial: la organizacion de origen bloquea por IP a este runner"
-        rc_refs=0
-      else
-        cuerpo=$(printf '%s' "$refs" | tr '\n' ' ' | cut -c1-120)
-        oops "$where — no se pudo consultar la API para '$tag' tras 2 intentos con credencial y 1 sin ella (rc=$rc_refs, anon rc=$rc_anon): ${err:-<sin mensaje>}${cuerpo:+ | respuesta anonima: $cuerpo}"
-        continue
-      fi
+    if ! refs=$(api_con_respaldo "repos/$owner/$api_repo/git/matching-refs/tags/$tag" 'type == "array"'); then
+      oops "$where — no se pudo consultar la API para '$tag' (2 intentos con credencial + 1 sin ella): $(diagnostico)"
+      continue
     fi
+    [ -s "$TMPANON" ] && nota "$where — '$tag' resuelto SIN credencial: la organizacion de origen bloquea por IP a este runner"
+
     if [ -z "$refs" ] || [ "$refs" = "[]" ]; then
       viol "$where — el comentario dice '$tag' y ese tag NO existe aguas arriba"
       continue
@@ -194,9 +201,16 @@ for f in "${FILES[@]}"; do
     # con un SHA de commit falla por un motivo que no es el suyo.
     tipo=$(printf '%s' "$refs" | jq -r --arg t "refs/tags/$tag" 'map(select(.ref == $t))|.[0].object.type // ""' 2>/dev/null)
     if [ "$tipo" = "tag" ]; then
-      deref=$($GH_API "repos/$owner/$api_repo/git/tags/$exacto" --jq '.object.sha' 2>/dev/null)
-      if [ -z "$deref" ]; then oops "$where — no se pudo desreferenciar el tag anotado '$tag'"; continue; fi
-      exacto="$deref"
+      # MISMO PROTOCOLO QUE ARRIBA: reintento, respaldo anonimo y validacion de forma. Este era el
+      # sitio olvidado. Y la validacion no es `no vacio`: se exige que el objeto traiga un
+      # `object.sha` de 40 hex, porque un cuerpo de error tambien es "no vacio" y se colo como si
+      # fuera un SHA.
+      if ! obj=$(api_con_respaldo "repos/$owner/$api_repo/git/tags/$exacto" '.object.sha | test("^[0-9a-f]{40}$")'); then
+        oops "$where — no se pudo desreferenciar el tag anotado '$tag': $(diagnostico)"
+        continue
+      fi
+      [ -s "$TMPANON" ] && nota "$where — tag anotado '$tag' desreferenciado SIN credencial"
+      exacto=$(printf '%s' "$obj" | jq -r '.object.sha')
     fi
 
     if [ "$exacto" != "$ref" ]; then
