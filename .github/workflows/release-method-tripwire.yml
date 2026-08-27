@@ -1,0 +1,53 @@
+name: release-method-tripwire
+on:
+  push:
+    branches: [main]
+
+# POR QUE EXISTE.
+#
+# Este repo paso a `develop`->`main` el 2026-08-26 (FASE 3 de la migracion de topologia). Su
+# `develop`->`main` es una RELEASE: lo que los demas repos consumen de aqui es un TAG, y el tag se
+# corta sobre `main`.
+#
+# Un rebase-merge de la release reescribe sus commits sobre `main` bajo SHAs nuevos, con lo que
+# `main` y `develop` dejan de compartir historia y la release siguiente NACE EN CONFLICTO. Un squash
+# la colapsa en un commit y pierde los mensajes. Solo el merge commit deja las dos ramas emparentadas.
+#
+# Hasta el 2026-08-25 el metodo equivocado era IMPOSIBLE: este repo solo admitia squash. Ese dia se
+# habilitaron los tres metodos en los diez —que es lo que esta topologia necesita— y este fichero es
+# lo unico que queda avisando. GitHub ademas PRESELECCIONA el ultimo metodo que usaste.
+#
+# Lo que vigila: que la punta de `main` sea un MERGE COMMIT.
+#
+# Un rebase-merge de la promocion reescribe sus commits sobre `main` con SHAs nuevos, con lo que
+# `main` y `develop` dejan de compartir historia y la promocion siguiente NACE EN CONFLICTO —
+# medido en la flota, entre 65 y 77 commits. Un squash colapsa todo en uno y pierde los mensajes.
+# Solo el merge commit deja las dos ramas emparentadas.
+#
+# Y hasta el 2026-08-25 esto lo impedia el REPO: `allow_merge_commit` era el unico metodo
+# habilitado aqui... al reves, era el unico PROHIBIDO, y `main` solo admitia rebase. Ese dia se
+# habilitaron los tres en los diez repos —que es lo que la topologia `develop`->`main` necesita— y
+# con ello el metodo equivocado dejo de ser imposible para pasar a ser solo desaconsejado. GitHub
+# ademas PRESELECCIONA el ultimo metodo que usaste en la caja de merge. Este fichero es lo unico
+# que queda avisando.
+#
+# AVISA, NO BLOQUEA: sin required status checks, un rojo aqui no impide nada. Llega DESPUES del
+# merge, a proposito — es un detector, no una puerta. Su valor es que el destrozo se vea el mismo
+# minuto y no dos dias despues, que es lo que paso la ultima vez que la topologia se rompio sola.
+#
+# GitHub-hosted a proposito: hace un `git cat-file` y ya. Colgarlo del runner propio solo le
+# anadiria el modo de fallo caro —encolarse en silencio 24 h— al unico aviso que hay.
+
+jobs:
+  verify-merge-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: la punta de main tiene que ser un merge commit (tripwire, solo avisa)
+        run: |
+          parents=$(git cat-file -p HEAD | grep -c '^parent ' || true)
+          if [ "$parents" -lt 2 ]; then
+            echo "::error::La punta de main NO es un merge commit ($parents padre(s)). La release develop->main se mergea con MERGE COMMIT: un rebase bifurca main y deja la release siguiente en conflicto; un squash pierde los mensajes. Comprueba el metodo en la caja de merge — GitHub preselecciona el que usaste la ultima vez. Un rojo aqui sobre un hotfix empujado a main es esperable; sobre una release significa que se mergeo con el metodo equivocado."
+            exit 1
+          fi
+          echo "OK: la punta de main es un merge commit ($parents padres)."
