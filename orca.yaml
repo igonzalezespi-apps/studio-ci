@@ -1,0 +1,12 @@
+scripts:
+  setup: |
+    [ -d "$ORCA_WORKTREE_PATH/.githooks" ] && git -C "$ORCA_WORKTREE_PATH" config core.hooksPath .githooks
+    for f in .env .env.local; do
+      [ -f "$ORCA_ROOT_PATH/$f" ] && [ ! -f "$ORCA_WORKTREE_PATH/$f" ] && cp "$ORCA_ROOT_PATH/$f" "$ORCA_WORKTREE_PATH/$f"
+    done
+    exit 0
+  archive: |
+    cd "$ORCA_WORKTREE_PATH" || exit 0
+    echo "== Sin commitear:"; git status --porcelain | head -10
+    echo "== Sin pushear:"; git log --branches --not --remotes --oneline 2>/dev/null | head -10
+    exit 0

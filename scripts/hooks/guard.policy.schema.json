@@ -11,6 +11,11 @@
       "default": false,
       "description": "Whether the agent may merge a PR whose base is the integration branch. A merge whose base is the protected branch is ALWAYS denied (human-only), regardless of this flag. false → the agent may not merge any PR (e.g. trunk→main repos, where the only base is the protected branch)."
     },
+    "require_pr_label": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether `gh pr create` must carry --label: the release gate of the studio products reads a semver label from the PR. false only in a repository whose releases do not read PR labels (e.g. release-please from the commits). The waiver covers PRs in THIS repository only: one opened toward another repository, or whose target the guard cannot prove, still needs the label."
+    },
     "protected_branch": {
       "type": "string",
       "default": "main",
@@ -42,6 +47,39 @@
       "type": "string",
       "default": "",
       "description": "How sdd-gate.sh names the sanctioned phase mutator in its deny messages. Absent → it names the core-dev plugin's scripts/opsx/set-phase.sh, which is the right answer for a repo on the plugin-only engine. Set it only where the repo still vendors its own mutator and the deny must point somewhere else."
+    },
+    "reserved_paths": {
+      "type": "array",
+      "default": [],
+      "description": "Surfaces this repo reserves to the owner ON TOP of the built-in floor of the pr-score gate (skills/pr-score/scripts/reserved-surface.sh). A PR that touches one is escalated instead of auto-merged. The floor itself cannot be configured away. Globs match the repo-relative path; `**` crosses directories, `*` does not.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["glob"],
+        "properties": {
+          "glob": { "type": "string", "minLength": 1, "description": "e.g. 'apps/api/src/routes/public/**'." },
+          "why": { "type": "string", "description": "The surface, in a few words; shown next to the path when the gate escalates." }
+        }
+      }
+    },
+    "reserved_paths_hard": {
+      "type": "array",
+      "default": [],
+      "description": "Like reserved_paths, but HARD: these paths stay the owner's even when the repo opts into the owner-decision lens (owner_lens), where an independent reviewer decides by content whether a change on the rest of the reserved surface needs the owner. Checked by `reserved-surface.sh --hard-only` together with the built-in hard subset (the guard and hooks, the merge-gate scripts, the guard policy, the agent's cabling, security/, the data model). Also reserved in the default mode, so a caller that never passes the flag cannot merge over them. Absent → only the built-in hard subset.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["glob"],
+        "properties": {
+          "glob": { "type": "string", "minLength": 1, "description": "e.g. 'apps/api/src/billing/**'." },
+          "why": { "type": "string", "description": "The surface, in a few words; shown next to the path when the gate escalates." }
+        }
+      }
+    },
+    "owner_lens": {
+      "type": "boolean",
+      "default": false,
+      "description": "Opt-in to the owner-decision lens (skills/owner-decision). false or absent → nothing changes: every hit of reserved-surface.sh escalates, as always. true → the merge procedure asks an independent, fresh-context reviewer whether the change contains a decision that belongs to the owner, and gates on its verdict with skills/pr-score/scripts/owner-gate.py; a path hit in the hard subset (reserved-surface.sh --hard-only) still goes to the owner always, a path hit outside it proceeds only if the lens finds nothing."
     },
     "pr_score": {
       "type": "object",

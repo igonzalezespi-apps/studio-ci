@@ -1,19 +1,23 @@
-## Para ti (negocio)
+## TL;DR
 
-<!-- Esta es la sección que Iván lee SIEMPRE, y muchas veces la única. Sin jerga:
-     nada de nombres de fichero, de funciones ni de herramientas.
-     - Qué cambia para el producto o para el estudio, en 3-5 líneas.
-     - Qué pasa si esto NO se mergea. -->
+<!-- La sección que Iván lee SIEMPRE, y casi siempre la única. Va primera y es
+     AUTOCONTENIDA: sin «ver abajo», y si hace falta un ADR o una decisión vieja,
+     se escribe aquí en una línea o se enlaza. Sin jerga: nada de ficheros, flags
+     ni herramientas.
+     - Qué cambia para los usuarios o para el estudio.
+     - Qué puede salir mal y cómo se deshace.
+     - Qué decisiones suyas van dentro (o «ninguna»).
+     - Qué NO se ha comprobado.
+     - Si la mergea él: el comando completo.
+     Si esta PR NO debe mergearse todavía, se abre en DRAFT — él mergea lo que
+     está listo y en verde, así que un aviso escrito aquí no la detiene. -->
 
-## Lo técnico que ratificas
+## Lo técnico (decidido por el agente; queda registrado)
 
-<!-- Iván firma como responsable técnico aunque no revise el diff, así que aquí va
-     lo que un responsable querría haber visto antes de firmar:
-     - qué se ha MEDIDO (con el número, no con "se comprobó"),
-     - qué se ha probado y CÓMO (suite, disparo real, mutación),
-     - qué RIESGO queda vivo y por qué se acepta.
-     Si la PR toca modelo de datos, API pública, gasto, credenciales/seguridad,
-     el contrato o un CLAUDE.md: dilo aquí en la primera línea. -->
+<!-- Telegráfico: hechos, números, comandos. Qué se MIDIÓ (con el número), qué se
+     probó y CÓMO (suite, disparo real, mutación), qué riesgo queda vivo.
+     Si toca modelo de datos, API pública, gasto, credenciales/seguridad, el
+     contrato o un CLAUDE.md: en la primera línea. -->
 
 ## Merge method
 

@@ -44,6 +44,10 @@
 # call to gh in the merge-to-integration check).
 # BASH_GUARD_PR_HEAD: override of a PR's head branch, TEST-ONLY (same lookup).
 # Setting either of the two puts the resolver in test mode; see pr_refs.
+# BASH_GUARD_PROJECT_ROOT: override of the repository this guard protects,
+# TEST-ONLY (see project_identities).
+# BASH_GUARD_OWN_REPO: override of this repository's "owner/name" for the merge
+# check, TEST-ONLY (see merge_target).
 # ============================================================================
 set -euo pipefail
 
@@ -64,6 +68,7 @@ try { p = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) {}
 const trees = Array.isArray(p.generated_trees) ? p.generated_trees : [];
 const regen = typeof p.generated_regen_hint === "string" ? p.generated_regen_hint : "";
 const merge = p.agent_may_merge === true ? "true" : "false";
+const prLabel = p.require_pr_label === false ? "false" : "true";
 const prot = typeof p.protected_branch === "string" && p.protected_branch ? p.protected_branch : "main";
 const integ = typeof p.integration_branch === "string" && p.integration_branch ? p.integration_branch : "";
 const longLived = Array.isArray(p.long_lived_branches) ? p.long_lived_branches : [];
@@ -71,6 +76,7 @@ const egress = Array.isArray(p.egress_allow) && p.egress_allow.length
   ? p.egress_allow : ["localhost", "127.0.0.1", "::1"];
 const out = [];
 out.push("MERGE\t" + merge);
+out.push("PRLABEL\t" + prLabel);
 out.push("PROTECTED\t" + prot);
 out.push("INTEGRATION\t" + integ);
 for (const b of longLived) if (typeof b === "string" && b) out.push("LONGLIVED\t" + b);
@@ -82,6 +88,7 @@ process.stdout.write(out.join("\n") + "\n");
 POLICY_TSV="$(node -e "$POLICY_READER" "$POLICY_FILE" 2>/dev/null || true)"
 
 AGENT_MAY_MERGE=false
+REQUIRE_PR_LABEL=true
 PROTECTED_BRANCH=main
 INTEGRATION_BRANCH=""
 LONG_LIVED_BRANCHES=()
@@ -92,6 +99,7 @@ if [ -n "$POLICY_TSV" ]; then
   while IFS=$'\t' read -r key val; do
     case "$key" in
       MERGE) AGENT_MAY_MERGE="$val" ;;
+      PRLABEL) REQUIRE_PR_LABEL="$val" ;;
       PROTECTED) PROTECTED_BRANCH="$val" ;;
       INTEGRATION) INTEGRATION_BRANCH="$val" ;;
       LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
@@ -107,6 +115,10 @@ if [ "${#EGRESS_ALLOW[@]}" -eq 0 ]; then
   EGRESS_ALLOW=("localhost" "127.0.0.1" "::1")
 fi
 
+# The repository-selecting global options of the git command being analysed (-C,
+# --git-dir, -c ...), set by check_git for its segment. Empty = git's own discovery.
+GIT_GLOBALS=()
+
 deny() {
   printf 'bash-guard DENY: %s. Alternative: %s\n' "$1" "$2" >&2
   exit 2
@@ -118,7 +130,17 @@ current_branch() {
     printf '%s' "$BASH_GUARD_BRANCH"
     return 0
   fi
-  git branch --show-current 2>/dev/null || true
+  # With the command's own -C / --git-dir replayed: `git -C <worktree> push origin HEAD`
+  # pushes the WORKTREE's branch, not the one checked out where the session stands.
+  git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} branch --show-current 2>/dev/null || true
+}
+
+# git with the repository-selecting environment removed, for questions about a
+# FIXED repository (the one this guard protects, a local path) that must not be
+# redirected by a GIT_DIR inherited from wherever the hook was launched.
+git_clean() {
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+    -u GIT_OBJECT_DIRECTORY -u GIT_NAMESPACE git "$@"
 }
 
 # Is the path a real environment file? (.env.example templates are not)
@@ -171,10 +193,22 @@ check_git() {
   # Skip git global options (those that take a separate value, in pairs) to
   # locate the real subcommand. `git -c x=y push` obfuscation is not guaranteed
   # (see header).
+  # The ones that decide WHICH repository git works on and where its remotes point
+  # are kept verbatim in GIT_GLOBALS, so the push check can replay them and ask git
+  # itself instead of re-deriving git's repository discovery by hand.
   local i=1 sub=""
+  GIT_GLOBALS=()
   while [ "$i" -lt "${#tok[@]}" ]; do
     case "${tok[i]}" in
-      -c | -C | --git-dir | --work-tree | --namespace | --exec-path) i=$((i + 2)) ;;
+      -c | -C | --git-dir | --work-tree)
+        GIT_GLOBALS+=("${tok[i]}" "${tok[i + 1]:-}")
+        i=$((i + 2))
+        ;;
+      --namespace | --exec-path) i=$((i + 2)) ;;
+      --git-dir=* | --work-tree=* | --config-env=* | --bare)
+        GIT_GLOBALS+=("${tok[i]}")
+        i=$((i + 1))
+        ;;
       -*) i=$((i + 1)) ;;
       *)
         sub="${tok[i]}"
@@ -191,9 +225,209 @@ check_git() {
   return 0
 }
 
+# --- Where does a push go? ---------------------------------------------------
+# PROTECTED_BRANCH is the policy of the repository that vendored this guard. A push
+# to ANOTHER repository must not inherit it: that repository's main is not ours,
+# and its own flow may well be to push to it. Measured 2026-08-03: a one-line fix
+# in a repository whose flow IS pushing to main was denied from a session rooted
+# in a consumer, and had to detour through a branch, a PR and a human merge. A
+# guard that fires where it has no business teaches its users to route around it.
+#
+# The destination is decided by the REMOTE the push reaches, never by a path.
+# Paths lie in both directions: a worktree or a second clone of this repository
+# has another top-level directory and pushes to the very same remote, and a
+# `git push <url-of-this-repo>` run from anywhere lands here too.
+#
+# FAIL-CLOSED: a push counts as foreign only when EVERY destination resolves,
+# unambiguously, to a remote that is not one of ours. Anything else — the command
+# moves git on the way (`cd`, `pushd`, `env -C`, GIT_DIR=...), the remote does not
+# resolve, a URL is not recognisable, the guard cannot tell which repository it
+# protects — keeps the protected-branch rule on.
+
+# Does the command move git somewhere the guard cannot follow? Segments are analysed
+# one at a time, and git is asked from the hook's own directory: the session's
+# CURRENT directory, which follows every `cd` the agent makes (measured 2026-09-14:
+# with the session standing in another checkout, `git push origin HEAD` resolved
+# HEAD there), not the one a `cd` earlier in the same command leaves behind. So in
+# `cd <x> && git push ...` the push would be resolved against the wrong repository,
+# in one direction or the other. Rather than guess, any relocation anywhere in the
+# command disables the foreign-repository exemption. Deliberately broad: a false
+# match only keeps a deny the command would have got anyway.
+command_relocates() {
+  local line
+  local re_cd='(^|[[:space:]])(cd|pushd|popd)([[:space:]]|$)'
+  # GIT_DIR & co. move git; GH_REPO moves gh (see pr_label_waived).
+  local re_env='(^|[[:space:]])(GIT_[A-Z_]+|GH_REPO)='
+  local re_chdir='(^|[[:space:]])(--chdir|env([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*C)([=[:space:]]|$)'
+  while IFS= read -r line; do
+    [[ "$line" =~ $re_cd ]] && return 0
+    [[ "$line" =~ $re_env ]] && return 0
+    [[ "$line" =~ $re_chdir ]] && return 0
+  done <<<"${SEGMENTS:-}"
+  return 1
+}
+
+# One spelling for every way of writing the same remote, so two can be compared.
+# The host is dropped on purpose: an ssh alias (`Host gh` → github.com) reaches the
+# same repository under another host name, while the path cannot be aliased, so
+#   https://github.com/Owner/Name.git   git@github.com:owner/name
+#   ssh://git@github.com:22/owner/name  gh:owner/name           → owner/name
+# (the same "owner/name" merge_target compares). An absolute local path, or a
+# file:// URL, becomes "local:<its git common dir>" when it is a repository —
+# shared by all its worktrees. Anything else prints NOTHING, which the caller must
+# read as "unknown", never as "some other repository".
+remote_identity() {
+  local u="$1" host="" path="" dir=""
+  case "$u" in
+    file://*) u="${u#file://}" ;;
+  esac
+  case "$u" in
+    /*)
+      dir="$(cd "$u" 2>/dev/null && cd "$(git_clean rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)" || return 0
+      [ -n "$dir" ] && printf 'local:%s' "$dir"
+      return 0
+      ;;
+    *://*)
+      u="${u#*://}"
+      host="${u%%/*}"
+      [ "$host" != "$u" ] || return 0
+      path="${u#*/}"
+      ;;
+    *:*)
+      # scp syntax [user@]host:path. A colon AFTER a slash is a relative path.
+      host="${u%%:*}"
+      path="${u#*:}"
+      case "$host" in */*) return 0 ;; esac
+      ;;
+    *) return 0 ;;
+  esac
+  [ -n "$host" ] || return 0
+  while [ "${path#/}" != "$path" ]; do path="${path#/}"; done
+  path="${path%/}"
+  path="${path%.git}"
+  path="${path%/}"
+  [ -n "$path" ] || return 0
+  printf '%s' "$path" | tr '[:upper:]' '[:lower:]'
+}
+
+# Every identity of the repository this guard protects: the one that holds the guard
+# itself. The guard is vendored INTO the repository whose policy it enforces, so
+# $HERE is always inside it (worktrees included) — unlike the cwd, which follows the
+# agent around, or $CLAUDE_PROJECT_DIR, which names the session and not the owner
+# of the policy loaded above. Every remote counts, fetch and push URLs alike: when
+# in doubt the rule stays on, and a remote of ours is a doubt.
+# TEST-ONLY override: BASH_GUARD_PROJECT_ROOT.
+project_identities() {
+  local root="${BASH_GUARD_PROJECT_ROOT:-$HERE}" remotes="" urls="" r u
+  git_clean -C "$root" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  remote_identity "$(cd "$root" 2>/dev/null && pwd -P)"
+  printf '\n'
+  remotes="$(git_clean -C "$root" remote 2>/dev/null)" || remotes=""
+  for r in $remotes; do
+    urls+="$(git_clean -C "$root" remote get-url --all "$r" 2>/dev/null)"$'\n'
+    urls+="$(git_clean -C "$root" remote get-url --push --all "$r" 2>/dev/null)"$'\n'
+  done
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    remote_identity "$u"
+    printf '\n'
+  done <<<"$urls"
+  return 0
+}
+
+# The URL(s) a push reaches, asked of git with the command's own -C / --git-dir / -c
+# replayed: repository discovery, insteadOf rewriting and a pushurl that differs from
+# the url are git's answer, not a re-derivation. With no remote named, git picks one
+# from its config (pushRemote, pushDefault, the branch's remote, origin); every remote
+# of the repository stands in for it. Returns 1 when the destination does not resolve.
+push_destination_urls() {
+  local remote="$1" remotes="" urls="" out="" r
+  if [ -z "$remote" ]; then
+    remotes="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} remote 2>/dev/null)" || return 1
+    [ -n "$remotes" ] || return 1
+    for r in $remotes; do
+      out="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} remote get-url --push --all "$r" 2>/dev/null)" || return 1
+      urls+="$out"$'\n'
+    done
+  elif out="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} remote get-url --push --all "$remote" 2>/dev/null)"; then
+    urls="$out"
+  else
+    # Not a configured remote: a URL or a path, after git's insteadOf rewriting.
+    out="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} ls-remote --get-url "$remote" 2>/dev/null)" || return 1
+    urls="$out"
+  fi
+  printf '%s\n' "$urls"
+}
+
+# identity_in <identity> <newline-separated identities>
+identity_in() {
+  local x
+  while IFS= read -r x; do
+    [ -n "$x" ] && [ "$x" = "$1" ] && return 0
+  done <<<"$2"
+  return 1
+}
+
+# Is this push aimed at the repository that vendored this guard? True (0) unless it
+# is PROVEN foreign — see the fail-closed paragraph above.
+push_targets_this_repo() {
+  local remote="$1" ids="" dests="" u d foreign=0
+  command_relocates && return 0
+  ids="$(project_identities)" || ids=""
+  [ -n "${ids//$'\n'/}" ] || return 0
+  dests="$(push_destination_urls "$remote")" || return 0
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    d="$(remote_identity "$u")" || d=""
+    [ -n "$d" ] || return 0
+    identity_in "$d" "$ids" && return 0
+    foreign=1
+  done <<<"$dests"
+  [ "$foreign" -eq 1 ] || return 0
+  return 1
+}
+
+# May this `gh pr create` go without --label? Only when this repository's policy says
+# `require_pr_label: false` AND the PR provably lands in THIS repository. The waiver is
+# this repository's to give, like the protected branch, and must not travel to another
+# one whose release gate does read the label. Same fail-closed shape as the push, with
+# the opposite default: `--repo` names the target (OWNER/REPO, HOST/OWNER/REPO or a
+# URL); without it gh uses the repository of the directory it runs in, so every remote
+# there must be ours. A relocation in the command (a `cd`, GH_REPO=), a --repo that does
+# not parse, or not knowing which repository this is keeps the label required.
+pr_label_waived() {
+  local repo="$1" ids="" t="" remotes="" urls="" r u d any=0
+  [ "$REQUIRE_PR_LABEL" = "false" ] || return 1
+  command_relocates && return 1
+  ids="$(project_identities)" || ids=""
+  [ -n "${ids//$'\n'/}" ] || return 1
+  if [ -n "$repo" ]; then
+    case "$repo" in
+      *://*) t="$(remote_identity "$repo")" ;;
+      */*/*) t="$(remote_identity "ssh://h/${repo#*/}")" ;;
+      */*) t="$(remote_identity "ssh://h/$repo")" ;;
+    esac
+    [ -n "$t" ] || return 1
+    identity_in "$t" "$ids"
+    return
+  fi
+  remotes="$(git remote 2>/dev/null)" || return 1
+  for r in $remotes; do
+    urls+="$(git remote get-url --all "$r" 2>/dev/null)"$'\n'
+  done
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    d="$(remote_identity "$u")" || d=""
+    [ -n "$d" ] || return 1
+    identity_in "$d" "$ids" || return 1
+    any=1
+  done <<<"$urls"
+  [ "$any" -eq 1 ]
+}
+
 check_git_push() {
   local i="$1"
-  local force=0 noverify=0 a
+  local force=0 noverify=0 a repo_opt=""
   local -a positional=()
   while [ "$i" -lt "${#tok[@]}" ]; do
     a="${tok[i]}"
@@ -207,8 +441,14 @@ check_git_push() {
         deny "git push ${a} pushes every branch, including ${PROTECTED_BRANCH}" \
           "push only your PR branch: git push -u origin HEAD"
         ;;
+      # --repo=<repository> stands for the <repository> argument when there is none.
+      --repo)
+        repo_opt="${tok[i]:-}"
+        i=$((i + 1))
+        ;;
+      --repo=*) repo_opt="${a#--repo=}" ;;
       # Push flags with a value in a separate token
-      -o | --push-option | --repo | --receive-pack | --exec) i=$((i + 1)) ;;
+      -o | --push-option | --receive-pack | --exec) i=$((i + 1)) ;;
       --*) ;;
       -?*)
         # Short cluster: -f anywhere is --force; -n is --dry-run on push
@@ -226,6 +466,13 @@ check_git_push() {
   if [ "$force" -eq 1 ]; then
     deny "git push --force/-f can rewrite remote history" \
       "use git push --force-with-lease toward your PR branch (never toward ${PROTECTED_BRANCH})"
+  fi
+
+  # Everything below is the protected-branch rule, which is THIS repository's policy.
+  # The --no-verify and --force checks above stay unconditional: they are rules about
+  # the agent, not about any repository.
+  if ! push_targets_this_repo "${positional[0]:-$repo_opt}"; then
+    return 0
   fi
 
   # Resolve the push target(s). positional[0] is the remote (name or URL); the
@@ -259,8 +506,11 @@ check_git_push() {
       dst="$(current_branch)"
     fi
     if [ "$dst" = "$PROTECTED_BRANCH" ]; then
+      # The alternative names the branch, or the worktree with -C: a bare `HEAD`
+      # resolves wherever the session happens to stand, which is how this very
+      # message used to recommend the command it had just denied.
       deny "push targeting ${PROTECTED_BRANCH} is forbidden (${PROTECTED_BRANCH} is protected for humans)" \
-        "push to your PR branch (git push -u origin HEAD) and open a PR"
+        "push your PR branch by name (git push -u origin <branch>) or from its worktree (git -C <worktree> push -u origin HEAD), and open a PR"
     fi
   done
   return 0
@@ -330,12 +580,13 @@ pr_refs() {
     return 0
   fi
   local refs
-  # The `--repo` of the original command MUST be forwarded. The hook runs with
-  # `cd "$CLAUDE_PROJECT_DIR"`, so without it `gh pr view` resolves the number
-  # against the SESSION's repo, not the PR's. Measured from ~/work against a
-  # product PR: "Could not resolve to a PullRequest with the number of 439",
-  # which the fail-closed branch below turns into the protected branch — so
-  # every cross-repo merge was denied no matter what the policy said.
+  # The `--repo` of the original command MUST be forwarded. The hook runs in
+  # whatever directory the session's shell is in (or in $CLAUDE_PROJECT_DIR, when
+  # a repo wires it with a `cd`), and neither is the PR's repository, so without
+  # it `gh pr view` resolves the number against the wrong repo. Measured from the
+  # studio repo against a product PR: "Could not resolve to a PullRequest with the
+  # number of 439", which the fail-closed branch below turns into the protected
+  # branch — so every cross-repo merge was denied no matter what the policy said.
   if [ -n "$repo" ]; then
     refs="$(gh pr view "$pr" --repo "$repo" --json baseRefName,headRefName \
       -q '.baseRefName + "\t" + .headRefName' 2>/dev/null || true)"
@@ -375,21 +626,63 @@ is_long_lived_branch() {
   return 1
 }
 
-# Which repo is the SESSION rooted in? The hook runs with `cd "$CLAUDE_PROJECT_DIR"`,
-# so this is the repo whose guard.policy.json was loaded at the top of this file.
-# Emits "<owner>/<name>", or nothing when the cwd is not a git repo with an origin.
-# TEST-ONLY override: BASH_GUARD_SESSION_REPO.
-session_repo() {
-  if [ -n "${BASH_GUARD_SESSION_REPO+x}" ]; then
-    printf '%s' "$BASH_GUARD_SESSION_REPO"
-    return 0
+# Which repository does this `gh pr merge` land in, and is it THIS one — the one
+# that vendored this guard, whose policy was loaded at the top of this file?
+# Prints the target's "owner/name" (lowercase) and returns:
+#   0  provably this repository -> the policy already loaded governs it
+#   1  another repository, the one printed -> its own policy governs it
+#   2  cannot be determined -> the caller denies
+# The cwd is NOT evidence of who we are. Until 1.14.0 it was: "this repo" was the
+# cwd's origin, on the belief that the hook always runs from $CLAUDE_PROJECT_DIR.
+# Measured 2026-09-14 that it runs wherever the session's shell is, following every
+# `cd`, so a session of a permissive repo standing in a restrictive one merged there
+# under its OWN policy (claude-plugins#112). What decides is the repository that
+# holds the guard, as for the protected branch of a push (project_identities).
+# Without --repo, gh resolves the PR in the repository of the directory it runs in;
+# that directory counts as ours only when EVERY one of its remotes is ours, and a
+# relocation in the command (`cd`, GH_REPO=) makes it unknowable.
+# TEST-ONLY override: BASH_GUARD_OWN_REPO is this repository's "owner/name", and
+# also stands for the cwd when no --repo is given.
+merge_target() {
+  local repo="$1" ids="" t="" remotes="" urls="" r u d any=0
+  if [ -n "${BASH_GUARD_OWN_REPO+x}" ]; then
+    ids="$(printf '%s' "$BASH_GUARD_OWN_REPO" | tr '[:upper:]' '[:lower:]')"
+    if [ -z "$repo" ]; then
+      [ -n "$ids" ] || return 2
+      printf '%s' "$ids"
+      return 0
+    fi
+  else
+    ids="$(project_identities)" || ids=""
   fi
-  local url
-  url="$(git config --get remote.origin.url 2>/dev/null || true)"
-  [ -n "$url" ] || return 0
-  # The last two path segments, for both spellings:
-  #   https://github.com/owner/name.git   git@github.com:owner/name.git
-  printf '%s' "$url" | sed -E 's#\.git$##; s#/$##; s#^.*[:/]([^/]+)/([^/]+)$#\1/\2#'
+  if [ -n "$repo" ]; then
+    case "$repo" in
+      *://*) t="$(remote_identity "$repo")" ;;
+      */*/*) t="$(remote_identity "ssh://h/${repo#*/}")" ;;
+      */*) t="$(remote_identity "ssh://h/$repo")" ;;
+    esac
+    [ -n "$t" ] || return 2
+    printf '%s' "$t"
+    identity_in "$t" "$ids" && return 0
+    return 1
+  fi
+  command_relocates && return 2
+  [ -n "${ids//$'\n'/}" ] || return 2
+  remotes="$(git_clean remote 2>/dev/null)" || return 2
+  for r in $remotes; do
+    urls+="$(git_clean remote get-url --all "$r" 2>/dev/null)"$'\n'
+  done
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    d="$(remote_identity "$u")" || d=""
+    [ -n "$d" ] || return 2
+    identity_in "$d" "$ids" || return 2
+    [ "$any" -eq 1 ] || t="$d"
+    any=1
+  done <<<"$urls"
+  [ "$any" -eq 1 ] || return 2
+  printf '%s' "$t"
+  return 0
 }
 
 # Turn a guard.policy.json FILE into the same TSV the top of this script parses.
@@ -429,46 +722,52 @@ target_policy_tsv() {
 # legitimate PR with a long-lived head is the release (head `develop`, base
 # `main`), and (2) already denies that.
 #
-# WHOSE POLICY DECIDES. Until 1.9.0 it was always the SESSION's, because the hook
-# starts with `cd "$CLAUDE_PROJECT_DIR"` and that is the only policy it had read.
+# WHOSE POLICY DECIDES. Until 1.9.0 it was always the SESSION's: the policy loaded
+# at the top of this file was the only one it had read.
 # That was harmless only by accident: the repos whose policy says
 # `agent_may_merge: false` had no integration branch, so every one of their PRs
 # targeted the protected branch — and negative (2) does not consult any policy.
 # The moment such a repo gains an integration branch, a session rooted somewhere
 # permissive could merge into it against that repo's own policy.
-# So a merge naming another repo re-reads THAT repo's guard.policy.json from its
-# origin and decides with it, failing CLOSED when it cannot be read. The globals
+# So a merge landing in another repo re-reads THAT repo's guard.policy.json from its
+# origin and decides with it, failing CLOSED when it cannot be read. Which repo the
+# merge lands in is merge_target's call, and since 1.15.0 the cwd has no say in it. The globals
 # are reassigned rather than shadowed on purpose: this process exits right after,
 # and threading four values through three helpers would be the kind of change
 # that quietly stops covering one of them.
 check_pr_merge() {
-  local pr="$1" repo="${2:-}" refs base head sess tsv
-  sess="$(session_repo)"
-  # No `--repo`, or it names the session's own repo -> the policy already loaded
-  # is the right one. Anything else — including a cwd that is not a repo, where
-  # `sess` is empty and "who am I" has no answer — goes and reads the target's.
-  if [ -n "$repo" ] && [ "$repo" != "$sess" ]; then
-    tsv="$(target_policy_tsv "$repo")"
-    if [ -z "$tsv" ]; then
-      deny "gh pr merge targets ${repo}, whose scripts/hooks/guard.policy.json could not be read, so the policy that governs it is unknown" \
-        "check the repo name, or merge from a session rooted in that repo (a repo with no vendored policy reserves its merges to a human)"
-    fi
-    AGENT_MAY_MERGE=false
-    PROTECTED_BRANCH=main
-    INTEGRATION_BRANCH=""
-    LONG_LIVED_BRANCHES=()
-    while IFS=$'\t' read -r key val; do
-      case "$key" in
-        MERGE) AGENT_MAY_MERGE="$val" ;;
-        PROTECTED) PROTECTED_BRANCH="$val" ;;
-        INTEGRATION) INTEGRATION_BRANCH="$val" ;;
-        LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
-      esac
-    done <<<"$tsv"
-  fi
+  local pr="$1" repo="${2:-}" refs base head target rc=0 tsv foreign=0
+  target="$(merge_target "$repo")" || rc=$?
+  case "$rc" in
+    0) ;;
+    1)
+      foreign=1
+      tsv="$(target_policy_tsv "$target")"
+      if [ -z "$tsv" ]; then
+        deny "gh pr merge targets ${repo}, whose scripts/hooks/guard.policy.json could not be read, so the policy that governs it is unknown" \
+          "check the repo name, or merge from a session rooted in that repo (a repo with no vendored policy reserves its merges to a human)"
+      fi
+      AGENT_MAY_MERGE=false
+      PROTECTED_BRANCH=main
+      INTEGRATION_BRANCH=""
+      LONG_LIVED_BRANCHES=()
+      while IFS=$'\t' read -r key val; do
+        case "$key" in
+          MERGE) AGENT_MAY_MERGE="$val" ;;
+          PROTECTED) PROTECTED_BRANCH="$val" ;;
+          INTEGRATION) INTEGRATION_BRANCH="$val" ;;
+          LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
+        esac
+      done <<<"$tsv"
+      ;;
+    *)
+      deny "gh pr merge$([ -n "$repo" ] && printf " --repo %s" "$repo"): cannot tell which repository this PR belongs to, so the policy that governs it is unknown" \
+        "name it explicitly, without moving the shell first: gh pr merge <n> --repo <owner>/<name>"
+      ;;
+  esac
 
   if [ "$AGENT_MAY_MERGE" != "true" ]; then
-    deny_human_merge "gh pr merge merges the PR from the CLI$([ -n "$repo" ] && [ "$repo" != "$sess" ] && printf ", and %s reserves its merges to a human" "$repo")"
+    deny_human_merge "gh pr merge merges the PR from the CLI$([ "$foreign" -eq 1 ] && printf ", and %s reserves its merges to a human" "$repo")"
   fi
   refs="$(pr_refs "$pr" "$repo")"
   base="${refs%%$'\t'*}"
@@ -545,6 +844,9 @@ check_gh() {
   # straight through. `pr-create.sh` is the comfortable path — it also checks the label EXISTS
   # (gh accepts a non-existent one, warns on stdout and still exits 0) and re-reads the PR
   # afterwards to prove it stuck.
+  #
+  # A repository whose releases do not read PR labels (release-please from the commits, say)
+  # can waive it with `require_pr_label: false` — for its own PRs only; see pr_label_waived.
   if [ "$sub1" = "pr" ] && [ "$sub2" = "create" ]; then
     local has_label=0
     for a in "${tok[@]:1}"; do
@@ -552,7 +854,7 @@ check_gh() {
         --label | --label=* | -l) has_label=1 ;;
       esac
     done
-    if [ "$has_label" -eq 0 ]; then
+    if [ "$has_label" -eq 0 ] && ! pr_label_waived "$repo_arg"; then
       deny "gh pr create without --label leaves the release gate's label to a second command, which is how it gets forgotten" \
         "pass it here (gh pr create --label semver:<x> ...) or use core-dev's pr-create.sh, which also verifies the label actually landed"
     fi
@@ -684,6 +986,9 @@ check_segment() {
     tok+=("$t")
   done
 
+  # A previous segment's git options must not leak into this one.
+  GIT_GLOBALS=()
+
   # Skip inert prefixes: env assignments, wrappers and shell keywords (do/then/…
   # appear as segment heads when loops/conditionals are split by ';').
   local start=0
@@ -694,7 +999,21 @@ check_segment() {
       continue
     fi
     case "$t" in
-      sudo | command | exec | nohup | time | env | do | then | else | elif | if | while | until)
+      env)
+        # env's own options come before the command it runs, and two of them take a
+        # value in the next token. Stopping at the first option made `env -C <dir>
+        # git push ...` a segment whose command was "-C": no rule looked at it.
+        start=$((start + 1))
+        while [ "$start" -lt "${#tok[@]}" ]; do
+          case "${tok[start]}" in
+            -u | -C | --unset | --chdir) start=$((start + 2)) ;;
+            -*) start=$((start + 1)) ;;
+            *) break ;;
+          esac
+        done
+        continue
+        ;;
+      sudo | command | exec | nohup | time | do | then | else | elif | if | while | until)
         start=$((start + 1))
         continue
         ;;
@@ -731,9 +1050,10 @@ check_segment() {
 
 # --- Command extraction from the harness JSON -------------------------------
 # node parses the JSON (no jq: not guaranteed on the machine; node >= 24 is a
-# repo requirement), strips heredoc bodies (literal data, e.g. commit messages
-# — analyzing them would give false positives) and splits the command into
-# segments by shell operators, one per line.
+# repo requirement), drops heredoc bodies that are DATA (commit messages, files
+# written with cat > f <<EOF — analyzing them would give false positives) but
+# KEEPS the ones fed to a shell (bash <<EOF: that is code), and splits the
+# command into segments by shell operators, one per line.
 
 read -r -d '' EXTRACT_JS <<'JS' || true
 const fs = require("fs");
@@ -752,31 +1072,496 @@ try {
 const cmd = data && data.tool_input ? data.tool_input.command : undefined;
 if (typeof cmd !== "string" || cmd.trim() === "") process.exit(0);
 
-// Strips heredoc bodies (<<EOF ... EOF): they are data, not commands. The
-// lookaround avoids confusing here-strings (<<<) with heredocs.
-function stripHeredocs(src) {
+// Heredoc bodies are data — commit messages, files written with `cat > f <<EOF` — and
+// analyzing them as commands would deny a runbook for mentioning `git push origin main` in
+// its prose. BUT a heredoc fed to a SHELL is code: `bash <<'EOF' … EOF`, `cat <<EOF | sh`,
+// `ssh host <<EOF`, `sudo -s <<EOF`. Stripping those blindly was a complete bypass of every
+// rule: measured 2026-09-01, a `curl … | bash` inside `bash <<'EOSU'` ran unchallenged in a
+// session where the same curl on a bare line was denied for egress.
+//
+// So a body is KEPT for analysis when it reaches a shell that will read it as commands, and
+// dropped otherwise. "Reaches a shell" is decided on the COMMAND STRUCTURE of the line that
+// opens the heredoc, not on words appearing in it — the first version matched shell names
+// anywhere on the line and an adversarial pass found it wrong both ways in one evening:
+// `/bin/bash <<EOF`, `$SHELL <<EOF`, `bash<<EOF` and `sudo --shell <<EOF` slipped through,
+// while `gh pr create --title "docs: ssh runbook" --body-file - <<EOF` was denied for the word
+// `ssh` in the title. Now:
+//   * the opener is the LOGICAL line (backslash-newline joined, comments removed);
+//   * within it, only the PIPELINE holding the `<<` matters, from the stage that owns the
+//     heredoc onward (in `cat <<EOF | bash` the body flows into bash through the pipe);
+//   * a stage feeds a shell when its command word — after wrappers like sudo/env/nice/ssh/su
+//     are unwrapped, path stripped, quotes removed — is a shell that reads its script from
+//     stdin (no `-c`, or `-s`, or `/dev/stdin`), or `.`/`source /dev/stdin`, or a wrapper that
+//     spawns a shell when given no command (`sudo -s`, `su -`, `ssh host`, `chroot dir`);
+//   * a command word that is an EXPANSION (`$SHELL`, `"$(which bash)"`) cannot be known and
+//     fails CLOSED: the body is analyzed;
+//   * a heredoc inside `$( … )` / `<( … )` / backticks reaches a shell when the enclosing
+//     command is `eval`, `.`/`source`, or a shell (`bash -c "$(cat <<EOF …)"`);
+//   * interpreters that are not shells (python, node, psql, make) are not parsed — the guard
+//     never read them, and a script file would carry the same text. Documented residual risk.
+// A kept body goes through the same treatment recursively (a heredoc inside it feeds a shell
+// or not by the same rule), depth-capped so a pathological nesting cannot hang the hook.
+// The lookaround in the operator regex avoids confusing here-strings (<<<) with heredocs; a
+// here-string stays in its segment and is analyzed there.
+const SHELLS = new Set(["bash", "sh", "dash", "zsh", "ksh", "ash", "mksh", "fish"]);
+const STDIN_PATHS = new Set(["/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "-"]);
+const WRAPPERS = new Set(["env", "nice", "nohup", "time", "timeout", "command", "exec", "stdbuf",
+  "ionice", "setsid", "caffeinate", "chroot", "nsenter", "unshare", "flock", "strace", "ltrace", "busybox"]);
+const CONTAINERS = new Set(["docker", "podman", "nerdctl", "kubectl", "lxc", "incus", "vagrant", "machinectl"]);
+// Words that can precede the command word of a stage without being it.
+const RESERVED = new Set(["!", "if", "then", "else", "elif", "do", "while", "until", "{", "coproc", "time", "--"]);
+// Flags that TAKE A VALUE, per wrapper: the value is not the command word.
+const VALUE_FLAGS = {
+  sudo: new Set(["-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-T", "-D", "-R"]),
+  doas: new Set(["-u", "-C"]),
+  runuser: new Set(["-u", "-g", "-G", "-c", "-s", "--shell", "--user", "--group", "--command"]),
+  su: new Set(["-c", "-s", "-g", "-G", "--command", "--shell", "--group", "--supp-group"]),
+  ssh: new Set(["-p", "-l", "-i", "-o", "-F", "-J", "-L", "-R", "-D", "-W", "-E", "-b", "-c", "-m", "-e", "-I", "-O", "-Q", "-S", "-w", "-B", "-P"]),
+  timeout: new Set(["-s", "-k", "--signal", "--kill-after"]),
+  nice: new Set(["-n", "--adjustment"]),
+  flock: new Set(["-w", "-E", "--timeout", "--conflict-exit-code"]),
+  nsenter: new Set(["-t", "-S", "-G", "-r", "-w", "--target"]),
+  unshare: new Set(["-s", "-R", "-w", "--setgroups", "--root", "--wd"]),
+  env: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
+  stdbuf: new Set(["-i", "-o", "-e"]),
+  ionice: new Set(["-c", "-n", "-p"]),
+  strace: new Set(["-o", "-e", "-p", "-s", "-E", "-a", "-P", "-I", "-u"]),
+  ltrace: new Set(["-o", "-e", "-p", "-s", "-u"]),
+  exec: new Set(["-a"]),
+  chroot: new Set(["--userspec", "--groups"]),
+};
+
+function basename(t) { const i = t.lastIndexOf("/"); return i === -1 ? t : t.slice(i + 1); }
+const isSpace = (c) => c === " " || c === "\t" || c === "\n" || c === "\r";
+
+// Quote-aware word tokenizer for ONE simple command (a stage: no unquoted |, ;, &&, newline —
+// hitting one STOPS the tokenizer, it never loops: the first structural version looped forever
+// on `ssh h 'echo a; echo b'`, node ran out of memory and the guard exited 0 for the whole call).
+// Words are {text, hasExpansion, quoted, qstart}: text is the unquoted content; hasExpansion
+// marks an unquoted `$`/backtick or a `$` inside double quotes; quoted means some part was
+// quoted; qstart means the word STARTED with a quote (so `"A=b"` is not an assignment).
+// Redirections — including the heredoc operator and its delimiter, and here-strings with
+// their word — are dropped: they are not command words.
+function tokenize(str) {
+  const words = [];
+  let i = 0;
+  const n = str.length;
+  while (i < n) {
+    while (i < n && isSpace(str[i])) i++;
+    if (i >= n) break;
+    const c = str[i];
+    if (c === "#") break;                                          // comment: not code
+    if (c === "|" || c === ";" || c === "&" || c === ")" || c === "(") break;   // not a simple command any more
+    const rm = /^(?:\d*>&\d*|\d*<&\d*|&>>?|\d*>>?\|?|\d*<<<|\d*<<-?|\d*<>|\d*<)/.exec(str.slice(i));
+    if (rm && rm[0].length) {
+      i += rm[0].length;
+      if (/[<>]&\d+$/.test(rm[0]) || /[<>]&-$/.test(rm[0])) continue;   // 2>&1, 2>&-: no target word
+      while (i < n && isSpace(str[i])) i++;
+      const before = i; readWord(); if (i === before) i++;         // the target, skipped
+      continue;
+    }
+    const before = i;
+    const w = readWord();
+    if (i === before) { i++; continue; }                           // progress, always
+    words.push(w);
+  }
+  return words;
+
+  function readWord() {
+    let text = "", hasExpansion = false, quoted = false, qstart = false;
+    const w0 = i;
+    while (i < n) {
+      const c = str[i];
+      if (isSpace(c) || c === "|" || c === ";" || c === "&" || c === ")" || c === "(" || c === "<" || c === ">") break;
+      if (c === "'") { quoted = true; if (i === w0) qstart = true; i++; while (i < n && str[i] !== "'") text += str[i++]; i++; continue; }
+      if (c === '"') {
+        quoted = true; if (i === w0) qstart = true; i++;
+        while (i < n && str[i] !== '"') {
+          if (str[i] === "\\" && i + 1 < n) { text += str[i + 1]; i += 2; continue; }
+          if (str[i] === "$" || str[i] === "`") hasExpansion = true;
+          if (str[i] === "$" && str[i + 1] === "(") { i = skipParens(i + 1); continue; }
+          if (str[i] === "`") { i++; while (i < n && str[i] !== "`") i++; i++; continue; }
+          text += str[i++];
+        }
+        i++;
+        continue;
+      }
+      if (c === "\\" && i + 1 < n) { text += str[i + 1]; i += 2; continue; }
+      if (c === "$" || c === "`") {
+        hasExpansion = true;
+        if (c === "$" && str[i + 1] === "(") { i = skipParens(i + 1); continue; }
+        if (c === "$" && str[i + 1] === "{") { i++; while (i < n && str[i] !== "}") i++; i++; continue; }
+        if (c === "`") { i++; while (i < n && str[i] !== "`") i++; i++; continue; }
+      }
+      text += c; i++;
+    }
+    return { text, hasExpansion, quoted, qstart };
+  }
+  function skipParens(at) {                                        // at points at "(": index past the matching ")"
+    let depth = 0, j = at, q = null;
+    for (; j < n; j++) {
+      const c = str[j];
+      if (q) { if (c === q) q = null; else if (c === "\\" && q === '"') j++; continue; }
+      if (c === "'" || c === '"') { q = c; continue; }
+      if (c === "(") depth++;
+      else if (c === ")") { depth--; if (depth === 0) return j + 1; }
+    }
+    return n;
+  }
+}
+
+// Lexer over one logical line. Calls cb(j, tok, depth, frameStart) for every character outside
+// quotes: tok is the character, or "$(" / "(" for a frame opening at j (frames: `$(`, `<(`,
+// `>(`, backticks, plain `(`, and `{ … }` groups) and ")" for a frame closing (frameStart = where
+// it opened). Inside double quotes only `$(` and backticks open a frame, and the quoting state
+// is restored when it closes. Returns the state at the end: {depth, q}.
+function lex(line, cb) {
+  const stack = [];
+  let q = null;
+  const isWordEdge = (c) => c === undefined || isSpace(c) || c === ";" || c === "|" || c === "&" || c === "(" || c === ")";
+  for (let j = 0; j < line.length; j++) {
+    const c = line[j], nx = line[j + 1], pv = line[j - 1];
+    if (q === "'") { if (c === "'") q = null; continue; }
+    if (q === '"') {
+      if (c === "\\") { j++; continue; }
+      if (c === '"') { q = null; continue; }
+      if (c === "$" && nx === "(") { stack.push({ j, q, kind: "$(" }); q = null; cb(j, "$(", stack.length, j); j++; continue; }
+      if (c === "`") { stack.push({ j, q, kind: "`" }); q = null; cb(j, "$(", stack.length, j); continue; }
+      continue;
+    }
+    if (c === "\\") { j++; continue; }
+    if (c === "'" || c === '"') { q = c; continue; }
+    if (c === "`") {
+      if (stack.length && stack[stack.length - 1].kind === "`") { const f = stack.pop(); q = f.q; cb(j, ")", stack.length, f.j); }
+      else { stack.push({ j, q: null, kind: "`" }); cb(j, "$(", stack.length, j); }
+      continue;
+    }
+    if (c === "$" && nx === "{") { j++; while (j < line.length && line[j] !== "}") j++; continue; }   // ${…}: not a group
+    if ((c === "$" || c === "<" || c === ">") && nx === "(") { stack.push({ j, q: null, kind: "$(" }); cb(j, "$(", stack.length, j); j++; continue; }
+    if (c === "(") { stack.push({ j, q: null, kind: "(" }); cb(j, "(", stack.length, j); continue; }
+    if (c === ")") { const f = stack.pop(); if (f) { q = f.q; cb(j, ")", stack.length, f.j); } continue; }
+    if (c === "{" && isWordEdge(pv) && isSpace(nx)) { stack.push({ j, q: null, kind: "{" }); cb(j, "(", stack.length, j); continue; }
+    if (c === "}" && isWordEdge(pv) && isWordEdge(nx) && stack.length && stack[stack.length - 1].kind === "{") {
+      const f = stack.pop(); cb(j, ")", stack.length, f.j); continue;
+    }
+    cb(j, c, stack.length, -1);
+  }
+  return { depth: stack.length, q };
+}
+
+// Is a quote or a frame still open at the end of this text? Then the command continues AFTER
+// the heredoc terminator (`echo "$(cat <<EOF` … `EOF` … `)" | sh`, `{ cat <<EOF` … `} | bash`).
+function openAtEnd(text) {
+  const st = lex(text, () => {});
+  return st.depth > 0 || st.q !== null;
+}
+
+// Split a command string into its simple commands at unquoted, depth-0 list and pipe operators.
+function splitList(text) {
+  const parts = [];
+  let last = 0, skip = -1;
+  lex(text, (j, tok, depth) => {
+    if (depth !== 0 || tok.length !== 1 || j === skip) return;
+    const nx = text[j + 1], pv = text[j - 1];
+    if (tok === ";" || tok === "\n") { parts.push(text.slice(last, j)); last = j + 1; return; }
+    if (tok === "|" || tok === "&") {
+      if (tok === "&" && (pv === ">" || pv === "<" || nx === ">")) return;      // 2>&1, &>
+      let w = 1;
+      if (nx === tok) w = 2;
+      else if (tok === "|" && nx === "&") w = 2;
+      parts.push(text.slice(last, j)); last = j + w; skip = j + 1;
+    }
+  });
+  parts.push(text.slice(last));
+  return parts.filter((p) => p.trim());
+}
+
+// Does ANY simple command of this string hand its stdin to a shell? (Remote/-c command lines:
+// every command of the list inherits the same stdin, and a pipe carries it further.)
+function anyFeedsShell(text, depth) {
+  return splitList(text).some((part) => wordsFeedShell(tokenize(part), depth));
+}
+
+// Is this script argument stdin? An expansion that is the whole word cannot be known → closed.
+function scriptArgIsStdin(p) {
+  if (p.hasExpansion && p.text === "") return true;
+  return STDIN_PATHS.has(p.text);
+}
+
+// Does a shell invoked with these arguments read its script from stdin? Flags count whether
+// quoted or not (`bash '-s'` is still -s to bash); `-s` means stdin even with positionals
+// after it (`bash -s deploy`: deploy is $1); `-c` means the script is an argument; a cluster
+// ending in o/O eats the next word (`-euo pipefail`); `-n` parses without executing.
+function shellReadsStdin(args) {
+  let hasC = false, hasS = false, hasN = false;
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k], t = a.text;
+    if (t === "--") { if (hasN) return false; if (hasS) return true; const p = args[k + 1]; return !p || scriptArgIsStdin(p); }
+    if ((t.startsWith("-") || t.startsWith("+")) && t.length > 1) {
+      if (t.startsWith("--")) { if (t === "--rcfile" || t === "--init-file") k++; continue; }
+      if (/[oO]$/.test(t)) k++;
+      if (t.includes("c")) hasC = true;
+      if (t.includes("s")) hasS = true;
+      if (t.includes("n")) hasN = true;
+      continue;
+    }
+    if (hasN) return false;
+    if (hasS) return true;
+    if (hasC) return false;
+    return scriptArgIsStdin(a);
+  }
+  return !hasN && (hasS || !hasC);
+}
+
+// Strip `-x` / `-x value` / `--long[=v]` / `--` from the front of a wrapper's args.
+function skipFlags(name, args) {
+  const valued = VALUE_FLAGS[name] || new Set();
+  let k = 0;
+  while (k < args.length) {
+    const a = args[k], t = a.text;
+    if (a.hasExpansion && t === "") break;                            // `sudo $FLAGS …`: unknown
+    if (t === "--") { k++; break; }
+    if (t === "-") { k++; continue; }                                 // `su -`
+    if (!t.startsWith("-")) break;
+    if (valued.has(t) || (name === "ssh" && t.length === 2 && /^-[plioFJLRDWEbcmeIOQSwBP]$/.test(t))) { k += 2; continue; }
+    k++;
+  }
+  return args.slice(k);
+}
+
+function sudoWantsShell(name, args) {
+  const valued = VALUE_FLAGS[name] || new Set();
+  for (let k = 0; k < args.length; k++) {
+    const t = args[k].text;
+    if (!t.startsWith("-")) break;
+    if (t === "--shell" || t === "--login") return true;
+    if (valued.has(t)) { k++; continue; }
+    if (/^-[A-Za-z]*[si]/.test(t) && !t.startsWith("--")) return true;
+  }
+  return false;
+}
+
+// The remote/-c command line, rebuilt from its words: a single quoted word IS the line.
+function commandLineOf(words) {
+  if (words.length === 1) return words[0].text;
+  return words.map((w) => w.text).join(" ");
+}
+
+// Does this simple command, given a heredoc (or its pipe) on stdin, hand that text to a shell as
+// commands? Wrappers are unwrapped; a command word that is an expansion fails closed.
+function wordsFeedShell(words, depth) {
+  if (depth > 12) return true;
+  let i = 0;
+  while (i < words.length && ((RESERVED.has(words[i].text) && !words[i].quoted) || (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i].text) && !words[i].qstart))) i++;
+  if (i >= words.length) return false;
+  const w0 = words[i];
+  const rest = words.slice(i + 1);
+  const name = basename(w0.text);
+  if (w0.hasExpansion && !SHELLS.has(name)) return true;             // `$SHELL <<EOF`, `"$(which bash)" <<EOF`, `$BIN/tool <<EOF`
+  if (SHELLS.has(name)) return shellReadsStdin(rest);
+  if (name === "." || name === "source") return rest.length === 0 || scriptArgIsStdin(rest[0]);
+  if (name === "ssh") {
+    const r = skipFlags("ssh", rest);                                // r[0] = host, the rest = remote command
+    if (r.length && r[0].hasExpansion && r[0].text === "") return true;
+    const cmd = r.slice(1);
+    if (!cmd.length) return true;                                    // remote login shell reads stdin
+    if (cmd.some((w) => w.hasExpansion && w.text === "")) return true;
+    return anyFeedsShell(commandLineOf(cmd), depth + 1);
+  }
+  if (name === "su") {
+    const c = rest.findIndex((a) => a.text === "-c" || a.text === "--command");
+    if (c >= 0 && rest[c + 1]) return (rest[c + 1].hasExpansion && rest[c + 1].text === "") ? true : anyFeedsShell(rest[c + 1].text, depth + 1);
+    return true;                                                     // `su`, `su -`, `su - user`: a shell on stdin
+  }
+  if (name === "sudo" || name === "doas") {
+    const cmd = skipFlags(name, rest);
+    if (cmd.length) return wordsFeedShell(cmd, depth + 1);
+    return sudoWantsShell(name, rest);                               // `sudo -s` / `sudo -i` / `doas -s` alone
+  }
+  if (name === "runuser") {
+    const c = rest.findIndex((a) => a.text === "-c" || a.text === "--command");
+    if (c >= 0 && rest[c + 1]) return (rest[c + 1].hasExpansion && rest[c + 1].text === "") ? true : anyFeedsShell(rest[c + 1].text, depth + 1);
+    const hasU = rest.some((a) => a.text === "-u" || a.text === "--user");
+    const cmd = skipFlags("runuser", rest);
+    if (hasU) return cmd.length ? wordsFeedShell(cmd, depth + 1) : true;   // `runuser -u x -- CMD`
+    return true;                                                     // `runuser -l x`, `runuser - x [args]`: x's shell
+  }
+  if (name === "env") {
+    const sIdx = rest.findIndex((a) => a.text === "-S" || a.text === "--split-string");
+    if (sIdx >= 0 && rest[sIdx + 1]) return anyFeedsShell(rest[sIdx + 1].text, depth + 1);   // `env -S "bash -s"`
+  }
+  if (name === "xargs" || name === "parallel") {
+    // stdin drives xargs; with `sh -c` (or any shell) among its words each input line runs.
+    return rest.some((w) => (w.hasExpansion && w.text === "") || SHELLS.has(basename(w.text)));
+  }
+  if (WRAPPERS.has(name)) {
+    let r = skipFlags(name, rest);
+    if (name === "env") { while (r.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(r[0].text) && !r[0].qstart) r = r.slice(1); }
+    if (name === "timeout" || name === "chroot" || name === "flock") r = r.slice(1);    // duration / new root / lock file
+    if (!r.length) return name === "chroot" || name === "nsenter" || name === "unshare";   // they spawn a shell without a command
+    return wordsFeedShell(r, depth + 1);
+  }
+  if (CONTAINERS.has(name)) {
+    // `docker exec -i c sh`, `podman run -i img /bin/bash`: the first shell word, and what
+    // follows it, decides; `sh -c '…'` gives stdin to the -c command, not to the shell. An
+    // expansion that is a whole word in a place a shell could go fails closed; `-v $PWD:/w` does not.
+    for (let k = 0; k < rest.length; k++) {
+      if (rest[k].hasExpansion && rest[k].text === "" && !rest[k].quoted) return true;
+      if (!rest[k].quoted && SHELLS.has(basename(rest[k].text))) return shellReadsStdin(rest.slice(k + 1));
+    }
+    return false;
+  }
+  return false;
+}
+
+// The pipeline that holds position `at`, at its own nesting level: { stages, starts, idx, frame }
+// where frame = { start, end, kind } is the innermost frame enclosing `at` (or null), so the
+// caller can look at what the frame's output feeds.
+function pipelineAround(line, at) {
+  const open = [];
+  let frame = null;
+  lex(line, (j, tok, depth, fs) => {
+    if (tok === "$(" || tok === "(") open.push({ start: j, kind: tok === "(" ? (line[j] === "{" ? "{" : "(") : "$(", depth, end: -1 });
+    else if (tok === ")") { const f = open.find((o) => o.start === fs); if (f) f.end = j; }
+  });
+  for (const f of open) if (f.start < at && (f.end === -1 || f.end > at)) if (!frame || f.start > frame.start) frame = f;
+  const from = frame ? frame.start + (frame.kind === "$(" && line[frame.start] !== "`" ? 2 : 1) : 0;
+  const to = frame && frame.end !== -1 ? frame.end : line.length;
+  const level = frame ? frame.depth : 0;
+  let start = from, end = to, skip = -1;
+  const cuts = [];
+  lex(line, (j, tok, depth) => {
+    if (j < from || j >= to || depth !== level || tok.length !== 1 || j === skip) return;
+    const nx = line[j + 1], pv = line[j - 1];
+    const isList = (tok === "|" && nx === "|") || (tok === "&" && nx === "&") || tok === ";" || tok === "\n"
+      || (tok === "&" && nx !== ">" && nx !== "&" && pv !== ">" && pv !== "<" && pv !== "|");
+    if (isList) {
+      const w = (tok === ";" || tok === "\n" || (tok === "&" && nx !== "&")) ? 1 : 2;
+      if (j < at) { start = j + w; cuts.length = 0; } else if (end === to) end = j;
+      if (w === 2) skip = j + 1;
+      return;
+    }
+    if (tok === "|" && pv !== "|" && nx !== "|" && j >= start && j < end) { cuts.push(j); if (nx === "&") skip = j + 1; }
+  });
+  const stages = [], starts = [];
+  let prev = start;
+  for (const c of cuts) { if (c < prev) continue; stages.push(line.slice(prev, c)); starts.push(prev); prev = c + (line[c + 1] === "&" ? 2 : 1); }
+  stages.push(line.slice(prev, end)); starts.push(prev);
+  let idx = 0;
+  for (let k = 0; k < stages.length; k++) if (at >= starts[k] && at <= starts[k] + stages[k].length) { idx = k; break; }
+  return { stages, starts, idx, frame };
+}
+
+// Process substitutions used as OUTPUT (`cat <<EOF > >(bash)`, `tee >(sh) <<EOF`) inside a stage:
+// the stage's output flows into the inner command. Returns the inner texts.
+function outputSubstitutions(stage) {
+  const inner = [];
+  const opens = [];
+  lex(stage, (j, tok, depth, fs) => {
+    if (tok === "$(" && stage[j] === ">") opens.push({ start: j, end: -1 });
+    else if (tok === ")") { const o = opens.find((x) => x.start === fs); if (o) o.end = j; }
+  });
+  for (const o of opens) inner.push(stage.slice(o.start + 2, o.end === -1 ? stage.length : o.end));
+  return inner;
+}
+
+// Does text produced at position `at` of the line (a heredoc body) reach a shell as commands?
+function feedsAShell(line, at, depth) {
+  const { stages, idx, frame } = pipelineAround(line, at);
+  for (let k = idx; k < stages.length; k++) {
+    if (wordsFeedShell(tokenize(stages[k]), 0)) return true;
+    for (const inner of outputSubstitutions(stages[k])) if (anyFeedsShell(inner, 1)) return true;
+  }
+  return frame ? outputFeedsShell(line, frame, depth) : false;
+}
+
+// Does the OUTPUT of a frame reach a shell as commands? For `$(`/backticks the enclosing command
+// may consume it as a script (`eval "$(cat <<EOF…)"`, `bash -c "$(…)"`, `bash <(…)`); for a
+// `( … )` or `{ … }` group nothing does, but a later stage of the enclosing pipeline still can
+// (`{ cat <<EOF; } | sh`). And the frame may itself sit inside another one: recurse.
+function outputFeedsShell(line, frame, depth) {
+  if (depth > 12) return true;
+  const outer = pipelineAround(line, frame.start);
+  if (frame.kind === "$(") {
+    const head = outer.stages[outer.idx].slice(0, Math.max(0, frame.start - outer.starts[outer.idx]));
+    if (consumesScript(tokenize(head))) return true;
+  }
+  for (let k = outer.idx + 1; k < outer.stages.length; k++) {
+    if (wordsFeedShell(tokenize(outer.stages[k]), 0)) return true;
+    for (const inner of outputSubstitutions(outer.stages[k])) if (anyFeedsShell(inner, 1)) return true;
+  }
+  return outer.frame ? outputFeedsShell(line, outer.frame, depth + 1) : false;
+}
+
+// `eval "$(…)"`, `. <(…)`, `bash -c "$(…)"`, `bash <(…)`: the substituted text is a script.
+function consumesScript(words) {
+  let i = 0;
+  while (i < words.length && ((RESERVED.has(words[i].text) && !words[i].quoted) || (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i].text) && !words[i].qstart))) i++;
+  if (i >= words.length) return false;
+  let name = basename(words[i].text);
+  let rest = words.slice(i + 1);
+  if (words[i].hasExpansion && !SHELLS.has(name)) return true;
+  if (name === "sudo" || name === "doas" || WRAPPERS.has(name)) { const r = skipFlags(name, rest); if (r.length) { name = basename(r[0].text); rest = r.slice(1); if (r[0].hasExpansion && !SHELLS.has(name)) return true; } }
+  return name === "eval" || name === "." || name === "source" || SHELLS.has(name);
+}
+
+// Returns the text with every heredoc body removed, plus the bodies that feed a shell.
+function splitHeredocs(src) {
   const opRe = /(?<!<)<<(?!<)-?\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1/;
   let out = "";
+  const bodies = [];
   let rest = src;
   for (;;) {
     const m = opRe.exec(rest);
-    if (!m) {
-      out += rest;
-      break;
-    }
-    const eol = rest.indexOf("\n", m.index + m[0].length);
-    if (eol === -1) {
-      out += rest;
-      break;
-    }
+    if (!m) { out += rest; break; }
+    // The LOGICAL opener line: joined across backslash-newline in both directions, because
+    // bash joins them before it ever parses — `cat <<EOF \` / `| bash` is one line to bash.
+    let lineStart = rest.lastIndexOf("\n", m.index) + 1;
+    while (lineStart >= 2 && rest[lineStart - 2] === "\\") lineStart = rest.lastIndexOf("\n", lineStart - 2) + 1;
+    let eol = rest.indexOf("\n", m.index + m[0].length);
+    while (eol !== -1 && rest[eol - 1] === "\\") eol = rest.indexOf("\n", eol + 1);
+    if (eol === -1) { out += rest; break; }
+    let line = rest.slice(lineStart, eol).replace(/\\\n/g, " ");
+    const at = m.index - lineStart - (rest.slice(lineStart, m.index).match(/\\\n/g) || []).length;
     out += rest.slice(0, eol + 1);
     const tail = rest.slice(eol + 1);
-    const endRe = new RegExp("^\\t*" + m[2] + "[ \\t]*$", "m");
+    const endRe = new RegExp("^\\t*" + m[2] + "[ \\t]*\\r?$", "m");
     const em = endRe.exec(tail);
-    if (!em) break; // unterminated heredoc: drop the rest (conservative)
+    let forced = false;
+    if (em) {
+      // The command may continue after the terminator while a frame or quote is still open on
+      // the opener line: append those lines (joined) so the pipeline analysis sees the consumer.
+      // No fixed cap decides the verdict: past the sanity bound with the command STILL open, the
+      // body is treated as shell-fed (closed), never judged on a truncated opener.
+      const after = tail.slice(em.index + em[0].length).split("\n");
+      let k = 1;
+      for (; k < after.length && k <= 2000 && openAtEnd(line); k++) line += " " + after[k];
+      if (openAtEnd(line)) forced = true;
+    } else if (openAtEnd(line)) {
+      forced = true;
+    }
+    const shellFed = forced || feedsAShell(line, at, 0);
+    if (!em) {
+      // Unterminated heredoc: the rest is its body. Dropped (conservative) unless it feeds a
+      // shell — then it is code that WILL run, and it is analyzed.
+      if (shellFed) bodies.push(tail);
+      break;
+    }
+    if (shellFed) bodies.push(tail.slice(0, em.index));
     rest = tail.slice(em.index + em[0].length);
   }
-  return out;
+  return { out, bodies };
+}
+
+// Every text the rules must see: the command with heredoc bodies removed, then each body that
+// feeds a shell, recursively (depth-capped: a pathological nesting must not hang the hook —
+// and past the cap the body is emitted WHOLE rather than dropped, so depth is never a bypass).
+function analyzableTexts(src, depth) {
+  if (depth >= 64) return [src];
+  const { out, bodies } = splitHeredocs(src);
+  const texts = [out];
+  for (const b of bodies) for (const t of analyzableTexts(b, depth + 1)) texts.push(t);
+  return texts;
 }
 
 // Split into segments on shell operators — but QUOTE-AWARE, which the previous
@@ -859,13 +1644,15 @@ function splitSegments(str) {
   return out;
 }
 
-for (const seg of splitSegments(stripHeredocs(cmd))) {
-  // One segment, one line. The shell reads this back with `while read -r`, so a segment
-  // carrying a literal newline (only possible from inside a quoted span) would arrive as two
-  // segments and each half would be matched on its own. Collapsing to a space keeps the
-  // segment whole; the quoted span is still re-split on its own by the `inner` pass above, so
-  // nothing that used to be caught stops being caught.
-  process.stdout.write(seg.replace(/\n/g, " ") + "\n");
+for (const text of analyzableTexts(cmd, 0)) {
+  for (const seg of splitSegments(text)) {
+    // One segment, one line. The shell reads this back with `while read -r`, so a segment
+    // carrying a literal newline (only possible from inside a quoted span) would arrive as two
+    // segments and each half would be matched on its own. Collapsing to a space keeps the
+    // segment whole; the quoted span is still re-split on its own by the `inner` pass above, so
+    // nothing that used to be caught stops being caught.
+    process.stdout.write(seg.replace(/\n/g, " ") + "\n");
+  }
 }
 JS
 
