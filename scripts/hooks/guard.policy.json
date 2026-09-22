@@ -3,6 +3,11 @@
   "protected_branch": "main",
   "integration_branch": "develop",
   "generated_trees": [],
-  "egress_allow": ["localhost", "127.0.0.1", "::1",
-    "www.githubstatus.com"]
+  "egress_allow": [
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "www.githubstatus.com"
+  ],
+  "owner_lens": true
 }
