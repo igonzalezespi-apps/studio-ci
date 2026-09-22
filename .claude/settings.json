@@ -23,5 +23,6 @@
         "repo": "igonzalezespi-apps/claude-plugins"
       }
     }
-  }
+  },
+  "outputStyle": "core-dev:owner"
 }
