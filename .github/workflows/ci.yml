@@ -46,7 +46,9 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(*/*.test.sh)
+          # Y `.github/workflows/*.test.sh`: el cuerpo de un `run:` tambien se prueba, y su test
+          # no vive junto a una action sino junto al workflow que extrae.
+          tests=(*/*.test.sh .github/workflows/*.test.sh)
           if [ ${#tests[@]} -eq 0 ]; then
             echo "no hay *.test.sh todavía"; exit 0
           fi
