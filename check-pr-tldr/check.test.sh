@@ -59,6 +59,9 @@ caso 1 "TL;DR de un titular" 's/^\*\*Que cambia.*/**Que cambia para ti:** poco./
 # --- 4. remite a otro sitio --------------------------------------------------
 caso 1 "dice «ver abajo»" 's/nadie tiene que hacer nada despues de mergear/el detalle esta mas abajo/'
 caso 0 "«abajo» fuera del TL;DR no cuenta" 's|Detalle en `scripts/x.sh`|Ver mas abajo, en `scripts/x.sh`|'
+# Citar la regla no es incumplirla: lo entrecomillado no cuenta. Salio con la primera PR que uso
+# este control — explicaba la regla y el control la denuncio por nombrarla.
+caso 0 "nombra «ver abajo» entre comillas, como ejemplo" 's/si el aviso fallara/que el resumen no diga «ver abajo»; si el aviso fallara/'
 
 # --- 5. cita una fuente sin traerla ------------------------------------------
 caso 1 "cita un ADR sin enlace ni linea" 's/si el aviso fallara/segun el ADR-7, si el aviso fallara/'

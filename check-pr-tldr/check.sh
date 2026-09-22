@@ -96,6 +96,11 @@ else:
 
 if tl is not None:
     prose = re.sub(r"```.*?```", " ", section, flags=re.S)
+    # Lo CITADO no cuenta: «ver abajo» entre comillas o en `codigo` es un ejemplo de lo que no se
+    # hace, no un «ver abajo». Se descubrio con la primera PR que uso este control: explicaba la
+    # regla y el control la denuncio por nombrarla.
+    citas = re.compile(r'«[^»]*»' + r'|"[^"]*"' + r"|'[^']*'" + r'|`[^`]*`')
+    prose_sin_citas = citas.sub(" ", prose)
     if len(re.sub(r"\s+", " ", prose).strip()) < 200:
         problems.append("3. el TL;DR tiene menos de 200 caracteres de texto: un titular no es un resumen")
 
@@ -105,7 +110,7 @@ if tl is not None:
         (r"\bcomo (en|se dijo en) la (PR|issue)\b", "«como en la PR/issue»"),
         (r"\bdetalle en la seccion\b", "«detalle en la seccion»"),
     ):
-        if re.search(pat, prose, re.I):
+        if re.search(pat, prose_sin_citas, re.I):
             problems.append("4. el TL;DR remite a otro sitio (%s): quien decide no deberia tener que buscarlo" % why)
             break
 
