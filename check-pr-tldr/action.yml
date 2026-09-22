@@ -1,0 +1,60 @@
+name: check-pr-tldr
+description: >-
+  Una PR marcada para que la lea una persona tiene que abrir con su `## TL;DR`, y ese TL;DR se
+  basta solo: sin «ver abajo», sin citar una fuente que no trae, y con el comando de merge de ESA
+  PR. Una PR sin la marca no se juzga. Stack-agnostico: shell + `gh api`, sin Node ni Flutter.
+
+inputs:
+  pr-number:
+    description: "Numero de la PR. Por defecto, la del evento."
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  repo:
+    description: "owner/name de la PR. Por defecto, el repo del evento."
+    required: false
+    default: ${{ github.repository }}
+  label:
+    description: "Etiqueta que marca 'esto lo lee y lo mergea una persona'."
+    required: false
+    default: "revision-humana"
+  github-token:
+    description: "Token con `pull-requests: read` sobre este repo."
+    required: true
+
+outputs:
+  violations:
+    description: "Numero de violaciones (0 si la PR no lleva la marca)."
+    value: ${{ steps.scan.outputs.violations }}
+
+runs:
+  using: composite
+  steps:
+    # `bash` explicito: sin `shell:` una composite action no arranca, y el fallo llega en tiempo de
+    # ejecucion con un mensaje que no menciona la causa.
+    - id: scan
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_REPO: ${{ inputs.repo }}
+        FLAG_LABEL: ${{ inputs.label }}
+      run: |
+        set -uo pipefail
+        # `$GITHUB_ACTION_PATH` es la raiz de ESTA action, no la del consumidor: sin el, el script
+        # se busca en el checkout de quien la usa y no esta.
+        #
+        # `|| rc=$?` Y NO `out=$(...); rc=$?`. El shell de un `run:` es
+        # `bash --noprofile --norc -e -o pipefail {0}`: el `-e` viene DESDE FUERA y el `set -uo`
+        # de arriba no lo quita, asi que una asignacion cuyo comando sale distinto de 0 aborta el
+        # paso ahi mismo — antes de imprimir el hallazgo. Le paso ya a `check-action-pins`: la
+        # action no podia informar de una violacion, que es el unico caso para el que existe.
+        rc=0
+        out=$(bash "$GITHUB_ACTION_PATH/check.sh" --repo "$PR_REPO" --pr "$PR_NUMBER" --label "$FLAG_LABEL" 2>&1) || rc=$?
+        printf '%s\n' "$out"
+        n=$(printf '%s' "$out" | sed -nE 's/.*, ([0-9]+) violacion\(es\).*/\1/p' | tail -1)
+        echo "violations=${n:-0}" >> "$GITHUB_OUTPUT"
+        {
+          echo "### check-pr-tldr"
+          printf '```\n%s\n```\n' "$out"
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit "$rc"

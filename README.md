@@ -134,6 +134,37 @@ jobs:
 > the gate fails open with extra coverage runs, never silently off. If your job sets an explicit
 > `name:`, pass that display name — it is what the jobs API reports.
 
+### `check-pr-tldr`
+
+A PR flagged for a **human** to read and merge must open with its own `## TL;DR`, and that section
+must stand alone. The flag (`revision-humana` by default) means "a person merges this one"; that
+person does not read the diff, they read that section — so a TL;DR that says «see below» or cites an
+ADR it does not bring along defeats the flag. Six violation classes: no `## TL;DR`, not the first
+section, under 200 characters of prose, points elsewhere, cites a source without a link or a line,
+or is missing the merge command **for this PR**. A PR without the flag is not judged (exit 0, and it
+says so), so the check can be wired in every repo without becoming noise.
+
+```yaml
+on:
+  pull_request:
+    types: [opened, edited, labeled, unlabeled, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  tldr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@vX.Y.Z
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+No checkout needed: it reads the PR through the API. `label` changes the flag; `pr-number`/`repo`
+default to the event's.
+
 ## Release control plane
 
 Three composite actions form the homogeneous release mechanism shared by every consumer repo: derive
