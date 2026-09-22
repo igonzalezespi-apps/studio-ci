@@ -42,6 +42,11 @@ cat > "$POL_PRODUCT" <<'JSON'
 { "agent_may_merge": true, "protected_branch": "main", "integration_branch": "develop",
   "generated_trees": [], "egress_allow": ["localhost", "127.0.0.1", "::1"] }
 JSON
+# A repository whose releases do not read PR labels (GROUP 8): it waives the label.
+POL_NOLABEL="$TMP/nolabel.json"
+cat > "$POL_NOLABEL" <<'JSON'
+{ "agent_may_merge": false, "protected_branch": "main", "require_pr_label": false }
+JSON
 
 make_input() {
   node -e '
@@ -55,9 +60,10 @@ make_input() {
 pass=0; fail=0; total=0
 # Per-group context, set before each table.
 TEST_POLICY=""; TEST_PR_BASE=""; TEST_PR_HEAD=""
-# Cual es el repo de la SESION. Por defecto, uno que el doble de `gh` no conoce, para que
-# todo caso con `--repo` recorra el camino ENTRE REPOS y lea la politica del destino.
-TEST_SESSION_REPO="owner/the-session-repo"
+# Cual es el repo PROPIO (el que vendoriza el guard). Por defecto, uno que el doble de `gh`
+# no conoce, para que todo caso con `--repo` recorra el camino ENTRE REPOS y lea la politica
+# del destino. Sin `--repo`, el override hace ademas de cwd: el cwd DE VERDAD es el GROUP 7.
+TEST_OWN_REPO="owner/the-session-repo"
 # Prepended to PATH for a case, so GROUP 4 can put a fake `gh` in front of the
 # real one and exercise pr_base_branch FOR REAL instead of injecting its answer.
 TEST_PATH_PREFIX=""
@@ -69,12 +75,17 @@ run_case() {
   local out rc want
   local path_for_case="$PATH"
   [ -n "$TEST_PATH_PREFIX" ] && path_for_case="${TEST_PATH_PREFIX}:${PATH}"
+  # BASH_GUARD_PROJECT_ROOT points at a directory that is not a repository: the guard
+  # cannot tell which repository it protects, so every push counts as ours (fail
+  # closed) and these tables test the rules, whatever directory the suite runs from.
+  # Which repository a push reaches is GROUP 8's business, with real repositories.
   out="$(make_input "$cmd" | env \
     BASH_GUARD_BRANCH="$branch" \
     BASH_GUARD_POLICY="$TEST_POLICY" \
     BASH_GUARD_PR_BASE="$TEST_PR_BASE" \
     BASH_GUARD_PR_HEAD="$TEST_PR_HEAD" \
-    BASH_GUARD_SESSION_REPO="$TEST_SESSION_REPO" \
+    BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" \
+    BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
     PATH="$path_for_case" \
     "$GUARD" 2>&1)"
   rc=$?
@@ -466,9 +477,9 @@ run_case allow 'echo x > packages/database/src/generated/f.ts'  # no trees confi
 # GROUP 4 — pr_base_branch FOR REAL (no BASH_GUARD_PR_BASE injection).
 #
 # Every merge case above injects the base, so the real lookup had never been
-# exercised — and it was broken. The hook runs with `cd "$CLAUDE_PROJECT_DIR"`,
-# so `gh pr view <n>` without `--repo` resolves the number against the SESSION's
-# repo. Measured from the studio repo against a PR in one of the maintainer's
+# exercised — and it was broken. The hook does not run in the PR's repository
+# (it runs in the session's cwd, or in $CLAUDE_PROJECT_DIR when a repo wires a
+# `cd`), so `gh pr view <n>` without `--repo` resolves the number elsewhere. Measured from the studio repo against a PR in one of the maintainer's
 # other repos: "Could not resolve to a PullRequest with the number of <n>".
 # pr_base_branch fails CLOSED, so it
 # returned the protected branch and EVERY cross-repo merge was denied, whatever
@@ -498,6 +509,13 @@ for a in "$@"; do
   esac
   i=$((i + 1))
 done
+# Como el `gh` real: `--repo` admite OWNER/REPO, HOST/OWNER/REPO o una URL, y sin el
+# resuelve en el repo del directorio en que corre (su origin). Sin entorno de git
+# heredado: desde un hook, GIT_DIR ganaria al cwd.
+if [ -z "$repo" ] && [ "$sub1" = "pr" ]; then
+  repo="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR git config --get remote.origin.url 2>/dev/null || true)"
+fi
+repo="$(printf '%s' "$repo" | tr '[:upper:]' '[:lower:]' | sed -E 's#^[a-z]+://##; s#^[^@/]+@##; s#^([^/:]+):#\1/#; s#\.git$##; s#^[^/]+/([^/]+/[^/]+)$#\1#')"
 
 # --- la politica DEL REPO DESTINO -------------------------------------------
 # El guard la pide con `gh api repos/<r>/contents/... --jq .content` y la pasa por
@@ -541,6 +559,8 @@ esac
 if [ "$sub1" = "pr" ] && [ "$sub2" = "view" ]; then
   case "$repo" in
     owner/product-develop)   printf 'develop\tfeature/123-work'; exit 0 ;;
+    # el repo PROPIO del GROUP 7 (repos reales)
+    owner/propio)            printf 'develop\tfeature/123-work'; exit 0 ;;
     # mismo par de refs, pero su politica reserva el merge al humano
     owner/reserved-to-human) printf 'develop\tfeature/123-work'; exit 0 ;;
     owner/product-main)      printf 'main\tdevelop';             exit 0 ;;
@@ -623,7 +643,7 @@ TEST_PATH_PREFIX=""
 # ignorase la politica del destino. Hacen falta los dos.
 # ============================================================================
 TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
-TEST_SESSION_REPO="owner/the-session-repo"
+TEST_OWN_REPO="owner/the-session-repo"
 # sesion PERMISIVA + destino que RESERVA el merge al humano -> deniega.
 # Con la politica de la sesion mandando, esto seria un allow.
 run_case deny  'gh pr merge 123 --repo owner/reserved-to-human --squash'
@@ -638,12 +658,12 @@ run_case deny  'gh pr merge 123 --squash'
 
 # `--repo` que nombra al PROPIO repo de la sesion: no hay lectura remota, manda
 # la politica ya cargada. Con la restrictiva, deniega.
-TEST_SESSION_REPO="owner/product-develop"
+TEST_OWN_REPO="owner/product-develop"
 run_case deny  'gh pr merge 123 --repo owner/product-develop --squash'
 # y con la permisiva, permite — mismo comando, misma sesion, otra politica local.
 TEST_POLICY="$POL_PRODUCT"
 run_case allow 'gh pr merge 123 --repo owner/product-develop --squash'
-TEST_SESSION_REPO="owner/the-session-repo"
+TEST_OWN_REPO="owner/the-session-repo"
 
 # Un destino SIN politica vendorizada (404) falla CERRADO: no saber que politica
 # gobierna un repo no puede leerse como "adelante".
@@ -657,7 +677,7 @@ run_case deny  'gh pr merge 123 --repo owner/sin-politica --squash'
 total=$((total + 1))
 sin_pol_msg="$(make_input 'gh pr merge 123 --repo owner/sin-politica --squash' | env \
   BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
-  BASH_GUARD_SESSION_REPO="owner/the-session-repo" \
+  BASH_GUARD_OWN_REPO="owner/the-session-repo" \
   PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
 case "$sin_pol_msg" in
   *"could not be read"*) pass=$((pass + 1)) ;;
@@ -680,9 +700,9 @@ TEST_POLICY="$POL_PRODUCT"
 # Un `cwd` que NO es un repo: `session_repo` no tiene respuesta. Eso NO puede
 # significar "soy el destino" — significa que no se quien soy, y entonces hay que
 # ir a leer la politica del destino igual. Con el destino restrictivo, deniega.
-TEST_SESSION_REPO=""
+TEST_OWN_REPO=""
 run_case deny  'gh pr merge 123 --repo owner/reserved-to-human --squash'
-TEST_SESSION_REPO="owner/the-session-repo"
+TEST_OWN_REPO="owner/the-session-repo"
 
 # `long_lived_branches` lo aporta el DESTINO. Gemelo del ultimo caso del GROUP 4:
 # misma cabeza `release/lts`, misma politica de sesion, y lo unico que cambia es
@@ -701,7 +721,7 @@ run_case deny  'gh pr merge 128 --repo owner/policy-longlived --squash'
 # lo unico que separa a su caso de un allow.
 # ============================================================================
 TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
-TEST_SESSION_REPO="owner/the-session-repo"
+TEST_OWN_REPO="owner/the-session-repo"
 # cabeza `main` bajo una politica que no menciona `main`: solo el suelo built-in
 # puede denegarlo. Quita el suelo y este caso pasa a allow.
 run_case deny  'gh pr merge 200 --repo owner/exotic-head-main --merge'
@@ -724,7 +744,7 @@ TEST_PATH_PREFIX=""
 TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
 unresolved_msg="$(make_input 'gh pr merge 789 --squash' | env \
   BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
-  BASH_GUARD_SESSION_REPO="owner/the-session-repo" \
+  BASH_GUARD_OWN_REPO="owner/the-session-repo" \
   PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
 total=$((total + 1))
 case "$unresolved_msg" in
@@ -740,7 +760,7 @@ esac
 # del repo DESTINO, que es quien manda desde la 1.10.0.
 resolved_msg="$(make_input 'gh pr merge 202 --repo owner/exotic-release --merge' | env \
   BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
-  BASH_GUARD_SESSION_REPO="owner/the-session-repo" \
+  BASH_GUARD_OWN_REPO="owner/the-session-repo" \
   PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)" || true
 total=$((total + 1))
 case "$resolved_msg" in
@@ -751,48 +771,247 @@ esac
 TEST_PATH_PREFIX=""
 
 # ============================================================================
-# GROUP 7 — session_repo() DE VERDAD, sin el override.
+# GROUP 7 — QUE REPO ES "ESTE", DE VERDAD: el que vendoriza el guard, nunca el cwd.
 #
-# Todos los casos de arriba inyectan `BASH_GUARD_SESSION_REPO`, asi que la funcion
-# que deriva "owner/name" de la URL del remoto no se ejecutaba NUNCA — el mismo
-# agujero que tuvo `pr_base_branch` hasta la 1.7.5. Aqui se ejecuta contra un repo
-# de verdad, con las dos formas de URL.
+# Hasta la 1.14.0 "este repo" era el origin del cwd, creyendo que el hook corre
+# siempre desde $CLAUDE_PROJECT_DIR. Medido el 2026-09-14 que corre donde este la
+# shell de la sesion, siguiendo cada `cd`: una sesion de un repo permisivo situada
+# en uno restrictivo mergeaba ALLI con SU politica (claude-plugins#112). Estas son
+# las tres filas de aquella tabla y sus gemelas permisivas, con repos reales y sin
+# ningun override de identidad: `owner/propio` vendoriza el guard y su politica
+# LOCAL permite mergear; `owner/reserved-to-human` la RESERVA en su origin.
+# Contra el guard 1.14.0, las dos primeras salen allow (control negativo).
 #
-# El fixture usa `owner/reserved-to-human` a proposito: su politica REMOTA reserva
-# el merge al humano y la LOCAL lo permite, asi que los dos caminos dan verdictos
-# OPUESTOS. Si `session_repo` devolviera cualquier otra cosa (la URL cruda, un
-# vacio), el guard leeria la remota y denegaria.
-#
-# HERMETICO FRENTE AL ENTORNO DE GIT: subshell con GIT_DIR y GIT_WORK_TREE
-# desarmados. Un `git init` dentro de un test lanzado desde un hook hereda el
-# GIT_DIR que git exporta y reinicia el repo real.
+# HERMETICO FRENTE AL ENTORNO DE GIT: `git_h` y el `env -u` de abajo.
 # ============================================================================
-sesion_real() { # sesion_real <url-del-remoto> <allow|deny>
-  local url="$1" expected="$2" out rc want
+git_h() {
+  env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR git \
+    -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false \
+    -c core.hooksPath=/dev/null -c init.defaultBranch=main "$@"
+}
+G7="$TMP/g7"; G7PROPIO="$G7/propio"; G7WT="$G7/propio-wt"; G7RES="$G7/reservado"; G7OTRO="$G7/otro"
+mkdir -p "$G7"
+if ! {
+  git_h init -q "$G7PROPIO" &&
+    git_h -C "$G7PROPIO" remote add origin https://github.com/owner/propio.git &&
+    git_h -C "$G7PROPIO" commit -q --allow-empty -m init &&
+    git_h -C "$G7PROPIO" worktree add -q -b feature/wt "$G7WT" &&
+    git_h init -q "$G7RES" &&
+    git_h -C "$G7RES" remote add origin git@github.com:owner/reserved-to-human.git &&
+    git_h init -q "$G7OTRO" &&
+    git_h -C "$G7OTRO" remote add origin https://github.com/owner/otro-repo.git
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 7 repositories" >&2
+  exit 1
+fi
+merge_real() { # merge_real <allow|deny> <cwd> <command>
+  local expected="$1" cwd="$2" cmd="$3" out rc want
   total=$((total + 1))
-  (
-    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
-    d="$(mktemp -d "$TMP/sess.XXXXXX")"
-    git -C "$d" init -q -b main
-    git -C "$d" remote add origin "$url"
-    cd "$d" || exit 3
-    make_input 'gh pr merge 123 --repo owner/reserved-to-human --squash' | env \
-      BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
-      PATH="$TMP/bin:$PATH" "$GUARD" >/dev/null 2>&1
-    exit $?
-  )
+  out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR -u BASH_GUARD_OWN_REPO -u BASH_GUARD_PR_BASE -u BASH_GUARD_PR_HEAD \
+    BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
+    BASH_GUARD_PROJECT_ROOT="$G7PROPIO" PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
   if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
   fail=$((fail + 1))
-  printf 'FAIL  session_repo real con %-42s esperaba %s (exit %d), salio %d\n' "$url" "$expected" "$want" "$rc"
+  printf 'FAIL  expected=%s (exit %d), got exit %d  [cwd=%s]  ::  %s\n' \
+    "$expected" "$want" "$rc" "${cwd#"$G7"/}" "$cmd"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
 }
-# El remoto ES el repo de la PR -> manda la politica LOCAL (permisiva) -> allow.
-sesion_real 'https://github.com/owner/reserved-to-human.git' allow
-sesion_real 'git@github.com:owner/reserved-to-human.git'     allow
-sesion_real 'https://github.com/owner/reserved-to-human'     allow
-# El remoto es OTRO repo -> se lee la politica REMOTA (restrictiva) -> deny.
-sesion_real 'https://github.com/owner/otro-repo.git'         deny
+# Las tres filas de claude-plugins#112: la PR es de `owner/reserved-to-human`.
+merge_real deny  "$G7RES"  'gh pr merge 5 --squash'
+merge_real deny  "$G7RES"  'gh pr merge 5 --repo owner/reserved-to-human --squash'
+merge_real deny  "$G7OTRO" 'gh pr merge 5 --repo owner/reserved-to-human --squash'
+# Sus gemelas: la PR es del repo PROPIO, cuya politica local permite. Desde el
+# checkout, desde un worktree, y nombrandolo con --repo en tres grafias desde fuera.
+merge_real allow "$G7PROPIO" 'gh pr merge 5 --squash'
+merge_real allow "$G7WT"     'gh pr merge 5 --squash'
+merge_real allow "$G7RES"    'gh pr merge 5 --repo owner/propio --squash'
+merge_real allow "$G7OTRO"   'gh pr merge 5 --repo github.com/OWNER/propio --squash'
+merge_real allow "$G7OTRO"   'gh pr merge 5 --repo=https://github.com/owner/propio.git --squash'
+# Sin --repo fuera del repo propio: gh resolveria en OTRO repo -> no se sabe cual
+# politica manda -> deniega, aunque ese otro repo permitiera.
+merge_real deny  "$G7OTRO"   'gh pr merge 5 --squash'
+# Una reubicacion en el propio comando hace el cwd inaveriguable.
+merge_real deny  "$G7PROPIO" "cd $G7RES && gh pr merge 5 --squash"
+merge_real deny  "$G7PROPIO" 'GH_REPO=owner/reserved-to-human gh pr merge 5 --squash'
+
+# ============================================================================
+# GROUP 8 — the protected branch is THIS repository's policy, and which repository
+# a push reaches is decided by its REMOTE, never by a path.
+#
+# Real repositories on disk, because the answer comes from git itself. The layout
+# covers the shapes a path-based check gets wrong: a worktree and a second clone of
+# this repository (other directories, same remote), a push by URL, and a repository
+# that carries a remote pointing back at this one. The acceptance cases written
+# with the first patch for this (push to another repo allowed; to this one denied
+# by any route; `cd` inside the command denied; --no-verify/--force denied in any
+# repo) are all here, next to the ones that patch let through.
+#
+# HERMETIC: every git call and every guard run drops GIT_DIR & co. — this suite also
+# runs from a pre-commit hook, which exports them.
+# ============================================================================
+REPOS="$TMP/repos"
+PROJ="$REPOS/proyecto"; WT="$REPOS/wt"; CLON="$REPOS/clon"
+OTRO="$REPOS/otro"; MIXTO="$REPOS/mixto"; SINREMOTO="$REPOS/sin-remoto"
+mkdir -p "$REPOS"
+if ! {
+  git_h init -q "$PROJ" &&
+    git_h -C "$PROJ" remote add origin https://github.com/acme/proyecto.git &&
+    git_h -C "$PROJ" commit -q --allow-empty -m init &&
+    git_h -C "$PROJ" worktree add -q -b feature/wt "$WT" &&
+    mkdir -p "$PROJ/sub" &&
+    git_h init -q "$CLON" &&
+    git_h -C "$CLON" remote add origin git@github.com:ACME/Proyecto &&
+    git_h init -q "$OTRO" &&
+    git_h -C "$OTRO" remote add origin https://github.com/acme/otro.git &&
+    git_h init -q "$MIXTO" &&
+    git_h -C "$MIXTO" remote add origin https://github.com/acme/mixto.git &&
+    git_h -C "$MIXTO" remote add proyecto git@github.com:acme/proyecto.git &&
+    git_h init -q "$SINREMOTO"
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 8 repositories" >&2
+  exit 1
+fi
+
+# push_real <allow|deny> <cwd> <command> — the branch resolves FOR REAL (no override),
+# and the protected repository is $PROJ.
+push_real() {
+  local expected="$1" cwd="$2" cmd="$3" out rc want
+  total=$((total + 1))
+  out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH \
+    BASH_GUARD_POLICY="$POL_PRISMA" BASH_GUARD_PROJECT_ROOT="$PROJ" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected=%s (exit %d), got exit %d  [cwd=%s]  ::  %s\n' \
+    "$expected" "$want" "$rc" "${cwd#"$REPOS"/}" "$cmd"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+
+# Another repository: its main is not ours.
+push_real allow "$OTRO" "git push origin main"
+push_real allow "$PROJ" "git -C $OTRO push origin main"
+push_real allow "$PROJ" "git --git-dir=$OTRO/.git push origin main"
+push_real allow "$PROJ" "git --git-dir $OTRO/.git push origin main"
+push_real allow "$PROJ" "git -C $OTRO push https://github.com/acme/otro.git main"
+push_real allow "$OTRO" "git push"
+push_real allow "$OTRO" "git push origin"
+push_real allow "$OTRO" "git push --repo=https://github.com/acme/otro.git"
+push_real allow "$MIXTO" "git push origin main"
+# This repository, by any route: still denied (no regression of the hard rule).
+push_real deny "$PROJ" "git push origin main"
+push_real deny "$PROJ/sub" "git push origin main"
+push_real deny "$OTRO" "git -C $PROJ push origin main"
+push_real deny "$OTRO" "git -C $PROJ/sub push origin main"
+push_real deny "$OTRO" "git -C $PROJ/../proyecto push origin main"
+push_real deny "$PROJ" "git push"
+push_real deny "$OTRO" "git push --repo=https://github.com/acme/proyecto.git"
+# ...including the routes a path comparison lets through: a worktree, a second clone
+# (other spelling, other case), a URL, a remote of another repo pointing back here,
+# --work-tree (it does not change the repository), and a -c that rewrites the URL.
+push_real deny "$WT" "git push origin main"
+push_real deny "$OTRO" "git -C $WT push origin main"
+push_real deny "$CLON" "git push origin main"
+push_real deny "$PROJ" "git -C $OTRO push https://github.com/acme/proyecto.git main"
+push_real deny "$PROJ" "git -C $OTRO push git@github.com:ACME/proyecto main"
+push_real deny "$PROJ" "git -C $OTRO push ssh://git@github.com:22/acme/proyecto.git main"
+push_real deny "$OTRO" "git push $PROJ main"
+push_real deny "$OTRO" "git push file://$WT main"
+push_real deny "$MIXTO" "git push proyecto main"
+push_real deny "$MIXTO" "git push"
+push_real deny "$PROJ" "git --work-tree=$OTRO push origin main"
+push_real deny "$OTRO" "git -c remote.origin.pushurl=https://github.com/acme/proyecto.git push origin main"
+# Fail-closed: the command moves git on the way, or the destination does not resolve.
+push_real deny "$PROJ" "cd $OTRO && git push origin main"
+push_real deny "$OTRO" "cd $PROJ && git push origin main"
+push_real deny "$OTRO" "(cd $PROJ; git push origin main)"
+push_real deny "$OTRO" "pushd $PROJ && git push origin main"
+push_real deny "$OTRO" "GIT_DIR=$PROJ/.git git push origin main"
+push_real deny "$OTRO" "env -C $PROJ git push origin main"
+push_real deny "$PROJ" "git -C $REPOS/no-existe push origin main"
+push_real deny "$PROJ" "git -C $REPOS push origin main"
+push_real deny "$PROJ" "git -C $SINREMOTO push origin main"
+push_real deny "$SINREMOTO" "git push"
+# HEAD is the branch of the repository the push runs in (-C included); a `cd` in the
+# same command stays ambiguous and denied.
+push_real allow "$PROJ" "git -C $WT push -u origin HEAD"
+push_real allow "$WT" "git push -u origin HEAD"
+push_real deny "$PROJ" "git push -u origin HEAD"
+push_real deny "$PROJ" "cd $WT && git push -u origin HEAD"
+push_real deny "$OTRO" "git --git-dir=$PROJ/.git push origin HEAD"
+# Rules about the agent, not about a repository: they apply toward any of them.
+push_real deny "$OTRO" "git push --no-verify origin main"
+push_real deny "$OTRO" "git push --force origin otra-rama"
+
+# The production anchor, with NO override: the protected repository is the one that
+# holds the guard. Vendored into $PROJ like a consumer does; no policy file there, so
+# strict defaults (main protected). $CLAUDE_PROJECT_DIR naming another repository
+# must not move the anchor.
+mkdir -p "$PROJ/scripts/hooks"
+cp "$GUARD" "$PROJ/scripts/hooks/bash-guard.sh"
+anchor_real() { # anchor_real <allow|deny> <cwd> <command>
+  local expected="$1" cwd="$2" cmd="$3" rc want
+  total=$((total + 1))
+  (cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH -u BASH_GUARD_POLICY -u BASH_GUARD_PROJECT_ROOT \
+    CLAUDE_PROJECT_DIR="$OTRO" "$PROJ/scripts/hooks/bash-guard.sh" >/dev/null 2>&1)
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected=%s (exit %d), got exit %d  [anchor, cwd=%s]  ::  %s\n' \
+    "$expected" "$want" "$rc" "${cwd#"$REPOS"/}" "$cmd"
+  return 0
+}
+anchor_real deny "$PROJ" "git push origin main"
+anchor_real deny "$WT" "git push origin main"
+anchor_real deny "$OTRO" "git -C $PROJ push origin main"
+anchor_real allow "$PROJ" "git -C $OTRO push origin main"
+anchor_real allow "$OTRO" "git push origin main"
+
+# `require_pr_label: false` waives the label on `gh pr create` for THIS repository's
+# PRs only, proven the same way: --repo, or every remote of the directory gh runs in.
+# gh_real <allow|deny> <policy> <cwd> <command>
+gh_real() {
+  local expected="$1" policy="$2" cwd="$3" cmd="$4" out rc want
+  total=$((total + 1))
+  out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH -u GH_REPO \
+    BASH_GUARD_POLICY="$policy" BASH_GUARD_PROJECT_ROOT="$PROJ" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected=%s (exit %d), got exit %d  [%s, cwd=%s]  ::  %s\n' \
+    "$expected" "$want" "$rc" "$(basename "$policy")" "${cwd#"$REPOS"/}" "$cmd"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+gh_real allow "$POL_NOLABEL" "$PROJ" 'gh pr create --title t --body b'
+gh_real allow "$POL_NOLABEL" "$WT" 'gh pr create --title t --body b'
+gh_real allow "$POL_NOLABEL" "$OTRO" 'gh pr create --repo acme/proyecto --title t --body b'
+gh_real allow "$POL_NOLABEL" "$OTRO" 'gh pr create -R github.com/ACME/proyecto --title t --body b'
+gh_real allow "$POL_NOLABEL" "$OTRO" 'gh pr create --repo=https://github.com/acme/proyecto --title t --body b'
+# ...and nowhere else: another repository's release gate may well read the label.
+gh_real deny "$POL_NOLABEL" "$OTRO" 'gh pr create --title t --body b'
+gh_real deny "$POL_NOLABEL" "$PROJ" 'gh pr create --repo acme/otro --title t --body b'
+gh_real deny "$POL_NOLABEL" "$PROJ" 'gh pr create --repo proyecto --title t --body b'
+gh_real deny "$POL_NOLABEL" "$MIXTO" 'gh pr create --title t --body b'
+gh_real deny "$POL_NOLABEL" "$SINREMOTO" 'gh pr create --title t --body b'
+gh_real deny "$POL_NOLABEL" "$OTRO" "cd $PROJ && gh pr create --title t --body b"
+gh_real deny "$POL_NOLABEL" "$PROJ" 'GH_REPO=acme/otro gh pr create --title t --body b'
+# The default still requires it, and a label always passes.
+gh_real deny "$POL_PRISMA" "$PROJ" 'gh pr create --title t --body b'
+gh_real allow "$POL_PRISMA" "$OTRO" 'gh pr create --label x --title t --body b'
+# Not knowing which repository this is (the tables above) keeps it required.
+TEST_POLICY="$POL_NOLABEL"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+run_case deny 'gh pr create --title t --body b'
 
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi
