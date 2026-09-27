@@ -199,14 +199,13 @@ CASES=(
   # regla entera y el verde no lo distinguiria.
   "$(printf 'allow|gh pr create --repo o/r --base main --head b \\\n  --label semver:none \\\n  --title "chore(x): y" --body-file b.md')"
   "$(printf 'deny|gh pr create --repo o/r --base main --head b \\\n  --title "chore(x): y" --body-file b.md')"
-  # Y la direccion peligrosa del mismo fallo: si el segmento se parte, una regla que exige ver
-  # una bandera deja de verla, pero tambien una prohibicion puede quedar en la mitad que nadie
-  # mira. Con la continuacion resuelta, esto se sigue denegando.
+  # Las dos direcciones del mismo troceo: la bandera que se deja de ver, y la prohibicion que
+  # queda en una mitad. Con la continuacion resuelta, ambas se leen enteras.
   "$(printf 'deny|git push --force \\\n  origin main')"
   "$(printf 'deny|git commit \\\n  --no-verify -m "wip"')"
   # Y la cobertura NO se cambia por comodidad: lo entrecomillado se sigue analizando,
-  # porque `bash -c "..."` se ejecuta de verdad. Antes de este arreglo esto NO se denegaba:
-  # el troceo partia la cadena en trozos que ya no parecian un `git push --force`.
+  # porque `bash -c "..."` se ejecuta de verdad, y un troceo que lo partiera dejaria de
+  # reconocerlo.
   'deny|bash -c "git push --force origin main"'
   'allow|gh api repos/owner/repo/pulls/123'
   'allow|cat .env.example'
@@ -247,22 +246,17 @@ done
 heredoc_cmd=$'git commit -m "$(cat <<\'EOF\'\nfeat(infra): bash command guard\n\n- denies git push origin main and cat .env\nEOF\n)"'
 run_case allow "$heredoc_cmd"
 
-# Heredocs that FEED A SHELL are code, not data. Measured 2026-09-01: `curl … | bash` inside
-# `bash <<'EOSU'` ran unchallenged in a session where the same curl on a bare line was denied —
-# a complete bypass of every rule. The decision is STRUCTURAL (which command reads the body,
-# after unwrapping sudo/env/ssh/su/…, path stripped, expansions failing closed), not a word
-# match on the line. Two adversarial rounds produced the cases below. Round 1 (against a
-# regex version): `/bin/bash`, `$SHELL`, `bash<<EOF`, `sudo --shell`, `doas -s`, `. /dev/stdin`,
-# `| bash` after a line continuation, `$(cat <<EOF)` consumed by eval/bash -c, the consumer
-# written AFTER the terminator; false positives from a shell word in a PR title or a comment,
-# `ssh host 'cat > f'`, `sudo -i -u postgres psql`, a delimiter named `sh`. Round 2 (against
-# the first structural version): a tokenizer that LOOPED on `ssh h 'echo a; echo b'` until node
-# ran out of memory and the guard allowed the whole call (the crash shape below must DENY the
-# bare push in front of it), a 20-line cap on the continuation after the terminator, `bash -s
-# 'deploy'`, `|&`, `2>&1 |`, `> >(bash)`, `flock FILE bash`, `env -u X bash`, `then bash`,
-# `{ cat <<EOF; } | sh`, `-euo pipefail`, `su -s /bin/sh`; false positives from `VAR="$(…)" gh`,
-# `-v $PWD:/w`, `bash $HERE/x.sh`, `bash -n`. Interpreters that are not shells (python, node,
-# psql, make, patch, crontab) stay unparsed: documented residual risk.
+# Heredocs that FEED A SHELL are code, not data: a body that reaches a shell runs, and one that
+# only lands in a file or in a PR body is prose. The decision is STRUCTURAL (which command reads
+# the body, after unwrapping sudo/env/ssh/su/…, path stripped, expansions failing closed), never
+# a word match on the line.
+#
+# Both directions matter and both have cases below: a shell reached through a path, a variable,
+# a wrapper, a pipe, a substitution or a line continuation is still a shell; and the word `bash`
+# or `ssh` inside a title, a comment or a delimiter is still prose. Each shape lives as ONE
+# case, never as a paragraph — the list of shapes IS the list of `run_case` lines below, and a
+# shape nobody wrote a case for is not covered by describing it here. Interpreters that are not
+# shells (python, node, psql, make, patch, crontab) stay unparsed: documented residual risk.
 run_case deny  $'/bin/bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'/usr/bin/sh <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'$SHELL <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
@@ -629,13 +623,10 @@ TEST_PATH_PREFIX=""
 # ============================================================================
 # GROUP 5 — LA POLITICA QUE MANDA ES LA DEL REPO DESTINO, no la de la sesion.
 #
-# Hasta la 1.9.0 mandaba siempre la de la SESION, porque el hook arranca con
-# `cd "$CLAUDE_PROJECT_DIR"` y esa era la unica que habia leido. Era inofensivo
-# SOLO por accidente: los repos cuya politica dice `agent_may_merge: false` no
-# tenian rama de integracion, asi que todas sus PRs apuntaban a la rama protegida
-# — y esa negativa no consulta ninguna politica. En cuanto uno de esos repos gane
-# una rama de integracion, una sesion permisiva podria mergear en el contra su
-# propia politica.
+# El hook arranca con `cd "$CLAUDE_PROJECT_DIR"`, asi que la politica de la sesion
+# es la unica que tiene a mano — y no es la que manda. La que decide es la del
+# repo al que apunta la PR, leida de su origin: quien merge no es quien pone las
+# condiciones.
 #
 # Los dos casos de abajo son gemelos y van en DIRECCIONES OPUESTAS. Uno solo no
 # prueba nada: si solo estuviera el restrictivo, un guard que denegara siempre
@@ -757,7 +748,7 @@ esac
 # unresolvable. Both exit 2, so only the message separates them — which is why
 # collapsing the two conditions into one went unnoticed by every exit-code case.
 # La politica exotica ya no es un fichero local: la sirve el doble de `gh` como la
-# del repo DESTINO, que es quien manda desde la 1.10.0.
+# del repo DESTINO, que es quien manda.
 resolved_msg="$(make_input 'gh pr merge 202 --repo owner/exotic-release --merge' | env \
   BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
   BASH_GUARD_OWN_REPO="owner/the-session-repo" \
@@ -773,14 +764,13 @@ TEST_PATH_PREFIX=""
 # ============================================================================
 # GROUP 7 — QUE REPO ES "ESTE", DE VERDAD: el que vendoriza el guard, nunca el cwd.
 #
-# Hasta la 1.14.0 "este repo" era el origin del cwd, creyendo que el hook corre
-# siempre desde $CLAUDE_PROJECT_DIR. Medido el 2026-09-14 que corre donde este la
-# shell de la sesion, siguiendo cada `cd`: una sesion de un repo permisivo situada
-# en uno restrictivo mergeaba ALLI con SU politica (claude-plugins#112). Estas son
-# las tres filas de aquella tabla y sus gemelas permisivas, con repos reales y sin
-# ningun override de identidad: `owner/propio` vendoriza el guard y su politica
-# LOCAL permite mergear; `owner/reserved-to-human` la RESERVA en su origin.
-# Contra el guard 1.14.0, las dos primeras salen allow (control negativo).
+# El hook corre donde este la shell de la sesion, que sigue cada `cd`, asi que el
+# cwd NO es una identidad: solo dice donde estabas. "Este repo" es el que vendoriza
+# el guard, y se comprueba. Tres filas y sus gemelas permisivas, con repos reales y
+# sin ningun override de identidad: `owner/propio` vendoriza el guard y su politica
+# LOCAL permite mergear; `owner/reserved-to-human` la RESERVA en su origin. Las dos
+# primeras salen allow contra cualquier implementacion que tome el cwd por identidad
+# — son las que discriminan.
 #
 # HERMETICO FRENTE AL ENTORNO DE GIT: `git_h` y el `env -u` de abajo.
 # ============================================================================
@@ -820,7 +810,8 @@ merge_real() { # merge_real <allow|deny> <cwd> <command>
   [ -n "$out" ] && printf '      output: %s\n' "$out"
   return 0
 }
-# Las tres filas de claude-plugins#112: la PR es de `owner/reserved-to-human`.
+# Las tres filas, todas con la PR en `owner/reserved-to-human`: sin `--repo`, con `--repo`
+# desde el repo propio, y con `--repo` desde un tercero.
 merge_real deny  "$G7RES"  'gh pr merge 5 --squash'
 merge_real deny  "$G7RES"  'gh pr merge 5 --repo owner/reserved-to-human --squash'
 merge_real deny  "$G7OTRO" 'gh pr merge 5 --repo owner/reserved-to-human --squash'
