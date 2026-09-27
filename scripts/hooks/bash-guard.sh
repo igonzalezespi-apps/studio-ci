@@ -18,22 +18,18 @@
 #             reason to self-correct instead of retrying blindly)
 #
 # ⚠️ TRIPWIRE — THIS IS NOT A SECURITY BOUNDARY ⚠️
-# A best-effort firewall against agent mistakes, not hermetic: obfuscated forms
-# — `bash -c "..."`, git aliases, `git -c ...`, variable expansion ($CMD),
-# intermediate scripts, quoted text the simple tokenizer does not interpret,
-# exotic chaining — are NOT guaranteed to be intercepted. The guard is also
+# A best-effort firewall against agent mistakes, not hermetic: it reads the
+# command line it is handed, so anything that hides the real command from a
+# simple tokenizer — another interpreter, an indirection, a script written first
+# and run afterwards — is NOT guaranteed to be intercepted. The guard is also
 # fail-open: if command extraction fails (node absent, malformed JSON), it
 # allows — a broken tripwire must not take down the harness.
 #
-# And there is NO server-side backstop behind it. The consuming repos have no
-# branch protection and no required status checks (measured across the fleet:
-# `branches/<ref>/protection` -> 404 and `rulesets` -> [] nearly everywhere; the
-# one existing ruleset only blocks deletion/force-push and does not gate on CI)
-# — a deliberate standing decision, not an oversight. So when this guard misses
-# something, what is left is: the local git hooks (pre-commit / commit-msg /
-# pre-push), a CI that REPORTS without blocking (no required checks -> a red run
-# does not stop a merge), and human review. Treat an escape here as a real
-# escape; nothing on the server is going to catch it.
+# Do NOT assume a server-side backstop behind it. Branch protection, rulesets and
+# required status checks are per-repository settings that this guard neither reads
+# nor guarantees; a CI that merely REPORTS does not stop a merge. Whoever vendors
+# this file checks what its own repository enforces — `branches/<ref>/protection`
+# and `rulesets` — and, until then, treats an escape here as a real escape.
 #
 # BASH_GUARD_BRANCH: override of the current branch, TEST-ONLY (bash-guard.test.sh)
 # — lets the suite simulate "on main"/"on a PR branch" deterministically. In
@@ -507,8 +503,8 @@ check_git_push() {
     fi
     if [ "$dst" = "$PROTECTED_BRANCH" ]; then
       # The alternative names the branch, or the worktree with -C: a bare `HEAD`
-      # resolves wherever the session happens to stand, which is how this very
-      # message used to recommend the command it had just denied.
+      # resolves wherever the session happens to stand, so what this message
+      # suggests must never contain one.
       deny "push targeting ${PROTECTED_BRANCH} is forbidden (${PROTECTED_BRANCH} is protected for humans)" \
         "push your PR branch by name (git push -u origin <branch>) or from its worktree (git -C <worktree> push -u origin HEAD), and open a PR"
     fi
@@ -632,12 +628,10 @@ is_long_lived_branch() {
 #   0  provably this repository -> the policy already loaded governs it
 #   1  another repository, the one printed -> its own policy governs it
 #   2  cannot be determined -> the caller denies
-# The cwd is NOT evidence of who we are. Until 1.14.0 it was: "this repo" was the
-# cwd's origin, on the belief that the hook always runs from $CLAUDE_PROJECT_DIR.
-# Measured 2026-09-14 that it runs wherever the session's shell is, following every
-# `cd`, so a session of a permissive repo standing in a restrictive one merged there
-# under its OWN policy (claude-plugins#112). What decides is the repository that
-# holds the guard, as for the protected branch of a push (project_identities).
+# The cwd is NOT evidence of who we are: the hook runs wherever the session's shell
+# is, and that follows every `cd`, so the directory says where you STOOD, never who
+# you ARE. What decides is the repository that HOLDS the guard, as for the protected
+# branch of a push (project_identities).
 # Without --repo, gh resolves the PR in the repository of the directory it runs in;
 # that directory counts as ours only when EVERY one of its remotes is ours, and a
 # relocation in the command (`cd`, GH_REPO=) makes it unknowable.
@@ -722,16 +716,12 @@ target_policy_tsv() {
 # legitimate PR with a long-lived head is the release (head `develop`, base
 # `main`), and (2) already denies that.
 #
-# WHOSE POLICY DECIDES. Until 1.9.0 it was always the SESSION's: the policy loaded
-# at the top of this file was the only one it had read.
-# That was harmless only by accident: the repos whose policy says
-# `agent_may_merge: false` had no integration branch, so every one of their PRs
-# targeted the protected branch — and negative (2) does not consult any policy.
-# The moment such a repo gains an integration branch, a session rooted somewhere
-# permissive could merge into it against that repo's own policy.
-# So a merge landing in another repo re-reads THAT repo's guard.policy.json from its
-# origin and decides with it, failing CLOSED when it cannot be read. Which repo the
-# merge lands in is merge_target's call, and since 1.15.0 the cwd has no say in it. The globals
+# WHOSE POLICY DECIDES. Not the SESSION's — the policy loaded at the top of this
+# file is simply the only one at hand, and being at hand is not being in charge.
+# Whoever merges does not set the conditions: a merge landing in another repo
+# re-reads THAT repo's guard.policy.json from its origin and decides with it,
+# failing CLOSED when it cannot be read. Which repo the merge lands in is
+# merge_target's call, and the cwd has no say in it. The globals
 # are reassigned rather than shadowed on purpose: this process exits right after,
 # and threading four values through three helpers would be the kind of change
 # that quietly stops covering one of them.
@@ -823,10 +813,11 @@ check_gh() {
     elif [ -z "$sub2" ]; then
       sub2="$a"
     elif [ -z "$merge_arg" ]; then
-      # Do NOT stop here. This used to `break`, and `--repo` almost always comes
-      # AFTER the PR number (`gh pr merge 123 --repo owner/name --squash`), so
-      # the flag was never reached and repo_arg stayed empty. Keep scanning to
-      # the end; only the FIRST positional after `pr merge` is the PR.
+      # Do NOT stop here: `--repo` usually comes AFTER the PR number
+      # (`gh pr merge 123 --repo owner/name --squash`), so a scan that stops at
+      # the first positional never reads it and the destination stays unknown.
+      # Keep scanning to the end; only the FIRST positional after `pr merge` is
+      # the PR.
       merge_arg="$a"
     fi
     i=$((i + 1))
@@ -1075,17 +1066,14 @@ if (typeof cmd !== "string" || cmd.trim() === "") process.exit(0);
 // Heredoc bodies are data — commit messages, files written with `cat > f <<EOF` — and
 // analyzing them as commands would deny a runbook for mentioning `git push origin main` in
 // its prose. BUT a heredoc fed to a SHELL is code: `bash <<'EOF' … EOF`, `cat <<EOF | sh`,
-// `ssh host <<EOF`, `sudo -s <<EOF`. Stripping those blindly was a complete bypass of every
-// rule: measured 2026-09-01, a `curl … | bash` inside `bash <<'EOSU'` ran unchallenged in a
-// session where the same curl on a bare line was denied for egress.
+// `ssh host <<EOF`, `sudo -s <<EOF`. Dropping a body without asking where it goes takes every
+// rule out of it; keeping every body denies prose for quoting a command. Both directions are
+// defects, and the suite carries one case per shape — that is where the concrete forms live.
 //
 // So a body is KEPT for analysis when it reaches a shell that will read it as commands, and
 // dropped otherwise. "Reaches a shell" is decided on the COMMAND STRUCTURE of the line that
-// opens the heredoc, not on words appearing in it — the first version matched shell names
-// anywhere on the line and an adversarial pass found it wrong both ways in one evening:
-// `/bin/bash <<EOF`, `$SHELL <<EOF`, `bash<<EOF` and `sudo --shell <<EOF` slipped through,
-// while `gh pr create --title "docs: ssh runbook" --body-file - <<EOF` was denied for the word
-// `ssh` in the title. Now:
+// opens the heredoc, never on words appearing in it: a shell name inside a PR title is prose,
+// and a shell reached through a path, a variable or a wrapper is still a shell. So:
 //   * the opener is the LOGICAL line (backslash-newline joined, comments removed);
 //   * within it, only the PIPELINE holding the `<<` matters, from the stage that owns the
 //     heredoc onward (in `cat <<EOF | bash` the body flows into bash through the pipe);
@@ -1135,8 +1123,9 @@ function basename(t) { const i = t.lastIndexOf("/"); return i === -1 ? t : t.sli
 const isSpace = (c) => c === " " || c === "\t" || c === "\n" || c === "\r";
 
 // Quote-aware word tokenizer for ONE simple command (a stage: no unquoted |, ;, &&, newline —
-// hitting one STOPS the tokenizer, it never loops: the first structural version looped forever
-// on `ssh h 'echo a; echo b'`, node ran out of memory and the guard exited 0 for the whole call).
+// hitting one STOPS the tokenizer, and it must never loop: a tokenizer that does not advance
+// hangs the hook, and a hook that cannot finish analyses nothing — so non-advance is a defect
+// of the same class as a missing rule, not a slowdown).
 // Words are {text, hasExpansion, quoted, qstart}: text is the unquoted content; hasExpansion
 // marks an unquoted `$`/backtick or a `$` inside double quotes; quoted means some part was
 // quoted; qstart means the word STARTED with a quote (so `"A=b"` is not an assignment).
@@ -1613,12 +1602,10 @@ function splitSegments(str) {
       continue;
     }
     // A backslash-newline is a line continuation, not two characters: bash joins the lines
-    // before parsing. The guard used to keep the pair verbatim, so the segment carried a raw
-    // newline into the shell's line-based read loop below and got TORN IN HALF. Measured
-    // 2026-08-21: `gh pr create --repo r --head b \\<newline>  --label semver:none ...` was
-    // denied for "without --label", because the first half of the torn segment genuinely had
-    // no --label in it. Every rule that requires a flag to be PRESENT somewhere in the command
-    // has the same hole, in both directions: a false deny here, a missed deny elsewhere.
+    // before parsing. Keeping the pair verbatim carries a raw newline into the line-based read
+    // loop below and TEARS THE SEGMENT IN HALF, and half a command satisfies no rule honestly:
+    // one that requires a flag to be present stops seeing it, one that forbids a shape stops
+    // recognising it. Joining first is what lets every rule read the whole command.
     if (c === "\\" && next === "\n") { cur += " "; i++; continue; }
     if (c === "\\" && next) { cur += c + next; i++; continue; }
     if (c === "'" || c === '"') { q = c; cur += c; buf = ""; continue; }
