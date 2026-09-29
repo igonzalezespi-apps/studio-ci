@@ -925,9 +925,224 @@ check_generated_write() {
   return 0
 }
 
+# --- Egress: the destination must be literal --------------------------------
+# The allow-list below judges the host WRITTEN in the command. A host that only exists after
+# the shell expands something — a variable, a command substitution, a word the shell builds —
+# is not written anywhere the guard can read, so the rule is: every word curl/wget would take
+# as a destination names its scheme and host literally, and a `$` or backtick in that part is
+# denied. The path after a literal host may hold expansions: it cannot change the host.
+#
+# Which words are destinations: every positional word, plus the value of any option that is
+# not listed below as a NON-destination value (output file, header, data, auth, timeouts…).
+# An option this rule does not know is taken as a flag, so its next word is judged as a
+# destination — fail-closed. And a tool told to read its URLs from a file is denied outright:
+# a destination nobody wrote in the command cannot be judged.
+
+# Shell words of a segment, honouring quotes and backslashes. A `$` or backtick the shell would
+# expand is kept; one it would not (inside single quotes, or escaped) becomes \x1f, so "does
+# this word hold an expansion" is a plain substring test. An expansion OUTSIDE any quotes — a
+# `$`, a backtick, or a brace that expands (an unquoted `,` or `..` before its closing brace) —
+# also puts \x1e in the word: the shell may split or multiply it, so what it turns into is not
+# one destination the guard can read.
+#
+# Linear in the length of the segment, and it has to be: a hook that grows quadratically with
+# its input turns a long command into a hook timeout. So the scan runs byte-wise (LC_ALL=C: a
+# character offset in a multibyte locale costs a walk from the start of the string) over
+# fixed-size chunks (an offset into a short chunk costs the same wherever the chunk sits), and
+# nothing inside the loop copies the remainder of the string.
+EGRESS_WORDS=()
+egress_words() {
+  local LC_ALL=C
+  local s="$1" w="" q="" c chunk i j m off n=${#1} inword=0 esc=0 br=0 brsep=0 dot=0
+  EGRESS_WORDS=()
+  for ((off = 0; off < n; off += 4096)); do
+    chunk="${s:off:4096}"
+    m=${#chunk}
+    for ((j = 0; j < m; j++)); do
+      c="${chunk:j:1}"
+      if ((esc)); then
+        # The character after a backslash, outside single quotes.
+        esc=0
+        if [[ $q == '"' ]]; then
+          case "$c" in
+            '$' | '`') w+=$'\x1f' ;;
+            '"' | '\') w+="$c" ;;
+            *) w+='\'"$c" ;;
+          esac
+        else
+          case "$c" in '$' | '`') c=$'\x1f' ;; esac
+          w+="$c"
+          inword=1
+        fi
+        continue
+      fi
+      if [[ $q == "'" ]]; then
+        if [[ $c == "'" ]]; then
+          q=""
+        else
+          case "$c" in '$' | '`') c=$'\x1f' ;; esac
+          w+="$c"
+        fi
+        continue
+      fi
+      if [[ $q == '"' ]]; then
+        case "$c" in
+          '"') q="" ;;
+          '\') esc=1 ;;
+          *) w+="$c" ;;
+        esac
+        continue
+      fi
+      case "$c" in
+        ' ' | $'\t')
+          ((inword)) && EGRESS_WORDS+=("$w")
+          w="" inword=0 br=0 brsep=0 dot=0
+          continue
+          ;;
+        "'" | '"') q="$c" ;;
+        '\') esc=1 ;;
+        '$' | '`') w+=$'\x1e'"$c" ;;
+        '{') br=$((br + 1)); w+="$c" ;;
+        ',') ((br)) && brsep=1; w+="$c" ;;
+        '.')
+          ((br && dot)) && brsep=1
+          w+="$c"
+          ;;
+        '}')
+          if ((br)); then
+            ((brsep)) && w+=$'\x1e'
+            br=$((br - 1))
+          fi
+          w+="$c"
+          ;;
+        *) w+="$c" ;;
+      esac
+      [[ $c == "." ]] && dot=1 || dot=0
+      inword=1
+    done
+  done
+  if [ "$inword" -eq 1 ]; then EGRESS_WORDS+=("$w"); fi
+  return 0
+}
+
+# Options whose value is NOT a destination, per tool: long names, then short letters. Then the
+# options that read URLs from a file, and the short ones whose value IS a destination (a proxy,
+# a base URL): theirs is judged whether it is attached or the next word.
+EGRESS_CURL_VALUE_LONG=" --output --output-dir --header --proxy-header --data --data-raw --data-binary --data-ascii --data-urlencode --json --form --form-string --user --user-agent --referer --request --write-out --cookie --cookie-jar --upload-file --connect-timeout --max-time --retry --retry-delay --retry-max-time --cacert --capath --cert --cert-type --key --key-type --pass --ciphers --range --time-cond --limit-rate --continue-at --speed-limit --speed-time --max-filesize --max-redirs --dump-header --trace --trace-ascii --stderr --netrc-file --oauth2-bearer --aws-sigv4 --expect100-timeout --keepalive-time --create-file-mode --proxy-user --proto --proto-redir --etag-save --etag-compare --pinnedpubkey --hostpubmd5 --hostpubsha256 --crlfile --delegation --login-options --sasl-authzid --service-name --tls-max --ftp-method --ftp-account --ftp-alternative-to-user --krb --mail-from --mail-rcpt --mail-auth --quote --telnet-option --local-port --interface --dns-interface --dns-ipv4-addr --dns-ipv6-addr --unix-socket --abstract-unix-socket --parallel-max --rate --variable "
+EGRESS_CURL_VALUE_SHORT="oHdFuAeXwbcTmErzCYyDUQtP"
+EGRESS_CURL_FROM_FILE_LONG=" --config "
+EGRESS_CURL_FROM_FILE_SHORT="K"
+EGRESS_CURL_DEST_SHORT="x"
+EGRESS_WGET_VALUE_LONG=" --output-document --output-file --append-output --directory-prefix --header --user-agent --user --password --http-user --http-password --ftp-user --ftp-password --proxy-user --proxy-password --post-data --post-file --body-data --body-file --method --tries --timeout --connect-timeout --read-timeout --dns-timeout --wait --waitretry --random-wait --referer --load-cookies --save-cookies --limit-rate --quota --level --accept --reject --accept-regex --reject-regex --include-directories --exclude-directories --domains --exclude-domains --certificate --certificate-type --private-key --private-key-type --ca-certificate --ca-directory --crl-file --progress --restrict-file-names --default-page --cut-dirs --max-redirect --local-encoding --remote-encoding --bind-address --dns-servers --secure-protocol --ciphers --pinnedpubkey --report-speed --warc-file --warc-header --warc-max-size --warc-tempdir --warc-dedup --warc-cdx --compression "
+EGRESS_WGET_VALUE_SHORT="OoaPUtTwQlARIXD"
+EGRESS_WGET_FROM_FILE_LONG=" --input-file --input-metalink --config "
+EGRESS_WGET_FROM_FILE_SHORT="i"
+EGRESS_WGET_DEST_SHORT="eB"
+
+deny_egress_nonliteral() {
+  local shown="${1//$'\x1e'/}"
+  shown="${shown//$'\x1f'/\$}"
+  shown="${shown//\$__GUARD_SUBST__/\$(…)}"
+  deny "curl/wget toward a destination that is not written literally ('${shown}'): network egress is restricted to the allow-list, and it can only judge a host written in the command" \
+    "write the URL with its scheme and host literally, quoted (the path may keep variables inside the quotes), or ask the user to fetch the resource"
+}
+
+deny_egress_from_file() {
+  deny "$1: a file can name URLs, and the egress allow-list can only judge a host written in the command" \
+    "write the URL literally in the command (headers can come from a file or stdin with -H @file / -H @-), or ask the user to fetch the resource"
+}
+
+# Judge one destination word: no unquoted expansion anywhere, and none in its scheme and host.
+egress_judge_word() {
+  local w="$1" head
+  case "$w" in *$'\x1e'*) deny_egress_nonliteral "$w" ;; esac
+  if [[ "$w" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+    head="${w#*://}"
+    [ -z "$head" ] && deny_egress_nonliteral "$w" # nothing after the scheme: the host was cut away
+    head="${head%%[/?#]*}"
+  else
+    head="${w%%/*}"
+  fi
+  case "$head" in
+    *'$'* | *'`'*) deny_egress_nonliteral "$w" ;;
+  esac
+  return 0
+}
+
+check_egress_literal() {
+  local tool="$1" seg="$2" w n i=0 k ch name val
+  local value_long value_short file_long file_short dest_short skip_next=0 opts_done=0
+  case "$tool" in
+    curl)
+      value_long="$EGRESS_CURL_VALUE_LONG" value_short="$EGRESS_CURL_VALUE_SHORT"
+      file_long="$EGRESS_CURL_FROM_FILE_LONG" file_short="$EGRESS_CURL_FROM_FILE_SHORT"
+      dest_short="$EGRESS_CURL_DEST_SHORT"
+      ;;
+    *)
+      value_long="$EGRESS_WGET_VALUE_LONG" value_short="$EGRESS_WGET_VALUE_SHORT"
+      file_long="$EGRESS_WGET_FROM_FILE_LONG" file_short="$EGRESS_WGET_FROM_FILE_SHORT"
+      dest_short="$EGRESS_WGET_DEST_SHORT"
+      ;;
+  esac
+  egress_words "$seg"
+  n=${#EGRESS_WORDS[@]}
+  # Everything up to the command word itself (assignments, wrappers, keywords) is not its args.
+  while [ "$i" -lt "$n" ]; do
+    w="${EGRESS_WORDS[i]}"
+    i=$((i + 1))
+    [ "${w##*/}" = "$tool" ] && break
+  done
+  for (( ; i < n; i++)); do
+    w="${EGRESS_WORDS[i]}"
+    if [ "$skip_next" -eq 1 ]; then
+      skip_next=0
+      continue
+    fi
+    if [ "$opts_done" -eq 0 ]; then
+      case "$w" in
+        --)
+          opts_done=1
+          continue
+          ;;
+        --*=*)
+          name="${w%%=*}" val="${w#*=}"
+          [[ "$file_long" == *" $name "* ]] && deny_egress_from_file "${tool} ${name}"
+          [[ "$value_long" == *" $name "* ]] || egress_judge_word "$val"
+          continue
+          ;;
+        --*)
+          [[ "$file_long" == *" $w "* ]] && deny_egress_from_file "${tool} ${w}"
+          [[ "$value_long" == *" $w "* ]] && skip_next=1
+          continue
+          ;;
+        -?*)
+          # A cluster of short options: the first one that takes a value ends it, and that
+          # value is the rest of the word or, when nothing is left, the next word.
+          for ((k = 1; k < ${#w}; k++)); do
+            ch="${w:k:1}"
+            [[ "$file_short" == *"$ch"* ]] && deny_egress_from_file "${tool} -${ch}"
+            if [[ "$dest_short" == *"$ch"* ]]; then
+              [ -n "${w:k+1}" ] && egress_judge_word "${w:k+1}"
+              break
+            fi
+            if [[ "$value_short" == *"$ch"* ]]; then
+              [ -z "${w:k+1}" ] && skip_next=1
+              break
+            fi
+          done
+          continue
+          ;;
+      esac
+    fi
+    egress_judge_word "$w"
+  done
+  return 0
+}
+
 # Egress restricted to the policy allow-list (default: localhost). Universal.
 check_egress() {
   local a url host allowed h
+  check_egress_literal "$cmd0" "$seg"
   for a in "${tok[@]:1}"; do
     # Only URLs with an explicit scheme (http://, https://, ftp://…) are
     # evaluated: detecting bare hosts (curl example.com) is ambiguous vs file
@@ -1631,8 +1846,38 @@ function splitSegments(str) {
   return out;
 }
 
+// A command whose argument holds a command or process substitution is still ONE command, but
+// splitSegments cuts it at the substitution: the words before it and the words after it arrive
+// as separate segments, and a rule that needs both halves (a destination and the flags around
+// it) reads neither. So each text is ALSO split with every outermost substitution — `$(…)`,
+// backticks, `<(…)`, `>(…)` — replaced by one placeholder word that carries a `$`: the command
+// around it is read whole, and a rule that asks "is this word literal?" gets a truthful no.
+// Coverage is additive, the same contract as the quoted spans above: the original segments,
+// the substitution bodies included, are still emitted; the masked ones are extra.
+const SUBST_PLACEHOLDER = "$__GUARD_SUBST__";
+function maskSubstitutions(text) {
+  const starts = new Set();
+  const spans = [];
+  let open = 0, from = -1;
+  lex(text, (j, tok, depth, frameStart) => {
+    if (tok === "$(") { starts.add(j); if (open === 0) from = j; open++; return; }
+    if (tok === ")" && starts.has(frameStart)) { open--; if (open === 0) spans.push([from, j + 1]); }
+  });
+  if (open > 0 && from >= 0) spans.push([from, text.length]); // unterminated: masked to the end
+  if (!spans.length) return text;
+  let out = "", k = 0;
+  for (const [a, b] of spans) { out += text.slice(k, a) + SUBST_PLACEHOLDER; k = b; }
+  return out + text.slice(k);
+}
+
 for (const text of analyzableTexts(cmd, 0)) {
-  for (const seg of splitSegments(text)) {
+  const segs = splitSegments(text);
+  const masked = maskSubstitutions(text);
+  if (masked !== text) {
+    const have = new Set(segs);
+    for (const s of splitSegments(masked)) if (!have.has(s)) { have.add(s); segs.push(s); }
+  }
+  for (const seg of segs) {
     // One segment, one line. The shell reads this back with `while read -r`, so a segment
     // carrying a literal newline (only possible from inside a quoted span) would arrive as two
     // segments and each half would be matched on its own. Collapsing to a space keeps the
