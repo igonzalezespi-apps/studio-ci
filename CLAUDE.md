@@ -19,11 +19,18 @@ Shared, reusable **composite GitHub Actions** for the maintainer's CI: `apply-ve
   OpenSpec **spec deltas** (`specs/**/spec.md`, which keep their `SHALL` / `WHEN`/`THEN` RFC2119
   keyword format).
 - **Conventional Commits** — `type(scope): description` (`feat/fix/chore/docs/refactor/ci`).
-- **Branch flow: trunk → main, squash-only.** PRs target `main` and every PR lands as **one
-  squashed conventional commit whose message is the PR title** (enforced by repo settings).
-  That commit drives the computed changelog/version, so **PR titles MUST be valid Conventional
-  Commits**. Keep PR branches linear; the only sanctioned force-push is `--force-with-lease`
-  on your own PR branch.
+- **Branch flow: `develop` → `main`.** `develop` is the default branch: work PRs target it and
+  land by **squash**, as **one conventional commit whose message is the PR title** — by
+  convention, not by settings (all three merge methods are enabled). That commit drives the
+  computed changelog/version, so **PR titles MUST be valid Conventional Commits**. `main` only
+  moves through the **promotion PR** `develop` → `main`, which the maintainer merges with a
+  **merge commit** and where the release tag is cut; an agent never merges into `main`. Keep
+  PR branches linear; the only sanctioned force-push is `--force-with-lease` on your own PR
+  branch.
+  *(Corrected 2026-09-29. Until then this bullet said «trunk → main, squash-only. PRs target `main`» <!-- flow-claim: allow -->
+  and «enforced by repo settings», a month after the move to `develop` on 2026-08-26. Re-measure
+  with `gh api repos/igonzalezespi-apps/studio-ci --jq '[.default_branch,.allow_squash_merge,.allow_merge_commit,.allow_rebase_merge]'`
+  and `gh pr list --repo igonzalezespi-apps/studio-ci --state merged --limit 10 --json baseRefName,headRefName`.)*
 - **No secrets committed** — placeholders only.
 - Each action is a self-contained `action.yml` (+ its shell scripts). Keep them dependency-free
   and stable — consumers pin them by ref, so a breaking change to an action's inputs/outputs
@@ -34,7 +41,11 @@ Shared, reusable **composite GitHub Actions** for the maintainer's CI: `apply-ve
 - The agent command guard is **vendored, not a plugin hook**: `scripts/hooks/bash-guard.sh`
   (canonical source + checksums in `scripts/hooks/.vendor.lock`) is cabled as a `PreToolUse`
   Bash hook in `.claude/settings.json`, parameterised by `scripts/hooks/guard.policy.json`
-  (trunk→main: no direct push to `main`, no agent-driven merge, egress limited to localhost).
+  (`develop` → `main`: no direct push to `main`, agent merges only into `develop` and never into
+  `main`, egress limited to localhost and the provider status page).
+  *(Corrected 2026-09-29: this said «trunk→main: … no agent-driven merge», <!-- flow-claim: allow -->
+  while the policy has said `integration_branch: develop` and `agent_may_merge: true` since
+  2026-08-26. Re-measure with `jq . scripts/hooks/guard.policy.json`.)*
   It **fail-opens**, so treat it as a tripwire against agent mistakes, not a security boundary.
 - **What actually enforces here is local, and nothing is enforced server-side.** The three real
   layers are: this guard (denies the agent's command mid-session), the `.githooks/` hooks
