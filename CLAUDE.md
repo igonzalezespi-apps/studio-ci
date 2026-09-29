@@ -27,6 +27,10 @@ Shared, reusable **composite GitHub Actions** for the maintainer's CI: `apply-ve
   **merge commit** and where the release tag is cut; an agent never merges into `main`. Keep
   PR branches linear; the only sanctioned force-push is `--force-with-lease` on your own PR
   branch.
+  **One measured exception:** dependency PRs would open against `main`, because the shared
+  Renovate preset this repo extends (`renovate-config:config-repo`) pins its base branch there.
+  None has opened since the move to `develop` (the last one landed on `main` on 2026-08-16;
+  `gh pr list --repo igonzalezespi-apps/studio-ci --state all --search 'author:app/renovate' --json baseRefName,createdAt`).
   *(Corrected 2026-09-29. Until then this bullet said «trunk → main, squash-only. PRs target `main`» <!-- flow-claim: allow -->
   and «enforced by repo settings», a month after the move to `develop` on 2026-08-26. Re-measure
   with `gh api repos/igonzalezespi-apps/studio-ci --jq '[.default_branch,.allow_squash_merge,.allow_merge_commit,.allow_rebase_merge]'`
