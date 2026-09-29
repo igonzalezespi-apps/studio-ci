@@ -42,6 +42,15 @@ jobs:
         with:
           node-version: "24"
 
+      - name: vendor-integrity
+        # G20 (plan maestro E5.1). Los ficheros vendorizados del guard tienen que ser EXACTAMENTE
+        # los que anoto `guard-sync.sh` en `.vendor.lock`. La suite de abajo prueba que el guard
+        # que hay FUNCIONA; esto prueba que es el que se sincronizo del canonico y no una copia
+        # retocada a mano. Sin este paso, un retoque local solo lo veia la auditoria semanal de
+        # deriva, dias despues y fuera de la PR que lo metio. Solo necesita `sha256sum`: ni node
+        # ni red. Si falla, la salida es regenerar con `guard-sync.sh`, no editar el lock.
+        run: cd scripts/hooks && sha256sum -c .vendor.lock
+
       - name: bash-guard self-test (all cases pass, suite never shrinks)
         # Este repo VENDORIZA el guard y hasta ahora no corria su suite: solo comprobaba disparo y
         # cableado. Un guard que se rompe no da error, deja de denegar — y eso el disparo puntual no

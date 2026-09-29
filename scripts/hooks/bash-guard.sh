@@ -2,8 +2,8 @@
 # ============================================================================
 # bash-guard.sh — PreToolUse guard (matcher: Bash) for Claude Code
 # ============================================================================
-# Canonical source: plugins/core-dev of igonzalezespi/claude-plugins. This file
-# is VENDORED (committed) into each consuming repo and cabled from its
+# Canonical source: igonzalezespi-apps/claude-plugins, plugins/core-dev/scripts/hooks/bash-guard.sh.
+# This file is VENDORED (committed) into each consuming repo and cabled from its
 # settings.json — it is NOT a plugin hook, because ${CLAUDE_PLUGIN_ROOT} does
 # not exist inside a git hook and a repo must keep enforcing without the plugin.
 # The universal core is identical across repos; everything repo-specific lives
