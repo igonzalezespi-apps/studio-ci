@@ -1,72 +1,28 @@
 # studio-ci
 
-Shared, reusable **composite GitHub Actions** for the maintainer's CI: `apply-version`,
-`changelog-release`, `ci-gate`, `compute-release-version`, `coverage-stale-gate`,
-`detect-changes`. Public (MIT). Consumed by the maintainer's other repos via
-`uses: igonzalezespi-apps/studio-ci/<action>@<ref>`.
+Reusable **composite GitHub Actions** for the maintainer's CI, one directory per action
+(`action.yml` + its shell scripts). Public (MIT). Consumers call
+`igonzalezespi-apps/studio-ci/<action>@<sha>`, so each action's inputs and outputs are a public API.
 
 ## Rules
 
-- **Public repo — never name a private project.** Not in code, YAML, shell, docs, comments,
-  commit messages, or CI. Refer to consumers neutrally ("a consuming repo", "a private TS
-  monorepo"). A local `pre-commit` guard (`.githooks/pre-commit`) enforces this against a
-  private denylist; enable it per clone with `git config core.hooksPath .githooks` (it is a
-  no-op where the denylist is absent, e.g. a fork).
-- **Language / Idioma** — Reply to the maintainer in **Spanish** (he reads Spanish; this holds
-  in every repo and session). Author the OpenSpec docs the maintainer reads — `proposal.md`,
-  `design.md`, `tasks.md` — in **Spanish** too. Everything else stays **English**: source code,
-  comments, identifiers, this contract file's own text, skills/`SKILL.md`, agent prompts, and
-  OpenSpec **spec deltas** (`specs/**/spec.md`, which keep their `SHALL` / `WHEN`/`THEN` RFC2119
-  keyword format).
-- **Conventional Commits** — `type(scope): description` (`feat/fix/chore/docs/refactor/ci`).
-- **Branch flow: `develop` → `main`.** `develop` is the default branch: work PRs target it and
-  land by **squash**, as **one conventional commit whose message is the PR title** — by
-  convention, not by settings (all three merge methods are enabled). That commit drives the
-  computed changelog/version, so **PR titles MUST be valid Conventional Commits**. `main` only
-  moves through the **promotion PR** `develop` → `main`, which the maintainer merges with a
-  **merge commit** and where the release tag is cut; an agent never merges into `main`. Keep
-  PR branches linear; the only sanctioned force-push is `--force-with-lease` on your own PR
-  branch.
-  **One measured exception:** dependency PRs would open against `main`, because the shared
-  Renovate preset this repo extends (`renovate-config:config-repo`) pins its base branch there.
-  None has opened since the move to `develop` (the last one landed on `main` on 2026-08-16;
-  `gh pr list --repo igonzalezespi-apps/studio-ci --state all --search 'author:app/renovate' --json baseRefName,createdAt`).
-  *(Corrected 2026-09-29. Until then this bullet said «trunk → main, squash-only. PRs target `main`» <!-- flow-claim: allow -->
-  and «enforced by repo settings», a month after the move to `develop` on 2026-08-26. Re-measure
-  with `gh api repos/igonzalezespi-apps/studio-ci --jq '[.default_branch,.allow_squash_merge,.allow_merge_commit,.allow_rebase_merge]'`
-  and `gh pr list --repo igonzalezespi-apps/studio-ci --state merged --limit 10 --json baseRefName,headRefName`.)*
-- **No secrets committed** — placeholders only.
-- Each action is a self-contained `action.yml` (+ its shell scripts). Keep them dependency-free
-  and stable — consumers pin them by ref, so a breaking change to an action's inputs/outputs
-  is a breaking change for every consumer.
-
-## Enforcement floor
-
-- The agent command guard is **vendored, not a plugin hook**: `scripts/hooks/bash-guard.sh`
-  (canonical source + checksums in `scripts/hooks/.vendor.lock`) is cabled as a `PreToolUse`
-  Bash hook in `.claude/settings.json`, parameterised by `scripts/hooks/guard.policy.json`
-  (`develop` → `main`: no direct push to `main`, agent merges only into `develop` and never into
-  `main`, egress limited to localhost and the provider status page).
-  *(Corrected 2026-09-29: this said «trunk→main: … no agent-driven merge», <!-- flow-claim: allow -->
-  while the policy has said `integration_branch: develop` and `agent_may_merge: true` since
-  2026-08-26. Re-measure with `jq . scripts/hooks/guard.policy.json`.)*
-  It **fail-opens**, so treat it as a tripwire against agent mistakes, not a security boundary.
-- **What actually enforces here is local, and nothing is enforced server-side.** The three real
-  layers are: this guard (denies the agent's command mid-session), the `.githooks/` hooks
-  (`pre-commit`, `commit-msg`) once cabled per clone, and CI — which **reports, it does not
-  block**: there are no required status checks, so a red run does not stop a merge. Branch
-  protection and rulesets are **deliberately not enabled** on this repo (verified:
-  `gh api repos/<owner>/<repo>/branches/main/protection` → `404`,
-  `gh api repos/<owner>/<repo>/rulesets` → `[]`) — a standing decision, not an oversight.
-  Enabling them is what would make a direct push to `main` or a merge over a red check
-  *impossible* instead of merely forbidden; until then, the rules above hold by discipline.
-- Run `./bootstrap.sh` after cloning: it cables the git hook, installs the declared Claude Code
-  plugins (`core-dev@ivan`, `studio-policy@ivan`), refreshes/verifies the vendored guard, and
-  runs its self-test. Keep the vendored guard **byte-identical** to the canonical core (refresh
-  with `guard-sync`, check with `guard-verify`); edit only `guard.policy.json`.
-- The **company / operating-model layer is injected by the `studio-policy` plugin**, not copied
-  here — this file stays self-contained and repo-specific so it still governs on a fork that has
-  no plugins installed.
+- **Public repo: never name a private project** — not in code, YAML, docs, comments, commit
+  messages, PR bodies or CI. Refer to consumers neutrally ("a consuming repo"). The `.githooks/`
+  hooks enforce it against a private denylist (a no-op on a fork).
+- **Language:** reply to the maintainer in Spanish; code, comments and this file stay English.
+- **Branch flow: `develop` → `main`.** Work PRs target `develop`, and so do dependency PRs (the
+  shared Renovate preset inherits `develop`). They land by **squash** — a convention, since all
+  three merge methods are enabled — so the PR title becomes the commit and MUST be a valid
+  Conventional Commit: it drives the changelog and version, together with the one `semver:*`
+  label every PR needs. `main` moves only through the promotion PR `develop` → `main`, which the
+  maintainer merges with a merge commit and where the release tag is cut; an agent never merges
+  into `main`.
+- **Nothing is enforced server-side** (no branch protection, rulesets or required checks: a
+  standing decision). CI reports, it does not block; what stops a mistake is the vendored guard
+  in-session and the `.githooks/` hooks per clone. Run `./bootstrap.sh` after cloning.
+- The company-wide rules come from the `studio-policy` plugin; this file keeps only what is
+  specific to this repo. Path rules load on demand: `.claude/rules/actions.md` (the actions and
+  their tests) and `.claude/rules/guard.md` (`scripts/hooks/`, `.githooks/`, `bootstrap.sh`).
 
 ## Reserved to the maintainer (escalate, do not decide)
 
