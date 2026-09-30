@@ -1,0 +1,34 @@
+# Ejecuta en GitHub los workflows reutilizables de este repo, llamados DESDE SU PROPIA RUTA
+# (`./.github/workflows/...`) y no desde un tag: cada PR que los toca prueba lo que recibira el
+# consumidor con el tag siguiente — el `concurrency` evaluado por GitHub, los permisos heredados, la
+# descarga verificada de gitleaks y la lectura real del Dependency Dashboard —, que es justo lo que
+# las suites locales (`*.test.sh`) no pueden ver.
+#
+# Solo en las PRs que tocan esos ficheros, y el heartbeat sin ping (`ping: false`): una PR no marca
+# casillas en el dashboard; el ping es cosa de la ejecucion programada de cada consumidor.
+#
+# Sin `concurrency` a proposito: el reutilizable trae el suyo, y `caller-guard` rechazaria uno aqui
+# en cuanto este workflow escuchara eventos de etiqueta.
+name: reusables-selftest
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/security.yml
+      - .github/workflows/renovate-heartbeat.yml
+      - .github/workflows/reusables-selftest.yml
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  security:
+    uses: ./.github/workflows/security.yml
+
+  renovate-heartbeat:
+    uses: ./.github/workflows/renovate-heartbeat.yml
+    with:
+      ping: false

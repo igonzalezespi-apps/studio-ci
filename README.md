@@ -165,6 +165,83 @@ jobs:
 No checkout needed: it reads the PR through the API. `label` changes the flag; `pr-number`/`repo`
 default to the event's.
 
+### `context-budget`
+
+What Claude Code loads into every session has a budget, and the repo configuration that decides
+*what* is loaded must resolve to something that exists. Eight checks, each named in the output:
+
+| check | what fails it |
+|---|---|
+| `size` | a file over its limit: root `CLAUDE.md` > 3,000 B, `**/output-styles/*.md` > 5,000 B, `**/contract-core.md` > 4,000 characters |
+| `descriptions` | a skill, command or agent `description` (+ `when_to_use`) > 250 characters; a plugin's skill listing (skills + commands without `disable-model-invocation`) summing > 6,000 |
+| `dated` | a dated paragraph or a «this line used to say» note in `CLAUDE.md`, `.claude/rules/**` or `contract-core.md` (history belongs in the commit message) |
+| `marketplace` | the canonical marketplace declared without `"ref": "main"`, or its legacy path in settings/workflows; a workflow that clones it without `--branch main` |
+| `output-style` | an `outputStyle` that does not resolve — Claude Code silently falls back to Default: a plugin style whose plugin is not enabled in the repo, a plugin that does not ship it, a project style that does not exist; optionally, not the agreed one |
+| `user-keys` | a personal key in the committed `.claude/settings.json` (`model`, `effortLevel`, `autoCompactWindow`, or a plugin from a marketplace the repo does not declare) |
+| `agents` | an agent without `model` or `effort` (Haiku is exempt from `effort`), or a read-only agent with `memory` — which grants Read/Write/Edit on its own |
+| `pact` | with a `TASKS.md`, not exactly one `contrato TASKS v2` line in `CLAUDE.md`, or another copy of the pact elsewhere |
+
+`size`, `descriptions` and `dated` are **budget** checks: the approval label (default
+`presupuesto-contexto-aprobado`, set by a person) lets an excess through, still listed as `APROB`.
+The other five are **configuration** checks, and no label makes a missing style exist. A line with
+`context-budget: allow` is skipped by `dated`, `marketplace` and `pact`. Exit `0` clean (warnings
+do not count), `1` violations, `2` could not measure (bad config, unknown flag) — never a silent `0`.
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled] # labeled: the approval label re-runs it
+
+permissions:
+  contents: read
+
+jobs:
+  context-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: igonzalezespi-apps/studio-ci/context-budget@vX.Y.Z
+        with:
+          mode: warn # report only, until the repo is on its diet; omit to enforce
+```
+
+Inputs: `path` (default `.`), `mode` (`enforce`|`warn`; empty = the config's, else `enforce`),
+`config`, `approval-label`, `labels` (default: the event's PR labels). Outputs: `violations`,
+`warnings`. Needs a checkout, `bash` and `python3` (stdlib only), no network, no token.
+
+**Per-repo config** — `.github/context-budget.json` (or `.context-budget.json`), every key optional,
+each one **replaces** the default (a list replaces the whole list):
+
+```json
+{
+  "mode": "enforce",
+  "limits": [{ "glob": "CLAUDE.md", "max_bytes": 3000 }, { "glob": "**/contract-core.md", "max_chars": 4000 }],
+  "description_max_chars": 250,
+  "plugin_description_sum_max_chars": 6000,
+  "output_style_expected": "core-dev:owner",
+  "warn_checks": ["marketplace"],
+  "skip_checks": [],
+  "exclude": ["**/node_modules/**", "**/fixtures/**", "**/tests/**"]
+}
+```
+
+The rest (`dated_globs`, `marketplace`, `forbidden_settings_keys`, `allowed_plugin_marketplaces`,
+`pact`, `plugin_description_sum_kinds`) is documented in the defaults at the top of
+`context-budget/context-budget.sh`. An unknown key is an error, not a silent no-op.
+
+**Locally or as a pre-commit** (a repo without CI) — the script is self-contained, so one copy is
+enough:
+
+```sh
+bash context-budget.sh --root . --marketplaces-dir ~/.claude/plugins/marketplaces
+# .githooks/pre-commit
+exec bash scripts/context-budget.sh --root "$(git rev-parse --show-toplevel)"
+```
+
+`--marketplaces-dir` lets `output-style` confirm that a plugin's style really exists; without it
+(as in CI, unless the repo *is* the marketplace) that one fact is reported as not verifiable
+instead of guessed. In a git work tree only tracked and non-ignored files are measured.
+
 ## Release control plane
 
 Three composite actions form the homogeneous release mechanism shared by every consumer repo: derive
@@ -283,6 +360,117 @@ Output: `files-changed` — space-separated list of files written, for `git add`
 > JSON/YAML edits use a small inline `node` script (preinstalled on every runner, same as `ci-gate`) —
 > **no `jq` dependency** and no `npm version`/`pnpm version` reliance, so the result is identical across
 > tool majors. The monorepo case keeps all packages in lockstep by walking every workspace `package.json`.
+
+## Reusable workflows
+
+Two whole workflows (`on: workflow_call`), called with `jobs.<id>.uses` and pinned like the actions.
+Their logic is inline in the YAML (a called workflow cannot read files from this repo at its own
+ref); each one has a suite next to it (`.github/workflows/*.test.sh`) that runs the real `run:` bodies.
+
+### `security.yml`
+
+One job, `scan` (one check, one runner start): **secrets** with gitleaks (fixed version, checksum
+verified, output redacted) and **dependencies** with `pnpm audit` / `npm audit`, picked by lockfile.
+
+| event | secrets | dependencies |
+|---|---|---|
+| `pull_request` | the PR's commits | only what the PR **adds** (head minus base); a PR that does not touch dependencies audits nothing |
+| `push` | the pushed commits | only what the push adds |
+| `schedule` / `workflow_dispatch` | the whole history | the absolute state |
+
+The split is deliberate: a new advisory on an old dependency would otherwise turn **every** open PR
+red, dependency-bot PRs included (which then stop automerging), without any of them causing it. That
+red belongs to the scheduled run, which is the one that measures the state.
+
+```yaml
+on:
+  pull_request:          # default types: opened, synchronize, reopened
+  push:
+    branches: [develop, main]
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    uses: igonzalezespi-apps/studio-ci/.github/workflows/security.yml@<sha> # vX.Y.Z
+    with:
+      audit-level: high            # low | moderate | high | critical
+```
+
+| input | default | description |
+|---|---|---|
+| `runs-on` | `ubuntu-latest` | a label, or a JSON list (`["self-hosted","linux"]`); public repos: hosted runners only |
+| `secrets-scan` | `true` | run gitleaks; a repo's `.gitleaks.toml` / `.gitleaksignore` are honoured |
+| `audit` | `true` | run the dependency audit |
+| `audit-level` | `high` | lowest severity that fails |
+| `working-directory` | `.` | folder holding the lockfile |
+| `ignore-advisories` | `""` | GHSA IDs that do not count (comma/space separated), each with its reason in a comment |
+
+**Concurrency — do not add your own around the call.** The job brings one that only cancels what
+has gone *stale*: `opened`/`synchronize` of a PR share a group and a new commit cancels the old run
+(the `cancelled` lands on a commit that is no longer the head). Every other event — `labeled`,
+`unlabeled`, `edited`, `reopened`, `ready_for_review`, push, schedule — gets a group of its own and
+neither cancels nor is cancelled. This is the fix for a measured failure: when `opened` and `labeled`
+share a cancelling group, one kills the other **on the same commit**, the `cancelled` check sticks to
+the PR head, the PR shows red and Renovate never automerges it (measured in another repository: 21 of 27
+checks `cancelled`, 3 of 47 bot PRs automerged). The `caller-guard` step fails the run if the calling
+workflow listens to label-like events **and** declares a `concurrency` at workflow level or on the
+calling job. `concurrency.test.sh` evaluates both workflows' expressions event by event and kills the
+"simplifications" that bring the failure back.
+
+Exit semantics per step: `0` clean, `1` finding, `2` could not measure (registry down, gitleaks
+error, bad input) — never a silent `0`. `pull_request_target` is refused. Yarn and pub are reported
+as not audited (pub has no native auditor; GitHub's dependency alerts and Renovate cover it).
+
+### `renovate-heartbeat.yml`
+
+A Renovate that stops running says nothing: no PRs looks exactly like "everything is up to date". This
+workflow pings it through the Dependency Dashboard's *"Check this box to trigger a request for
+Renovate to run again"* box, which Renovate repaints **empty** on every run — so the dashboard itself
+is the state, and nothing else is stored:
+
+- box empty → Renovate answered the previous ping (or there was none): tick it again (ping sent);
+- box ticked and the issue untouched for less than `max-silence-hours` → ping in flight, green;
+- box ticked for longer → nobody answered: **red**.
+
+It also fails on an open *"Action Required: Fix Renovate Configuration"* issue, on a missing dashboard,
+and on any open bot PR whose head carries a `cancelled` or `timed_out` check (Renovate only automerges
+green, and a cancelled check nobody re-runs parks the PR forever). *Repository problems* listed on the
+dashboard are reported as warnings.
+
+```yaml
+on:
+  schedule:
+    - cron: "23 6 * * 1,4"   # twice a week: a dead Renovate turns red on the second run after it dies
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write              # the ping ticks a box on the dashboard issue
+  pull-requests: read
+  checks: read
+
+jobs:
+  renovate-heartbeat:
+    uses: igonzalezespi-apps/studio-ci/.github/workflows/renovate-heartbeat.yml@<sha> # vX.Y.Z
+```
+
+| input | default | description |
+|---|---|---|
+| `runs-on` | `ubuntu-latest` | as above |
+| `ping` | `true` | tick the box; `false` = read-only checks (use it on a PR trigger) |
+| `max-silence-hours` | `48` | how long a ping may stay unanswered |
+| `stuck-prs` | `true` | look for bot PRs with a cancelled check on their head |
+| `dashboard-title` | `Dependency Dashboard` | your `dependencyDashboardTitle`, if you changed it |
+| `bot-login` | `renovate[bot]` | the bot's login |
+
+The job runs with the caller's token grant (it declares no `permissions` of its own, so a read-only
+caller can still use `ping: false`). Ticking the box only requests a run: Renovate's own `schedule`
+still decides when PRs open.
 
 ## Versioning
 

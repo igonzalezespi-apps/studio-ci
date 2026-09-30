@@ -1,0 +1,887 @@
+#!/usr/bin/env bash
+# context-budget.sh — lo que Claude Code carga en cada sesion tiene un presupuesto, y la
+# configuracion del repo que decide QUE se carga tiene que resolver a algo que existe.
+#
+# POR QUE EXISTE. Las reglas que el modelo lee al arrancar (CLAUDE.md, estilo de salida,
+# contrato, descripciones de skills y agentes) crecen solas: cada correccion añade un parrafo
+# con su fecha y nadie quita el anterior. Medido en la flota: un CLAUDE.md que llego a
+# multiplicarse por diecisiete, y que se paga en CADA peticion de CADA sesion. Y la configuracion
+# falla en silencio: un `outputStyle` que no resuelve cae a Default sin avisar, y un
+# marketplace declarado sin `ref` sigue la rama por defecto del remoto, no lo publicado.
+#
+# OCHO comprobaciones, cada una con su nombre (el que sale entre corchetes):
+#
+#   size          limites por fichero, en bytes o en caracteres (CLAUDE.md, estilos, contrato)
+#   descriptions  `description` (+ `when_to_use`) de cada skill, comando y agente <= N
+#                 caracteres, y la suma del listado de skills de cada plugin <= M
+#   dated         parrafos fechados o notas de «antes decia» en los ficheros de reglas
+#   marketplace   el marketplace canonico se declara con su ruta canonica y con `ref`; la
+#                 ruta antigua no aparece en ajustes ni workflows
+#   output-style  `outputStyle` resuelve a un estilo que existe (y su plugin esta habilitado);
+#                 si la configuracion fija `output_style_expected`, es ese y no otro
+#   user-keys     ninguna clave personal en el settings versionado del repo
+#   agents        cada agente declara `model` y `effort`, y ninguno de solo lectura lleva
+#                 `memory` (que concede Read/Write/Edit por su cuenta)
+#   pact          con `TASKS.md`, exactamente una linea del pacto en CLAUDE.md y ninguna copia
+#
+# Las tres primeras son de PRESUPUESTO: la etiqueta de aprobacion (por defecto
+# `presupuesto-contexto-aprobado`, que pone una persona) las deja pasar sin ocultarlas. Las
+# otras cinco son de CONFIGURACION: una etiqueta no hace que un estilo inexistente exista.
+#
+# Uso:
+#   context-budget.sh [--root DIR] [--config FICHERO] [--mode enforce|warn]
+#                     [--labels "a,b"] [--approval-label ETIQUETA]
+#                     [--marketplaces-dir DIR] [--annotations]
+#
+#   --root              raiz del repo a revisar (por defecto, el directorio actual)
+#   --config            JSON de configuracion; por defecto `.github/context-budget.json` o
+#                       `.context-budget.json` si existen, y si no, los valores de fabrica
+#   --mode              enforce (falla) o warn (solo avisa); manda sobre el `mode` del JSON
+#   --labels            etiquetas de la PR, separadas por comas
+#   --approval-label    etiqueta que aprueba un exceso de presupuesto
+#   --marketplaces-dir  copia local de los marketplaces (p. ej. ~/.claude/plugins/marketplaces)
+#                       para comprobar que el estilo de un plugin existe de verdad
+#   --annotations       ademas, lineas `::error`/`::warning` para GitHub Actions
+#
+# Como pre-commit (un repo sin CI): en `.githooks/pre-commit`,
+#   exec bash ruta/a/context-budget.sh --root "$(git rev-parse --show-toplevel)"
+#
+# Salida: una linea por hallazgo y un resumen «context-budget: N violacion(es), ...».
+# Exit 0 si no hay violaciones (los avisos no cuentan), 1 si hay, 2 si no se puede medir
+# (sin python3, configuracion ilegible, argumento desconocido): no saber no es estar limpio.
+#
+# Sin dependencias fuera de bash y python3 (stdlib): el frontmatter se lee con un lector
+# propio y tolerante, porque el de las skills reales no siempre es YAML valido (dos puntos sin
+# comillas en una descripcion) y Claude Code las carga igual.
+set -uo pipefail
+
+case "${1:-}" in
+  -h | --help) sed -n '/^# Uso:/,/^# Salida/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+command -v python3 > /dev/null 2>&1 || { echo "context-budget: falta python3" >&2; exit 2; }
+
+exec python3 - "$@" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+
+# ---------------------------------------------------------------------------------------------
+# Valores de fabrica. Un JSON de configuracion los sustituye CLAVE A CLAVE (una lista entera
+# sustituye a la lista entera: asi nadie hereda un limite que no ve escrito).
+# ---------------------------------------------------------------------------------------------
+DEFAULTS = {
+    "mode": "enforce",
+    "limits": [
+        {"glob": "CLAUDE.md", "max_bytes": 3000},
+        {"glob": ".claude/CLAUDE.md", "max_bytes": 3000},
+        {"glob": "**/output-styles/*.md", "max_bytes": 5000},
+        {"glob": "**/contract-core.md", "max_chars": 4000},
+    ],
+    "description_max_chars": 250,
+    "plugin_description_sum_max_chars": 6000,
+    # Lo que suma el listado: skills y comandos que el modelo puede invocar. Los agentes tienen
+    # su propio limite por pieza pero no entran en la suma (van en otro listado).
+    "plugin_description_sum_kinds": ["skills", "commands"],
+    "dated_globs": ["CLAUDE.md", "**/CLAUDE.md", ".claude/rules/**/*.md", "**/contract-core.md"],
+    "marketplace": {
+        "repo": "igonzalezespi-apps/claude-plugins",
+        "ref": "main",
+        "legacy_repos": ["igonzalezespi/claude-plugins"],
+    },
+    # Vacio = no se exige ninguno. Con valor, el settings versionado tiene que declarar ESE.
+    "output_style_expected": "",
+    "forbidden_settings_keys": ["model", "effortLevel", "autoCompactWindow"],
+    "allowed_plugin_marketplaces": [],
+    "pact": {
+        "tasks_file": "TASKS.md",
+        "marker": "contrato TASKS v2",
+        "aliases": ["pacto tablero", "tablero pact"],
+        "copy_globs": ["**/CLAUDE.md", "CLAUDE.local.md", "**/AGENTS.md", ".claude/rules/**/*.md"],
+    },
+    "warn_checks": [],
+    "skip_checks": [],
+    "exclude": [
+        "**/node_modules/**",
+        "**/.git/**",
+        ".claude/worktrees/**",
+        "**/fixtures/**",
+        "**/tests/**",
+        "**/test/**",
+        "**/archive/**",
+    ],
+}
+
+CHECKS = ["size", "descriptions", "dated", "marketplace", "output-style", "user-keys", "agents", "pact"]
+BUDGET_CHECKS = {"size", "descriptions", "dated"}  # las que la etiqueta puede aprobar
+BUILTIN_STYLES = {"default", "explanatory", "learning"}
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+ALLOW_MARK = "context-budget: allow"
+
+
+def die(msg):
+    print("context-budget: " + msg, file=sys.stderr)
+    sys.exit(2)
+
+
+# Un fallo interno NO puede salir con 1: se leeria como «hay violaciones» (o, peor, se
+# aprenderia a ignorarlo). Sale con 2, que es «no se pudo medir», y con la traza.
+def _crash(exc_type, exc, tb):
+    import traceback
+    sys.stdout.flush()
+    traceback.print_exception(exc_type, exc, tb)
+    print("context-budget: error interno (%s): no se pudo medir" % exc_type.__name__, file=sys.stderr)
+    sys.stderr.flush()
+    os._exit(2)
+
+
+sys.excepthook = _crash
+
+
+# ---------------------------------------------------------------------------------------------
+# Argumentos
+# ---------------------------------------------------------------------------------------------
+args = sys.argv[1:]
+opt = {"root": ".", "config": "", "mode": "", "labels": "", "approval": "presupuesto-contexto-aprobado",
+       "mkt_dir": "", "annotations": False}
+i = 0
+while i < len(args):
+    a = args[i]
+    flag_map = {"--root": "root", "--config": "config", "--mode": "mode", "--labels": "labels",
+                "--approval-label": "approval", "--marketplaces-dir": "mkt_dir"}
+    if a in flag_map:
+        if i + 1 >= len(args):
+            die("falta valor para " + a)
+        opt[flag_map[a]] = args[i + 1]
+        i += 2
+    elif a == "--annotations":
+        opt["annotations"] = True
+        i += 1
+    else:
+        die("argumento desconocido '%s'" % a)
+
+ROOT = os.path.abspath(opt["root"])
+if not os.path.isdir(ROOT):
+    die("no existe el directorio %s" % ROOT)
+
+cfg = json.loads(json.dumps(DEFAULTS))
+cfg_path = opt["config"]
+if not cfg_path:
+    for cand in (".github/context-budget.json", ".context-budget.json"):
+        if os.path.isfile(os.path.join(ROOT, cand)):
+            cfg_path = os.path.join(ROOT, cand)
+            break
+elif not os.path.isabs(cfg_path) and not os.path.isfile(cfg_path):
+    cfg_path = os.path.join(ROOT, cfg_path)
+if cfg_path:
+    try:
+        with open(cfg_path, encoding="utf-8") as fh:
+            user_cfg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die("configuracion ilegible (%s): %s" % (cfg_path, exc))
+    if not isinstance(user_cfg, dict):
+        die("la configuracion (%s) no es un objeto JSON" % cfg_path)
+    unknown = sorted(k for k in user_cfg if k not in DEFAULTS and not k.startswith("_"))
+    if unknown:
+        die("clave(s) desconocida(s) en %s: %s" % (cfg_path, ", ".join(unknown)))
+    for k, v in user_cfg.items():
+        if k.startswith("_"):
+            continue  # comentarios: "_por_que": "..."
+        if isinstance(DEFAULTS[k], dict) and isinstance(v, dict):
+            merged = dict(cfg[k])
+            merged.update(v)
+            cfg[k] = merged
+        else:
+            cfg[k] = v
+
+for rule in cfg["limits"] if isinstance(cfg["limits"], list) else [None]:
+    if not isinstance(rule, dict) or not (rule.get("glob") or rule.get("path")) \
+            or not isinstance(rule.get("max_bytes", rule.get("max_chars")), int):
+        die("cada limite es {\"glob\": ..., \"max_bytes\"|\"max_chars\": entero}; no vale %s" % json.dumps(rule))
+for key in ("warn_checks", "skip_checks", "exclude", "dated_globs", "forbidden_settings_keys",
+            "allowed_plugin_marketplaces", "plugin_description_sum_kinds"):
+    if not isinstance(cfg[key], list):
+        die("'%s' tiene que ser una lista" % key)
+
+MODE = opt["mode"] or cfg.get("mode") or "enforce"
+if MODE not in ("enforce", "warn"):
+    die("modo desconocido '%s' (enforce o warn)" % MODE)
+for name in list(cfg["warn_checks"]) + list(cfg["skip_checks"]):
+    if name not in CHECKS:
+        die("comprobacion desconocida '%s' (validas: %s)" % (name, ", ".join(CHECKS)))
+LABELS = {x.strip() for x in opt["labels"].split(",") if x.strip()}
+APPROVED = bool(opt["approval"]) and opt["approval"] in LABELS
+
+
+# ---------------------------------------------------------------------------------------------
+# Globs con `**` de verdad: `*` no cruza `/`, `**/` cruza cero o mas directorios.
+# ---------------------------------------------------------------------------------------------
+_glob_cache = {}
+
+
+def glob_re(pattern):
+    if pattern in _glob_cache:
+        return _glob_cache[pattern]
+    out, j = "", 0
+    while j < len(pattern):
+        c = pattern[j]
+        if pattern.startswith("**/", j):
+            out += "(?:.*/)?"
+            j += 3
+        elif pattern.startswith("**", j):
+            out += ".*"
+            j += 2
+        elif c == "*":
+            out += "[^/]*"
+            j += 1
+        elif c == "?":
+            out += "[^/]"
+            j += 1
+        else:
+            out += re.escape(c)
+            j += 1
+    rx = re.compile("^" + out + "$")
+    _glob_cache[pattern] = rx
+    return rx
+
+
+def matches(path, patterns):
+    return any(glob_re(p).match(path) for p in patterns)
+
+
+# ---------------------------------------------------------------------------------------------
+# Ficheros: los de git (versionados + nuevos no ignorados) si ROOT es un repo; si no, el arbol.
+# ---------------------------------------------------------------------------------------------
+def list_files():
+    files = None
+    try:
+        top = subprocess.run(["git", "-C", ROOT, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        if os.path.realpath(top) == os.path.realpath(ROOT):
+            raw = subprocess.run(["git", "-C", ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                                 capture_output=True, check=True).stdout
+            files = sorted({p for p in raw.decode("utf-8", "replace").split("\0") if p})
+    except (OSError, subprocess.CalledProcessError):
+        files = None
+    if files is None:
+        files = []
+        for d, dirs, names in os.walk(ROOT):
+            rel_d = os.path.relpath(d, ROOT)
+            dirs[:] = [x for x in dirs if x not in (".git", "node_modules")
+                       and os.path.normpath(os.path.join(rel_d, x)) != os.path.normpath(".claude/worktrees")]
+            for n in names:
+                files.append(os.path.normpath(os.path.join(rel_d, n)).replace(os.sep, "/"))
+        files.sort()
+    return [f for f in files if os.path.isfile(os.path.join(ROOT, f)) and not matches(f, cfg["exclude"])]
+
+
+FILES = list_files()
+
+
+def read_text(rel):
+    with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def read_bytes(rel):
+    with open(os.path.join(ROOT, rel), "rb") as fh:
+        return fh.read()
+
+
+# ---------------------------------------------------------------------------------------------
+# Frontmatter tolerante: claves de primer nivel, escalares entre comillas o planos (con
+# continuacion indentada), bloques `>`/`|` y listas `[a, b]` o `- a`. Devuelve (dict, lineas)
+# donde lineas[clave] es el numero de linea (1-based) en el fichero.
+# ---------------------------------------------------------------------------------------------
+def unquote(v):
+    if len(v) >= 2 and v[0] == v[-1] == '"':
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v[1:-1]
+    if len(v) >= 2 and v[0] == v[-1] == "'":
+        return v[1:-1].replace("''", "'")
+    return v
+
+
+def parse_frontmatter(text):
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return None, {}
+    body = []
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            break
+        body.append(ln)
+    else:
+        return None, {}
+    data, where, k = {}, {}, 0
+    while k < len(body):
+        m = re.match(r"^([A-Za-z0-9_-]+):(?:[ \t]+(.*)|[ \t]*)$", body[k])
+        if not m:
+            k += 1
+            continue
+        key, val, lineno = m.group(1), (m.group(2) or "").rstrip(), k + 2
+        k += 1
+        cont = []
+        # continuacion: indentada, en blanco, o un `- item` en la columna 0 (YAML lo admite)
+        while k < len(body) and (body[k][:1] in (" ", "\t") or body[k].strip() == "" or body[k].startswith("- ")):
+            cont.append(body[k])
+            k += 1
+        while cont and cont[-1].strip() == "":
+            cont.pop()
+        if re.match(r"^[>|][+-]?[0-9]*$", val):
+            parts = [c.strip() for c in cont]
+            val = ("\n".join(parts) if val[0] == "|" else " ".join(p for p in parts if p)).strip()
+        elif val == "" and cont and all(c.strip().startswith("- ") or c.strip() == "" for c in cont):
+            val = [unquote(c.strip()[2:].strip()) for c in cont if c.strip()]
+        else:
+            if cont:
+                val = " ".join([val] + [c.strip() for c in cont]).strip()
+            if val.startswith("[") and val.endswith("]"):
+                val = [unquote(x.strip()) for x in val[1:-1].split(",") if x.strip()]
+            else:
+                val = unquote(val)
+        data[key] = val
+        where[key] = lineno
+    return data, where
+
+
+def truthy(v):
+    return isinstance(v, str) and v.strip().lower() in ("true", "yes", "on", "1")
+
+
+def as_list(v):
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    return [x.strip() for x in str(v).split(",") if x.strip()]
+
+
+# ---------------------------------------------------------------------------------------------
+# Hallazgos
+# ---------------------------------------------------------------------------------------------
+findings = []  # (check, path, line, message)
+examined = {c: 0 for c in CHECKS}
+notes = {c: [] for c in CHECKS}
+
+
+def add(check, path, line, msg):
+    findings.append((check, path, line, msg))
+
+
+def fmt_n(n):
+    return "{:,}".format(n).replace(",", ".")
+
+
+# --- raices de componentes: `.claude/` y cada plugin (`.claude-plugin/plugin.json`) ----------
+def component_roots():
+    roots = {}
+    for f in FILES:
+        if f.endswith(".claude-plugin/plugin.json"):
+            base = f[: -len(".claude-plugin/plugin.json")].rstrip("/")
+            name = os.path.basename(base) if base else os.path.basename(ROOT)
+            try:
+                name = json.loads(read_text(f)).get("name") or name
+            except ValueError:
+                pass
+            roots[base] = name
+    for f in FILES:
+        m = re.match(r"^((?:.*/)?\.claude)/(?:skills|commands|agents)/", f)
+        if m:
+            roots.setdefault(m.group(1), "(proyecto) " + m.group(1))
+    return roots
+
+
+ROOTS = component_roots()
+
+
+def components(kind):
+    """(ruta, raiz) de cada skill, comando o agente, segun el `kind`."""
+    out = []
+    for base in ROOTS:
+        prefix = (base + "/") if base else ""
+        for f in FILES:
+            if not f.startswith(prefix):
+                continue
+            rest = f[len(prefix):]
+            if kind == "skills" and re.match(r"^skills/[^/]+/SKILL\.md$", rest):
+                out.append((f, base))
+            elif kind in ("commands", "agents") and rest.startswith(kind + "/") and rest.endswith(".md"):
+                out.append((f, base))
+    return sorted(set(out))
+
+
+# ---------------------------------------------------------------------------------------------
+# size — limites por fichero
+# ---------------------------------------------------------------------------------------------
+def check_size():
+    for rule in cfg["limits"]:
+        pat = rule.get("glob") or rule.get("path")
+        for f in FILES:
+            if not glob_re(pat).match(f):
+                continue
+            examined["size"] += 1
+            if "max_chars" in rule:
+                n, cap, unit = len(read_text(f)), int(rule["max_chars"]), "caracteres"
+            else:
+                n, cap, unit = len(read_bytes(f)), int(rule["max_bytes"]), "B"
+            if n > cap:
+                add("size", f, 0, "%s %s > %s %s (+%s)" % (fmt_n(n), unit, fmt_n(cap), unit, fmt_n(n - cap)))
+            else:
+                notes["size"].append("%s %s/%s %s" % (f, fmt_n(n), fmt_n(cap), unit))
+
+
+# ---------------------------------------------------------------------------------------------
+# descriptions — por pieza y suma del listado de cada plugin
+# ---------------------------------------------------------------------------------------------
+def check_descriptions():
+    cap = int(cfg["description_max_chars"])
+    sum_cap = int(cfg["plugin_description_sum_max_chars"])
+    sum_kinds = set(cfg["plugin_description_sum_kinds"])
+    sums, hidden = {}, 0
+    for kind in ("skills", "commands", "agents"):
+        for f, base in components(kind):
+            data, where = parse_frontmatter(read_text(f))
+            if data is None:
+                continue
+            if kind != "agents" and truthy(data.get("disable-model-invocation")):
+                hidden += 1  # no entra en el listado del modelo: no cuesta contexto
+                continue
+            text = str(data.get("description") or "")
+            if data.get("when_to_use"):
+                text = (text + " " + str(data["when_to_use"])).strip()
+            examined["descriptions"] += 1
+            if kind in sum_kinds:
+                sums[base] = sums.get(base, 0) + len(text)
+            if len(text) > cap:
+                add("descriptions", f, where.get("description", 0),
+                    "description de %s caracteres > %s" % (fmt_n(len(text)), fmt_n(cap)))
+    for base, total in sorted(sums.items()):
+        label = ROOTS.get(base, base)
+        if total > sum_cap:
+            add("descriptions", (base or ".") + "/", 0,
+                "el listado de %s suma %s caracteres > %s" % (label, fmt_n(total), fmt_n(sum_cap)))
+        else:
+            notes["descriptions"].append("%s %s/%s" % (label, fmt_n(total), fmt_n(sum_cap)))
+    if hidden:
+        notes["descriptions"].append("%d con disable-model-invocation, fuera del listado" % hidden)
+
+
+# ---------------------------------------------------------------------------------------------
+# dated — parrafos fechados y notas de «antes decia»
+# ---------------------------------------------------------------------------------------------
+MONTHS_ES = "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre"
+DATED_PATTERNS = [
+    (re.compile(r"\b(?:19|20)\d\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b"), "fecha"),
+    (re.compile(r"\b(?:0?[1-9]|[12]\d|3[01])[-/.](?:0?[1-9]|1[0-2])[-/.](?:19|20)\d\d\b"), "fecha"),
+    (re.compile(r"\b\d{1,2} de (?:%s)\b" % MONTHS_ES, re.I), "fecha"),
+    (re.compile(r"\b(?:el|del|desde el|hasta el) (?:0?[1-9]|[12]\d|3[01])-(?:0[1-9]|1[0-2])\b", re.I), "fecha"),
+    (re.compile(r"(?:^[\s>*_-]*|\()[*_]*(?:corregid[oa]|enmendad[oa]|corrected|amended)\b", re.I), "nota de correccion"),
+    (re.compile(r"\b(?:esta|este) (?:l[ií]nea|regla|frase|p[aá]rrafo|punto|bullet|fichero) dec[ií]a\b", re.I), "«antes decia»"),
+    (re.compile(r"\b(?:hasta (?:hoy|entonces|ahora)|antes)\b[^.]{0,40}\bdec[ií]a\b", re.I), "«antes decia»"),
+    (re.compile(r"\b(?:this|the) (?:line|rule|bullet|sentence|paragraph|file) (?:said|used to say)\b", re.I), "«antes decia»"),
+    (re.compile(r"\buntil (?:then|today)\b[^.]{0,40}\bsaid\b", re.I), "«antes decia»"),
+]
+
+
+def check_dated():
+    per_file_cap = 8
+    for f in FILES:
+        if not matches(f, cfg["dated_globs"]):
+            continue
+        examined["dated"] += 1
+        fence, hits = False, []
+        for n, ln in enumerate(read_text(f).split("\n"), 1):
+            if re.match(r"^\s*(```|~~~)", ln):
+                fence = not fence
+                continue
+            if fence or ALLOW_MARK in ln:
+                continue
+            for rx, why in DATED_PATTERNS:
+                m = rx.search(ln)
+                if m:
+                    hits.append((n, why, m.group(0)))
+                    break
+        for n, why, what in hits[:per_file_cap]:
+            add("dated", f, n, "parrafo fechado (%s: «%s»): la historia va al mensaje del commit" % (why, what))
+        if len(hits) > per_file_cap:
+            add("dated", f, 0, "... y %d linea(s) fechada(s) mas en este fichero" % (len(hits) - per_file_cap))
+
+
+# ---------------------------------------------------------------------------------------------
+# Ajustes del repo
+# ---------------------------------------------------------------------------------------------
+SETTINGS_FILES = [".claude/settings.json", ".claude/settings.local.json"]
+
+
+def load_settings(rel):
+    """dict, o None si no existe. Un JSON roto es un hallazgo, no un exit 2."""
+    p = os.path.join(ROOT, rel)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except ValueError as exc:
+        add("user-keys", rel, 0, "JSON ilegible: Claude Code lo ignora entero (%s)" % exc)
+        return {}
+
+
+SETTINGS = {rel: load_settings(rel) for rel in SETTINGS_FILES}
+
+
+def repo_of(src):
+    """owner/repo (minusculas) de una fuente de marketplace github o git; '' si no es de GitHub."""
+    if not isinstance(src, dict):
+        return ""
+    if src.get("source") == "github" and isinstance(src.get("repo"), str):
+        return src["repo"].strip().lower().removesuffix(".git")
+    url = src.get("url") if isinstance(src.get("url"), str) else ""
+    m = re.search(r"github\.com[:/]+([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url.strip(), re.I)
+    return m.group(1).lower() if m else ""
+
+
+def repo_rx(repo):
+    return re.compile(r"(?<![\w.-])" + re.escape(repo) + r"(?![\w-])", re.I)
+
+
+def check_marketplace():
+    mk = cfg["marketplace"]
+    canon = (mk.get("repo") or "").lower()
+    ref = mk.get("ref") or ""
+    legacy = [x.lower() for x in mk.get("legacy_repos") or []]
+    for rel, st in SETTINGS.items():
+        if not st:
+            continue
+        mkts = st.get("extraKnownMarketplaces") or {}
+        if not isinstance(mkts, dict):
+            continue
+        for name, entry in mkts.items():
+            src = (entry or {}).get("source") if isinstance(entry, dict) else None
+            repo = repo_of(src)
+            examined["marketplace"] += 1
+            if repo in legacy:
+                add("marketplace", rel, 0, "extraKnownMarketplaces.%s apunta a la ruta antigua %s (canonica: %s)"
+                    % (name, repo, canon))
+            elif canon and repo == canon and ref:
+                got = src.get("ref") if isinstance(src, dict) else None
+                if got != ref:
+                    add("marketplace", rel, 0, "extraKnownMarketplaces.%s sin \"ref\": \"%s\" (tiene %s): sin ref se "
+                        "sigue la rama por defecto del remoto, no lo publicado" % (name, ref, json.dumps(got)))
+    wf = [f for f in FILES if re.match(r"^\.github/workflows/[^/]+\.ya?ml$", f)]
+    for f in wf:
+        examined["marketplace"] += 1
+        raw = read_text(f).split("\n")
+        # une las continuaciones con `\` para leer un `git clone` partido en varias lineas
+        logical, start, buf = [], 0, ""
+        for n, ln in enumerate(raw, 1):
+            if not buf:
+                start = n
+            buf = (buf + " " + ln.strip()) if buf else ln
+            if ln.rstrip().endswith("\\"):
+                buf = buf.rstrip().rstrip("\\")
+                continue
+            logical.append((start, buf))
+            buf = ""
+        if buf:
+            logical.append((start, buf))
+        for n, ln in logical:
+            if ALLOW_MARK in ln:
+                continue
+            is_comment = ln.lstrip().startswith("#")
+            for old in legacy:
+                if repo_rx(old).search(ln) and not is_comment:
+                    add("marketplace", f, n, "usa la ruta antigua %s (canonica: %s)" % (old, canon))
+            if canon and ref and not is_comment and repo_rx(canon).search(ln) and re.search(r"\bgit\s+clone\b", ln):
+                if not re.search(r"(?:--branch[ =]|\s-b\s+)[\"']?%s[\"']?(?:\s|$)" % re.escape(ref), ln):
+                    add("marketplace", f, n, "clona %s sin --branch %s: valida contra la rama por defecto, no contra "
+                        "lo publicado" % (canon, ref))
+        for n, ln in enumerate(raw, 1):
+            m = re.match(r"^(\s*)repository:\s*[\"']?([\w.-]+/[\w.-]+)[\"']?\s*(?:#.*)?$", ln)
+            if not m or ALLOW_MARK in ln or m.group(2).lower() != canon or not ref:
+                continue
+            ind, block = len(m.group(1)), []
+            for other in raw[max(0, n - 8): n + 8]:
+                mm = re.match(r"^(\s*)ref:\s*[\"']?([^\"'#\s]+)", other)
+                if mm and len(mm.group(1)) == ind:
+                    block.append(mm.group(2))
+            if ref not in block:
+                add("marketplace", f, n, "checkout de %s sin ref: %s" % (canon, ref))
+
+
+def enabled_plugins():
+    names = {}
+    for st in SETTINGS.values():
+        if not st:
+            continue
+        ep = st.get("enabledPlugins") or {}
+        if isinstance(ep, dict):
+            for key, val in ep.items():
+                if val and "@" in key:
+                    plugin, mkt = key.rsplit("@", 1)
+                    names.setdefault(plugin, set()).add(mkt)
+    return names
+
+
+def style_names_in(dir_rel_or_abs, absolute=False):
+    """Nombres de estilo (fichero sin .md y `name:` del frontmatter) de un directorio."""
+    out = set()
+    base = dir_rel_or_abs if absolute else os.path.join(ROOT, dir_rel_or_abs)
+    if not os.path.isdir(base):
+        return out
+    for n in os.listdir(base):
+        if not n.endswith(".md"):
+            continue
+        out.add(n[:-3].lower())
+        try:
+            with open(os.path.join(base, n), encoding="utf-8", errors="replace") as fh:
+                data, _ = parse_frontmatter(fh.read())
+            if data and data.get("name"):
+                out.add(str(data["name"]).strip().lower())
+        except OSError:
+            pass
+    return out
+
+
+def plugin_style_dirs(plugin_dir_abs):
+    dirs = [os.path.join(plugin_dir_abs, "output-styles")]
+    pj = os.path.join(plugin_dir_abs, ".claude-plugin", "plugin.json")
+    try:
+        with open(pj, encoding="utf-8") as fh:
+            decl = json.load(fh).get("outputStyles")
+        for d in as_list(decl) if not isinstance(decl, list) else decl:
+            dirs.append(os.path.normpath(os.path.join(plugin_dir_abs, str(d))))
+    except (OSError, ValueError, AttributeError):
+        pass
+    return dirs
+
+
+def find_plugin_dir(plugin, mkts):
+    """Directorio absoluto del plugin: en ESTE repo, o en la copia local del marketplace."""
+    for base, name in ROOTS.items():
+        if name == plugin and not name.startswith("(proyecto)"):
+            return os.path.join(ROOT, base)
+    if opt["mkt_dir"]:
+        for mkt in sorted(mkts):
+            mroot = os.path.join(os.path.expanduser(opt["mkt_dir"]), mkt)
+            try:
+                with open(os.path.join(mroot, ".claude-plugin", "marketplace.json"), encoding="utf-8") as fh:
+                    for p in json.load(fh).get("plugins", []):
+                        if p.get("name") == plugin and isinstance(p.get("source"), str):
+                            return os.path.normpath(os.path.join(mroot, p["source"]))
+            except (OSError, ValueError, AttributeError):
+                pass
+            cand = os.path.join(mroot, "plugins", plugin)
+            if os.path.isdir(cand):
+                return cand
+    return None
+
+
+def check_output_style():
+    enabled = enabled_plugins()
+    want = cfg.get("output_style_expected") or ""
+    if want:
+        st = SETTINGS.get(".claude/settings.json")
+        got = st.get("outputStyle") if isinstance(st, dict) else None
+        examined["output-style"] += 1
+        if got != want:
+            add("output-style", ".claude/settings.json", 0, "outputStyle %s, y el acordado es \"%s\""
+                % (json.dumps(got) if got is not None else "sin declarar", want))
+    for rel, st in SETTINGS.items():
+        if not st or "outputStyle" not in st:
+            continue
+        style = st.get("outputStyle")
+        examined["output-style"] += 1
+        if not isinstance(style, str) or not style.strip():
+            add("output-style", rel, 0, "outputStyle vacio o no es texto: cae a Default en silencio")
+            continue
+        s = style.strip()
+        if s.lower() in BUILTIN_STYLES:
+            notes["output-style"].append("%s: %s (integrado)" % (rel, s))
+            continue
+        if ":" in s:
+            plugin, name = s.split(":", 1)
+            if plugin not in enabled:
+                add("output-style", rel, 0, "outputStyle \"%s\": el plugin %s no esta habilitado en los ajustes del "
+                    "repo, y sin el el estilo cae a Default en silencio" % (s, plugin))
+                continue
+            pdir = find_plugin_dir(plugin, enabled[plugin])
+            if pdir is None:
+                notes["output-style"].append("%s: %s (plugin habilitado; el estilo no se puede ver sin una copia del "
+                                             "marketplace)" % (rel, s))
+                continue
+            found = set()
+            for d in plugin_style_dirs(pdir):
+                found |= style_names_in(d, absolute=True)
+            if name.lower() not in found:
+                add("output-style", rel, 0, "outputStyle \"%s\": el plugin %s no trae el estilo %s (trae: %s)"
+                    % (s, plugin, name, ", ".join(sorted(found)) or "ninguno"))
+            else:
+                notes["output-style"].append("%s: %s (resuelve)" % (rel, s))
+        else:
+            if s.lower() in style_names_in(".claude/output-styles"):
+                notes["output-style"].append("%s: %s (.claude/output-styles)" % (rel, s))
+            else:
+                add("output-style", rel, 0, "outputStyle \"%s\" no es un estilo integrado ni esta en "
+                    ".claude/output-styles/: cae a Default en silencio" % s)
+
+
+def check_user_keys():
+    rel = ".claude/settings.json"
+    st = SETTINGS.get(rel)
+    if st is None:
+        return
+    examined["user-keys"] += 1
+    for key in cfg["forbidden_settings_keys"]:
+        cur, ok = st, True
+        for part in key.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                ok = False
+                break
+        if ok:
+            add("user-keys", rel, 0, "\"%s\" es un ajuste personal: en el settings del repo pisa el de cada "
+                "usuario (va en el suyo o en .claude/settings.local.json)" % key)
+    declared = set((st.get("extraKnownMarketplaces") or {}).keys()) if isinstance(st.get("extraKnownMarketplaces"), dict) else set()
+    declared |= set(cfg["allowed_plugin_marketplaces"])
+    ep = st.get("enabledPlugins") or {}
+    if isinstance(ep, dict):
+        for key in sorted(ep):
+            mkt = key.rsplit("@", 1)[1] if "@" in key else ""
+            if mkt not in declared:
+                add("user-keys", rel, 0, "enabledPlugins \"%s\": su marketplace no lo declara este repo, asi que es "
+                    "un plugin del usuario" % key)
+
+
+# ---------------------------------------------------------------------------------------------
+# agents — model + effort declarados; sin memory en los de solo lectura
+# ---------------------------------------------------------------------------------------------
+def check_agents():
+    for f, _ in components("agents"):
+        data, where = parse_frontmatter(read_text(f))
+        examined["agents"] += 1
+        if data is None:
+            add("agents", f, 1, "sin frontmatter: hereda modelo y esfuerzo de la sesion")
+            continue
+        model = str(data.get("model") or "").strip()
+        if not model:
+            add("agents", f, 1, "sin model: hereda el de la sesion principal")
+        if not str(data.get("effort") or "").strip() and "haiku" not in model.lower():
+            add("agents", f, 1, "sin effort: hereda el de la sesion principal")
+        mem = str(data.get("memory") or "").strip().lower()
+        if mem and mem not in ("none", "false", "no", "off"):
+            tools = [t.split("(")[0].strip() for t in as_list(data.get("tools"))]
+            denied = {t.split("(")[0].strip() for t in as_list(data.get("disallowedTools"))}
+            read_only = (bool(tools) and "*" not in tools and not (set(tools) & WRITE_TOOLS)) or \
+                        ({"Write", "Edit"} <= denied)
+            if read_only:
+                add("agents", f, where.get("memory", 1), "memory: %s en un agente de solo lectura: memory le concede "
+                    "Read/Write/Edit por su cuenta" % mem)
+
+
+# ---------------------------------------------------------------------------------------------
+# pact — con TASKS.md, una linea del pacto en CLAUDE.md y ninguna copia
+# ---------------------------------------------------------------------------------------------
+def check_pact():
+    pc = cfg["pact"]
+    tasks = pc.get("tasks_file") or "TASKS.md"
+    if not os.path.isfile(os.path.join(ROOT, tasks)):
+        notes["pact"].append("sin %s: no aplica" % tasks)
+        return
+    examined["pact"] += 1
+    marker = pc.get("marker") or ""
+    alias_rx = [re.compile(re.escape(a), re.I) for a in pc.get("aliases") or []]
+    main = "CLAUDE.md" if os.path.isfile(os.path.join(ROOT, "CLAUDE.md")) else ".claude/CLAUDE.md"
+    if not os.path.isfile(os.path.join(ROOT, main)):
+        add("pact", "CLAUDE.md", 0, "hay %s y no hay CLAUDE.md con la linea del pacto" % tasks)
+        return
+    lines = read_text(main).split("\n")
+    marked = [n for n, ln in enumerate(lines, 1) if marker in ln]
+    if len(marked) != 1:
+        add("pact", main, marked[1] if len(marked) > 1 else 0,
+            "%d linea(s) con «%s»: tiene que haber exactamente una" % (len(marked), marker))
+    for n, ln in enumerate(lines, 1):
+        if n not in marked and any(r.search(ln) for r in alias_rx) and ALLOW_MARK not in ln:
+            add("pact", main, n, "copia vieja del pacto fuera de la linea «%s»" % marker)
+    for f in FILES:
+        if f == main or not matches(f, pc.get("copy_globs") or []):
+            continue
+        for n, ln in enumerate(read_text(f).split("\n"), 1):
+            if ALLOW_MARK in ln:
+                continue
+            if (marker and marker in ln) or any(r.search(ln) for r in alias_rx):
+                add("pact", f, n, "otra copia del pacto: el texto vive solo en %s" % main)
+                break
+
+
+RUNNERS = {"size": check_size, "descriptions": check_descriptions, "dated": check_dated,
+           "marketplace": check_marketplace, "output-style": check_output_style,
+           "user-keys": check_user_keys, "agents": check_agents, "pact": check_pact}
+
+for c in CHECKS:
+    if c not in cfg["skip_checks"]:
+        RUNNERS[c]()
+
+# ---------------------------------------------------------------------------------------------
+# Veredicto
+# ---------------------------------------------------------------------------------------------
+n_fail = n_warn = n_ok_label = 0
+by_check = {c: [] for c in CHECKS}
+for f in findings:
+    by_check[f[0]].append(f)
+
+
+def annot(kind, check, path, line, msg):
+    if not opt["annotations"]:
+        return
+    loc = "file=%s" % path.rstrip("/") if path and not path.endswith("/") else ""
+    if loc and line:
+        loc += ",line=%d" % line
+    clean = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print("::%s %stitle=context-budget [%s]::%s" % (kind, (loc + ",") if loc else "", check, clean))
+
+
+for c in CHECKS:
+    if c in cfg["skip_checks"]:
+        print("--    [%s] desactivada por la configuracion" % c)
+        continue
+    items = by_check[c]
+    if not items:
+        extra = "; ".join(notes[c][:6])
+        if examined[c]:
+            print("OK    [%s] %d revisado(s)%s" % (c, examined[c], (": " + extra) if extra else ""))
+        else:
+            print("--    [%s] %s" % (c, extra or "nada que revisar"))
+        continue
+    for check, path, line, msg in items:
+        where = path + (":%d" % line if line else "")
+        if MODE == "enforce" and c not in cfg["warn_checks"]:
+            if c in BUDGET_CHECKS and APPROVED:
+                n_ok_label += 1
+                print("APROB [%s] %s: %s" % (c, where, msg))
+                annot("warning", c, path, line, "aprobado por la etiqueta: " + msg)
+            else:
+                n_fail += 1
+                print("FAIL  [%s] %s: %s" % (c, where, msg))
+                annot("error", c, path, line, msg)
+        else:
+            n_warn += 1
+            print("WARN  [%s] %s: %s" % (c, where, msg))
+            annot("warning", c, path, line, msg)
+
+print("----------------------------------------")
+tail = ""
+if n_ok_label:
+    tail = ", %d aprobada(s) por la etiqueta '%s'" % (n_ok_label, opt["approval"])
+print("context-budget: %d violacion(es), %d aviso(s)%s (modo %s, %d fichero(s) en el arbol)."
+      % (n_fail, n_warn, tail, MODE, len(FILES)))
+if n_fail and not APPROVED and any(f[0] in BUDGET_CHECKS for f in findings):
+    print("Un exceso de presupuesto (size, descriptions, dated) solo lo aprueba una persona, con la etiqueta '%s'."
+          % opt["approval"])
+sys.exit(1 if n_fail else 0)
+PY

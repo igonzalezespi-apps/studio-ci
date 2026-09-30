@@ -2,8 +2,8 @@
 # ============================================================================
 # bash-guard.sh — PreToolUse guard (matcher: Bash) for Claude Code
 # ============================================================================
-# Canonical source: plugins/core-dev of igonzalezespi/claude-plugins. This file
-# is VENDORED (committed) into each consuming repo and cabled from its
+# Canonical source: igonzalezespi-apps/claude-plugins, plugins/core-dev/scripts/hooks/bash-guard.sh.
+# This file is VENDORED (committed) into each consuming repo and cabled from its
 # settings.json — it is NOT a plugin hook, because ${CLAUDE_PLUGIN_ROOT} does
 # not exist inside a git hook and a repo must keep enforcing without the plugin.
 # The universal core is identical across repos; everything repo-specific lives
@@ -18,22 +18,18 @@
 #             reason to self-correct instead of retrying blindly)
 #
 # ⚠️ TRIPWIRE — THIS IS NOT A SECURITY BOUNDARY ⚠️
-# A best-effort firewall against agent mistakes, not hermetic: obfuscated forms
-# — `bash -c "..."`, git aliases, `git -c ...`, variable expansion ($CMD),
-# intermediate scripts, quoted text the simple tokenizer does not interpret,
-# exotic chaining — are NOT guaranteed to be intercepted. The guard is also
+# A best-effort firewall against agent mistakes, not hermetic: it reads the
+# command line it is handed, so anything that hides the real command from a
+# simple tokenizer — another interpreter, an indirection, a script written first
+# and run afterwards — is NOT guaranteed to be intercepted. The guard is also
 # fail-open: if command extraction fails (node absent, malformed JSON), it
 # allows — a broken tripwire must not take down the harness.
 #
-# And there is NO server-side backstop behind it. The consuming repos have no
-# branch protection and no required status checks (measured across the fleet:
-# `branches/<ref>/protection` -> 404 and `rulesets` -> [] nearly everywhere; the
-# one existing ruleset only blocks deletion/force-push and does not gate on CI)
-# — a deliberate standing decision, not an oversight. So when this guard misses
-# something, what is left is: the local git hooks (pre-commit / commit-msg /
-# pre-push), a CI that REPORTS without blocking (no required checks -> a red run
-# does not stop a merge), and human review. Treat an escape here as a real
-# escape; nothing on the server is going to catch it.
+# Do NOT assume a server-side backstop behind it. Branch protection, rulesets and
+# required status checks are per-repository settings that this guard neither reads
+# nor guarantees; a CI that merely REPORTS does not stop a merge. Whoever vendors
+# this file checks what its own repository enforces — `branches/<ref>/protection`
+# and `rulesets` — and, until then, treats an escape here as a real escape.
 #
 # BASH_GUARD_BRANCH: override of the current branch, TEST-ONLY (bash-guard.test.sh)
 # — lets the suite simulate "on main"/"on a PR branch" deterministically. In
@@ -507,8 +503,8 @@ check_git_push() {
     fi
     if [ "$dst" = "$PROTECTED_BRANCH" ]; then
       # The alternative names the branch, or the worktree with -C: a bare `HEAD`
-      # resolves wherever the session happens to stand, which is how this very
-      # message used to recommend the command it had just denied.
+      # resolves wherever the session happens to stand, so what this message
+      # suggests must never contain one.
       deny "push targeting ${PROTECTED_BRANCH} is forbidden (${PROTECTED_BRANCH} is protected for humans)" \
         "push your PR branch by name (git push -u origin <branch>) or from its worktree (git -C <worktree> push -u origin HEAD), and open a PR"
     fi
@@ -632,12 +628,10 @@ is_long_lived_branch() {
 #   0  provably this repository -> the policy already loaded governs it
 #   1  another repository, the one printed -> its own policy governs it
 #   2  cannot be determined -> the caller denies
-# The cwd is NOT evidence of who we are. Until 1.14.0 it was: "this repo" was the
-# cwd's origin, on the belief that the hook always runs from $CLAUDE_PROJECT_DIR.
-# Measured 2026-09-14 that it runs wherever the session's shell is, following every
-# `cd`, so a session of a permissive repo standing in a restrictive one merged there
-# under its OWN policy (claude-plugins#112). What decides is the repository that
-# holds the guard, as for the protected branch of a push (project_identities).
+# The cwd is NOT evidence of who we are: the hook runs wherever the session's shell
+# is, and that follows every `cd`, so the directory says where you STOOD, never who
+# you ARE. What decides is the repository that HOLDS the guard, as for the protected
+# branch of a push (project_identities).
 # Without --repo, gh resolves the PR in the repository of the directory it runs in;
 # that directory counts as ours only when EVERY one of its remotes is ours, and a
 # relocation in the command (`cd`, GH_REPO=) makes it unknowable.
@@ -722,16 +716,12 @@ target_policy_tsv() {
 # legitimate PR with a long-lived head is the release (head `develop`, base
 # `main`), and (2) already denies that.
 #
-# WHOSE POLICY DECIDES. Until 1.9.0 it was always the SESSION's: the policy loaded
-# at the top of this file was the only one it had read.
-# That was harmless only by accident: the repos whose policy says
-# `agent_may_merge: false` had no integration branch, so every one of their PRs
-# targeted the protected branch — and negative (2) does not consult any policy.
-# The moment such a repo gains an integration branch, a session rooted somewhere
-# permissive could merge into it against that repo's own policy.
-# So a merge landing in another repo re-reads THAT repo's guard.policy.json from its
-# origin and decides with it, failing CLOSED when it cannot be read. Which repo the
-# merge lands in is merge_target's call, and since 1.15.0 the cwd has no say in it. The globals
+# WHOSE POLICY DECIDES. Not the SESSION's — the policy loaded at the top of this
+# file is simply the only one at hand, and being at hand is not being in charge.
+# Whoever merges does not set the conditions: a merge landing in another repo
+# re-reads THAT repo's guard.policy.json from its origin and decides with it,
+# failing CLOSED when it cannot be read. Which repo the merge lands in is
+# merge_target's call, and the cwd has no say in it. The globals
 # are reassigned rather than shadowed on purpose: this process exits right after,
 # and threading four values through three helpers would be the kind of change
 # that quietly stops covering one of them.
@@ -823,10 +813,11 @@ check_gh() {
     elif [ -z "$sub2" ]; then
       sub2="$a"
     elif [ -z "$merge_arg" ]; then
-      # Do NOT stop here. This used to `break`, and `--repo` almost always comes
-      # AFTER the PR number (`gh pr merge 123 --repo owner/name --squash`), so
-      # the flag was never reached and repo_arg stayed empty. Keep scanning to
-      # the end; only the FIRST positional after `pr merge` is the PR.
+      # Do NOT stop here: `--repo` usually comes AFTER the PR number
+      # (`gh pr merge 123 --repo owner/name --squash`), so a scan that stops at
+      # the first positional never reads it and the destination stays unknown.
+      # Keep scanning to the end; only the FIRST positional after `pr merge` is
+      # the PR.
       merge_arg="$a"
     fi
     i=$((i + 1))
@@ -934,9 +925,224 @@ check_generated_write() {
   return 0
 }
 
+# --- Egress: the destination must be literal --------------------------------
+# The allow-list below judges the host WRITTEN in the command. A host that only exists after
+# the shell expands something — a variable, a command substitution, a word the shell builds —
+# is not written anywhere the guard can read, so the rule is: every word curl/wget would take
+# as a destination names its scheme and host literally, and a `$` or backtick in that part is
+# denied. The path after a literal host may hold expansions: it cannot change the host.
+#
+# Which words are destinations: every positional word, plus the value of any option that is
+# not listed below as a NON-destination value (output file, header, data, auth, timeouts…).
+# An option this rule does not know is taken as a flag, so its next word is judged as a
+# destination — fail-closed. And a tool told to read its URLs from a file is denied outright:
+# a destination nobody wrote in the command cannot be judged.
+
+# Shell words of a segment, honouring quotes and backslashes. A `$` or backtick the shell would
+# expand is kept; one it would not (inside single quotes, or escaped) becomes \x1f, so "does
+# this word hold an expansion" is a plain substring test. An expansion OUTSIDE any quotes — a
+# `$`, a backtick, or a brace that expands (an unquoted `,` or `..` before its closing brace) —
+# also puts \x1e in the word: the shell may split or multiply it, so what it turns into is not
+# one destination the guard can read.
+#
+# Linear in the length of the segment, and it has to be: a hook that grows quadratically with
+# its input turns a long command into a hook timeout. So the scan runs byte-wise (LC_ALL=C: a
+# character offset in a multibyte locale costs a walk from the start of the string) over
+# fixed-size chunks (an offset into a short chunk costs the same wherever the chunk sits), and
+# nothing inside the loop copies the remainder of the string.
+EGRESS_WORDS=()
+egress_words() {
+  local LC_ALL=C
+  local s="$1" w="" q="" c chunk i j m off n=${#1} inword=0 esc=0 br=0 brsep=0 dot=0
+  EGRESS_WORDS=()
+  for ((off = 0; off < n; off += 4096)); do
+    chunk="${s:off:4096}"
+    m=${#chunk}
+    for ((j = 0; j < m; j++)); do
+      c="${chunk:j:1}"
+      if ((esc)); then
+        # The character after a backslash, outside single quotes.
+        esc=0
+        if [[ $q == '"' ]]; then
+          case "$c" in
+            '$' | '`') w+=$'\x1f' ;;
+            '"' | '\') w+="$c" ;;
+            *) w+='\'"$c" ;;
+          esac
+        else
+          case "$c" in '$' | '`') c=$'\x1f' ;; esac
+          w+="$c"
+          inword=1
+        fi
+        continue
+      fi
+      if [[ $q == "'" ]]; then
+        if [[ $c == "'" ]]; then
+          q=""
+        else
+          case "$c" in '$' | '`') c=$'\x1f' ;; esac
+          w+="$c"
+        fi
+        continue
+      fi
+      if [[ $q == '"' ]]; then
+        case "$c" in
+          '"') q="" ;;
+          '\') esc=1 ;;
+          *) w+="$c" ;;
+        esac
+        continue
+      fi
+      case "$c" in
+        ' ' | $'\t')
+          ((inword)) && EGRESS_WORDS+=("$w")
+          w="" inword=0 br=0 brsep=0 dot=0
+          continue
+          ;;
+        "'" | '"') q="$c" ;;
+        '\') esc=1 ;;
+        '$' | '`') w+=$'\x1e'"$c" ;;
+        '{') br=$((br + 1)); w+="$c" ;;
+        ',') ((br)) && brsep=1; w+="$c" ;;
+        '.')
+          ((br && dot)) && brsep=1
+          w+="$c"
+          ;;
+        '}')
+          if ((br)); then
+            ((brsep)) && w+=$'\x1e'
+            br=$((br - 1))
+          fi
+          w+="$c"
+          ;;
+        *) w+="$c" ;;
+      esac
+      [[ $c == "." ]] && dot=1 || dot=0
+      inword=1
+    done
+  done
+  if [ "$inword" -eq 1 ]; then EGRESS_WORDS+=("$w"); fi
+  return 0
+}
+
+# Options whose value is NOT a destination, per tool: long names, then short letters. Then the
+# options that read URLs from a file, and the short ones whose value IS a destination (a proxy,
+# a base URL): theirs is judged whether it is attached or the next word.
+EGRESS_CURL_VALUE_LONG=" --output --output-dir --header --proxy-header --data --data-raw --data-binary --data-ascii --data-urlencode --json --form --form-string --user --user-agent --referer --request --write-out --cookie --cookie-jar --upload-file --connect-timeout --max-time --retry --retry-delay --retry-max-time --cacert --capath --cert --cert-type --key --key-type --pass --ciphers --range --time-cond --limit-rate --continue-at --speed-limit --speed-time --max-filesize --max-redirs --dump-header --trace --trace-ascii --stderr --netrc-file --oauth2-bearer --aws-sigv4 --expect100-timeout --keepalive-time --create-file-mode --proxy-user --proto --proto-redir --etag-save --etag-compare --pinnedpubkey --hostpubmd5 --hostpubsha256 --crlfile --delegation --login-options --sasl-authzid --service-name --tls-max --ftp-method --ftp-account --ftp-alternative-to-user --krb --mail-from --mail-rcpt --mail-auth --quote --telnet-option --local-port --interface --dns-interface --dns-ipv4-addr --dns-ipv6-addr --unix-socket --abstract-unix-socket --parallel-max --rate --variable "
+EGRESS_CURL_VALUE_SHORT="oHdFuAeXwbcTmErzCYyDUQtP"
+EGRESS_CURL_FROM_FILE_LONG=" --config "
+EGRESS_CURL_FROM_FILE_SHORT="K"
+EGRESS_CURL_DEST_SHORT="x"
+EGRESS_WGET_VALUE_LONG=" --output-document --output-file --append-output --directory-prefix --header --user-agent --user --password --http-user --http-password --ftp-user --ftp-password --proxy-user --proxy-password --post-data --post-file --body-data --body-file --method --tries --timeout --connect-timeout --read-timeout --dns-timeout --wait --waitretry --random-wait --referer --load-cookies --save-cookies --limit-rate --quota --level --accept --reject --accept-regex --reject-regex --include-directories --exclude-directories --domains --exclude-domains --certificate --certificate-type --private-key --private-key-type --ca-certificate --ca-directory --crl-file --progress --restrict-file-names --default-page --cut-dirs --max-redirect --local-encoding --remote-encoding --bind-address --dns-servers --secure-protocol --ciphers --pinnedpubkey --report-speed --warc-file --warc-header --warc-max-size --warc-tempdir --warc-dedup --warc-cdx --compression "
+EGRESS_WGET_VALUE_SHORT="OoaPUtTwQlARIXD"
+EGRESS_WGET_FROM_FILE_LONG=" --input-file --input-metalink --config "
+EGRESS_WGET_FROM_FILE_SHORT="i"
+EGRESS_WGET_DEST_SHORT="eB"
+
+deny_egress_nonliteral() {
+  local shown="${1//$'\x1e'/}"
+  shown="${shown//$'\x1f'/\$}"
+  shown="${shown//\$__GUARD_SUBST__/\$(…)}"
+  deny "curl/wget toward a destination that is not written literally ('${shown}'): network egress is restricted to the allow-list, and it can only judge a host written in the command" \
+    "write the URL with its scheme and host literally, quoted (the path may keep variables inside the quotes), or ask the user to fetch the resource"
+}
+
+deny_egress_from_file() {
+  deny "$1: a file can name URLs, and the egress allow-list can only judge a host written in the command" \
+    "write the URL literally in the command (headers can come from a file or stdin with -H @file / -H @-), or ask the user to fetch the resource"
+}
+
+# Judge one destination word: no unquoted expansion anywhere, and none in its scheme and host.
+egress_judge_word() {
+  local w="$1" head
+  case "$w" in *$'\x1e'*) deny_egress_nonliteral "$w" ;; esac
+  if [[ "$w" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+    head="${w#*://}"
+    [ -z "$head" ] && deny_egress_nonliteral "$w" # nothing after the scheme: the host was cut away
+    head="${head%%[/?#]*}"
+  else
+    head="${w%%/*}"
+  fi
+  case "$head" in
+    *'$'* | *'`'*) deny_egress_nonliteral "$w" ;;
+  esac
+  return 0
+}
+
+check_egress_literal() {
+  local tool="$1" seg="$2" w n i=0 k ch name val
+  local value_long value_short file_long file_short dest_short skip_next=0 opts_done=0
+  case "$tool" in
+    curl)
+      value_long="$EGRESS_CURL_VALUE_LONG" value_short="$EGRESS_CURL_VALUE_SHORT"
+      file_long="$EGRESS_CURL_FROM_FILE_LONG" file_short="$EGRESS_CURL_FROM_FILE_SHORT"
+      dest_short="$EGRESS_CURL_DEST_SHORT"
+      ;;
+    *)
+      value_long="$EGRESS_WGET_VALUE_LONG" value_short="$EGRESS_WGET_VALUE_SHORT"
+      file_long="$EGRESS_WGET_FROM_FILE_LONG" file_short="$EGRESS_WGET_FROM_FILE_SHORT"
+      dest_short="$EGRESS_WGET_DEST_SHORT"
+      ;;
+  esac
+  egress_words "$seg"
+  n=${#EGRESS_WORDS[@]}
+  # Everything up to the command word itself (assignments, wrappers, keywords) is not its args.
+  while [ "$i" -lt "$n" ]; do
+    w="${EGRESS_WORDS[i]}"
+    i=$((i + 1))
+    [ "${w##*/}" = "$tool" ] && break
+  done
+  for (( ; i < n; i++)); do
+    w="${EGRESS_WORDS[i]}"
+    if [ "$skip_next" -eq 1 ]; then
+      skip_next=0
+      continue
+    fi
+    if [ "$opts_done" -eq 0 ]; then
+      case "$w" in
+        --)
+          opts_done=1
+          continue
+          ;;
+        --*=*)
+          name="${w%%=*}" val="${w#*=}"
+          [[ "$file_long" == *" $name "* ]] && deny_egress_from_file "${tool} ${name}"
+          [[ "$value_long" == *" $name "* ]] || egress_judge_word "$val"
+          continue
+          ;;
+        --*)
+          [[ "$file_long" == *" $w "* ]] && deny_egress_from_file "${tool} ${w}"
+          [[ "$value_long" == *" $w "* ]] && skip_next=1
+          continue
+          ;;
+        -?*)
+          # A cluster of short options: the first one that takes a value ends it, and that
+          # value is the rest of the word or, when nothing is left, the next word.
+          for ((k = 1; k < ${#w}; k++)); do
+            ch="${w:k:1}"
+            [[ "$file_short" == *"$ch"* ]] && deny_egress_from_file "${tool} -${ch}"
+            if [[ "$dest_short" == *"$ch"* ]]; then
+              [ -n "${w:k+1}" ] && egress_judge_word "${w:k+1}"
+              break
+            fi
+            if [[ "$value_short" == *"$ch"* ]]; then
+              [ -z "${w:k+1}" ] && skip_next=1
+              break
+            fi
+          done
+          continue
+          ;;
+      esac
+    fi
+    egress_judge_word "$w"
+  done
+  return 0
+}
+
 # Egress restricted to the policy allow-list (default: localhost). Universal.
 check_egress() {
   local a url host allowed h
+  check_egress_literal "$cmd0" "$seg"
   for a in "${tok[@]:1}"; do
     # Only URLs with an explicit scheme (http://, https://, ftp://…) are
     # evaluated: detecting bare hosts (curl example.com) is ambiguous vs file
@@ -1075,17 +1281,14 @@ if (typeof cmd !== "string" || cmd.trim() === "") process.exit(0);
 // Heredoc bodies are data — commit messages, files written with `cat > f <<EOF` — and
 // analyzing them as commands would deny a runbook for mentioning `git push origin main` in
 // its prose. BUT a heredoc fed to a SHELL is code: `bash <<'EOF' … EOF`, `cat <<EOF | sh`,
-// `ssh host <<EOF`, `sudo -s <<EOF`. Stripping those blindly was a complete bypass of every
-// rule: measured 2026-09-01, a `curl … | bash` inside `bash <<'EOSU'` ran unchallenged in a
-// session where the same curl on a bare line was denied for egress.
+// `ssh host <<EOF`, `sudo -s <<EOF`. Dropping a body without asking where it goes takes every
+// rule out of it; keeping every body denies prose for quoting a command. Both directions are
+// defects, and the suite carries one case per shape — that is where the concrete forms live.
 //
 // So a body is KEPT for analysis when it reaches a shell that will read it as commands, and
 // dropped otherwise. "Reaches a shell" is decided on the COMMAND STRUCTURE of the line that
-// opens the heredoc, not on words appearing in it — the first version matched shell names
-// anywhere on the line and an adversarial pass found it wrong both ways in one evening:
-// `/bin/bash <<EOF`, `$SHELL <<EOF`, `bash<<EOF` and `sudo --shell <<EOF` slipped through,
-// while `gh pr create --title "docs: ssh runbook" --body-file - <<EOF` was denied for the word
-// `ssh` in the title. Now:
+// opens the heredoc, never on words appearing in it: a shell name inside a PR title is prose,
+// and a shell reached through a path, a variable or a wrapper is still a shell. So:
 //   * the opener is the LOGICAL line (backslash-newline joined, comments removed);
 //   * within it, only the PIPELINE holding the `<<` matters, from the stage that owns the
 //     heredoc onward (in `cat <<EOF | bash` the body flows into bash through the pipe);
@@ -1135,8 +1338,9 @@ function basename(t) { const i = t.lastIndexOf("/"); return i === -1 ? t : t.sli
 const isSpace = (c) => c === " " || c === "\t" || c === "\n" || c === "\r";
 
 // Quote-aware word tokenizer for ONE simple command (a stage: no unquoted |, ;, &&, newline —
-// hitting one STOPS the tokenizer, it never loops: the first structural version looped forever
-// on `ssh h 'echo a; echo b'`, node ran out of memory and the guard exited 0 for the whole call).
+// hitting one STOPS the tokenizer, and it must never loop: a tokenizer that does not advance
+// hangs the hook, and a hook that cannot finish analyses nothing — so non-advance is a defect
+// of the same class as a missing rule, not a slowdown).
 // Words are {text, hasExpansion, quoted, qstart}: text is the unquoted content; hasExpansion
 // marks an unquoted `$`/backtick or a `$` inside double quotes; quoted means some part was
 // quoted; qstart means the word STARTED with a quote (so `"A=b"` is not an assignment).
@@ -1613,12 +1817,10 @@ function splitSegments(str) {
       continue;
     }
     // A backslash-newline is a line continuation, not two characters: bash joins the lines
-    // before parsing. The guard used to keep the pair verbatim, so the segment carried a raw
-    // newline into the shell's line-based read loop below and got TORN IN HALF. Measured
-    // 2026-08-21: `gh pr create --repo r --head b \\<newline>  --label semver:none ...` was
-    // denied for "without --label", because the first half of the torn segment genuinely had
-    // no --label in it. Every rule that requires a flag to be PRESENT somewhere in the command
-    // has the same hole, in both directions: a false deny here, a missed deny elsewhere.
+    // before parsing. Keeping the pair verbatim carries a raw newline into the line-based read
+    // loop below and TEARS THE SEGMENT IN HALF, and half a command satisfies no rule honestly:
+    // one that requires a flag to be present stops seeing it, one that forbids a shape stops
+    // recognising it. Joining first is what lets every rule read the whole command.
     if (c === "\\" && next === "\n") { cur += " "; i++; continue; }
     if (c === "\\" && next) { cur += c + next; i++; continue; }
     if (c === "'" || c === '"') { q = c; cur += c; buf = ""; continue; }
@@ -1644,8 +1846,38 @@ function splitSegments(str) {
   return out;
 }
 
+// A command whose argument holds a command or process substitution is still ONE command, but
+// splitSegments cuts it at the substitution: the words before it and the words after it arrive
+// as separate segments, and a rule that needs both halves (a destination and the flags around
+// it) reads neither. So each text is ALSO split with every outermost substitution — `$(…)`,
+// backticks, `<(…)`, `>(…)` — replaced by one placeholder word that carries a `$`: the command
+// around it is read whole, and a rule that asks "is this word literal?" gets a truthful no.
+// Coverage is additive, the same contract as the quoted spans above: the original segments,
+// the substitution bodies included, are still emitted; the masked ones are extra.
+const SUBST_PLACEHOLDER = "$__GUARD_SUBST__";
+function maskSubstitutions(text) {
+  const starts = new Set();
+  const spans = [];
+  let open = 0, from = -1;
+  lex(text, (j, tok, depth, frameStart) => {
+    if (tok === "$(") { starts.add(j); if (open === 0) from = j; open++; return; }
+    if (tok === ")" && starts.has(frameStart)) { open--; if (open === 0) spans.push([from, j + 1]); }
+  });
+  if (open > 0 && from >= 0) spans.push([from, text.length]); // unterminated: masked to the end
+  if (!spans.length) return text;
+  let out = "", k = 0;
+  for (const [a, b] of spans) { out += text.slice(k, a) + SUBST_PLACEHOLDER; k = b; }
+  return out + text.slice(k);
+}
+
 for (const text of analyzableTexts(cmd, 0)) {
-  for (const seg of splitSegments(text)) {
+  const segs = splitSegments(text);
+  const masked = maskSubstitutions(text);
+  if (masked !== text) {
+    const have = new Set(segs);
+    for (const s of splitSegments(masked)) if (!have.has(s)) { have.add(s); segs.push(s); }
+  }
+  for (const seg of segs) {
     // One segment, one line. The shell reads this back with `while read -r`, so a segment
     // carrying a literal newline (only possible from inside a quoted span) would arrive as two
     // segments and each half would be matched on its own. Collapsing to a space keeps the

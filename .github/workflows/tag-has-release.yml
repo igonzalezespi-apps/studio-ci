@@ -1,0 +1,51 @@
+# Toda etiqueta `v*` acaba con su publicacion en GitHub; si alguien la empuja suelta, se crea aqui.
+#
+# POR QUE EXISTE. En este repositorio la etiqueta se corta A MANO. Medido en la flota el
+# 2026-09-23: `studio-ci` tenia nueve etiquetas y SIETE publicaciones — `v0.4.1` y `v0.6.5` se
+# habian empujado sueltas. Nadie lo vio, y no por descuido: una etiqueta huerfana no pone nada
+# rojo. Solo hace que la lista de publicaciones —que es lo unico que se mira para saber que hay
+# publicado— mienta por omision, y que `--generate-notes` de la siguiente arranque del sitio
+# equivocado. Los cuatro productos NO necesitan este workflow: su `release.yml` corta etiqueta y
+# publicacion en el mismo paso, y anadirlo alli seria un camino muerto (ver el parrafo siguiente).
+#
+# LO QUE NO PUEDE HACER, y conviene saberlo antes de fiarle nada mas: si la etiqueta la empuja un
+# workflow con el `GITHUB_TOKEN` por defecto, GitHub NO dispara este evento y esto no corre nunca
+# —sin aviso, sin run, sin rojo—. Aqui la empuja una persona con su propia credencial, asi que
+# dispara. Es la red del procedimiento MANUAL, no un mecanismo que cubra a un robot.
+#
+# `runs-on: ubuntu-latest` fijo, NUNCA `vars.RUNNER_TARGET`: este repositorio se gobierna como
+# publico, y apuntar `runs-on` a una de las maquinas del estudio desde un repositorio publico es
+# una frontera de seguridad y no una preferencia de facturacion — una PR de un fork ejecuta el
+# fichero de workflow DEL FORK, o sea codigo de un tercero, en esa maquina.
+name: Tag / release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # crear la publicacion que falta
+
+jobs:
+  tag-has-release:
+    name: tag-has-release
+    runs-on: ubuntu-latest
+    steps:
+      # Se prueba disparando, no leyendo: `.github/workflows/tag-has-release.test.sh` en
+      # `studio-ci` extrae ESTE cuerpo y lo ejecuta con el shell real de GitHub contra un `gh` de
+      # mentira. Los otros tres repositorios de configuracion llevan una copia identica de este
+      # fichero; si tocas uno, pasa el test alli.
+      - name: Cada etiqueta tiene su publicacion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            echo "OK  $TAG ya tiene su publicacion."
+            exit 0
+          fi
+          echo "$TAG se empujo como etiqueta suelta: le creo su publicacion."
+          # `--verify-tag`: si la etiqueta no existiera, fallar en vez de inventarsela.
+          gh release create "$TAG" --repo "$REPO" --verify-tag --generate-notes --title "$TAG"

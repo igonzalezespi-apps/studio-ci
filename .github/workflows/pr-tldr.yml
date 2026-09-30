@@ -1,0 +1,32 @@
+# Una PR marcada `revision-humana` la mergea una persona, y esa persona lee la seccion `## TL;DR`
+# en lugar del diff. Este control la pone roja si esa seccion no se basta sola: si no existe, si no
+# es la primera, si es un titular de dos lineas, si remite a otra parte ("ver abajo"), si cita una
+# decision o un documento que no trae, o si no incluye el comando de merge de ESTA PR. Una PR sin
+# la marca NO se juzga y sale verde: esas las integra un agente bajo sus tres puertas, y juzgarlas
+# aqui convertiria el control en ruido.
+#
+# `ubuntu-latest` fijo, y NO `vars.RUNNER_TARGET`: la accion no hace checkout ni necesita el
+# toolchain del repositorio —es una sola llamada a la API— y meterla en la cola de los ejecutores
+# propios la dejaria esperando detras de trabajos de minutos. Medido el 2026-09-23 en
+# `claude-plugins`: con un unico ejecutor registrado, `version-gate` estuvo encolado detras de
+# `tests` mas de quince minutos.
+#
+# SIN `concurrency` a proposito: `opened` y `labeled` disparan dos runs casi a la vez, y cancelar
+# el primero fabrica un check rojo que no corresponde a ningun fallo.
+name: PR TL;DR
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  check-pr-tldr:
+    name: check-pr-tldr
+    runs-on: ubuntu-latest
+    steps:
+      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@040cfeb899d509ab94d8f50782b623c12b90fb04 # v0.7.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

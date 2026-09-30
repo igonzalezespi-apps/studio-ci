@@ -46,7 +46,9 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(*/*.test.sh)
+          # Y `.github/workflows/*.test.sh`: el cuerpo de un `run:` tambien se prueba, y su test
+          # no vive junto a una action sino junto al workflow que extrae.
+          tests=(*/*.test.sh .github/workflows/*.test.sh)
           if [ ${#tests[@]} -eq 0 ]; then
             echo "no hay *.test.sh todavía"; exit 0
           fi
@@ -56,3 +58,17 @@ jobs:
             bash "$t" || rc=1
           done
           exit $rc
+
+  # La action se ejecuta aqui desde SU PROPIA RUTA (`./context-budget`), no desde un tag: asi
+  # cada PR prueba en GitHub lo que recibira el consumidor con el tag siguiente —la expresion
+  # por defecto de `labels`, las anotaciones y el resumen del paso—, que es justo lo que las
+  # suites locales no pueden ver. Solo aviso: este repo todavia no ha pasado su dieta de
+  # contexto, y un rojo permanente aqui enseñaria a ignorarlo.
+  context-budget:
+    name: context-budget (este repo, solo aviso)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./context-budget
+        with:
+          mode: warn
