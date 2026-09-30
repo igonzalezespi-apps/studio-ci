@@ -37,7 +37,7 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: "Runner. Un label (`ubuntu-latest`) o una lista JSON (`[\"self-hosted\",\"linux\"]`)."
+        description: "Runner. Un label (`ubuntu-latest`) o una lista JSON de etiquetas (`[\"linux\",\"x64\"]`)."
         type: string
         required: false
         default: ubuntu-latest

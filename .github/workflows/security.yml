@@ -38,7 +38,7 @@ on:
     inputs:
       runs-on:
         description: >-
-          Runner. Un label (`ubuntu-latest`) o una lista JSON (`["self-hosted","linux"]`). En un repo
+          Runner. Un label (`ubuntu-latest`) o una lista JSON de etiquetas (`["linux","x64"]`). En un repo
           PUBLICO, solo runners alojados: una PR desde un fork ejecuta su propio workflow.
         type: string
         required: false
