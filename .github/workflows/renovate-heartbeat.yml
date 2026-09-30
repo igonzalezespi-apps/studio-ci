@@ -1,0 +1,192 @@
+# Workflow REUTILIZABLE (`on: workflow_call`): comprueba que Renovate sigue vivo en el repo que lo
+# llama, y que no hay PRs suyas atascadas por un check cancelado.
+#
+#   on:
+#     schedule:
+#       - cron: "23 6 * * 1,4"
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#     issues: write          # el ping marca una casilla del Dependency Dashboard
+#     pull-requests: read
+#     checks: read
+#   jobs:
+#     renovate-heartbeat:
+#       uses: igonzalezespi-apps/studio-ci/.github/workflows/renovate-heartbeat.yml@<sha> # vX.Y.Z
+#
+# POR QUE HACE FALTA. Un Renovate que deja de ejecutarse no avisa: no abre PRs, y eso es
+# indistinguible de "todo esta al dia". Pasa por un error de configuracion, por quedarse sin memoria
+# al regenerar un lockfile o porque la App deja de tener acceso. Y hay un segundo silencio: Renovate
+# vivo, PRs abiertas y ninguna se automergea porque un check `cancelled` se quedo en su cabeza.
+#
+# COMO MIDE QUE ESTA VIVO. El Dependency Dashboard trae la casilla "Check this box to trigger a
+# request for Renovate to run again". Cada vez que Renovate se ejecuta, la vuelve a pintar VACIA. El
+# heartbeat usa esa casilla como ping, sin estado propio:
+#   - vacia  -> Renovate contesto al ping anterior (o no hubo): se marca otra vez y queda enviado;
+#   - marcada y la issue lleva menos de `max-silence-hours` sin cambios -> ping en curso, verde;
+#   - marcada y mas vieja que eso -> nadie ha contestado: ROJO.
+# Con dos ejecuciones por semana y 48 h de umbral, un Renovate muerto sale en rojo en la segunda
+# ejecucion despues de morir. Marcar la casilla solo pide una ejecucion: el `schedule` de Renovate
+# sigue mandando sobre cuando abre PRs.
+#
+# Salida: 0 vivo; 1 hallazgo (sin dashboard, error de configuracion, ping sin contestar, PR con un
+# check cancelado); 2 no se pudo medir (API, permisos). Nunca un 0 por no haber podido mirar.
+name: renovate-heartbeat
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: "Runner. Un label (`ubuntu-latest`) o una lista JSON (`[\"self-hosted\",\"linux\"]`)."
+        type: string
+        required: false
+        default: ubuntu-latest
+      ping:
+        description: >-
+          Marcar la casilla de re-ejecucion del dashboard. Necesita `issues: write`. Con `false` solo
+          hace las comprobaciones de lectura (util en una PR).
+        type: boolean
+        required: false
+        default: true
+      max-silence-hours:
+        description: "Horas que puede estar un ping sin respuesta antes de dar rojo."
+        type: number
+        required: false
+        default: 48
+      stuck-prs:
+        description: "Buscar PRs abiertas del bot con un check cancelado en su commit de cabeza (necesita `checks: read`)."
+        type: boolean
+        required: false
+        default: true
+      dashboard-title:
+        description: "Titulo de la issue del dashboard (el de `dependencyDashboardTitle`)."
+        type: string
+        required: false
+        default: Dependency Dashboard
+      bot-login:
+        description: "Usuario del bot."
+        type: string
+        required: false
+        default: renovate[bot]
+
+jobs:
+  heartbeat:
+    name: heartbeat
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: 5
+    # Pings en serie (dos a la vez se pisarian la casilla). En una PR, grupo propio de la ejecucion:
+    # un heartbeat nunca deja un `cancelled` en la cabeza de una PR.
+    concurrency:
+      group: studio-renovate-heartbeat-${{ github.repository }}-${{ startsWith(github.event_name, 'pull_request') && format('run-{0}-{1}', github.run_id, github.run_attempt) || 'ping' }}
+      cancel-in-progress: false
+    steps:
+      - name: Renovate vivo y sin PRs atascadas
+        id: heartbeat
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PING: ${{ inputs.ping }}
+          MAX_SILENCE_HOURS: ${{ inputs.max-silence-hours }}
+          STUCK_PRS: ${{ inputs.stuck-prs }}
+          DASHBOARD_TITLE: ${{ inputs.dashboard-title }}
+          BOT_LOGIN: ${{ inputs.bot-login }}
+        run: |
+          set -uo pipefail
+          # `-e` viene de fuera: todo lo que puede fallar a proposito va con `||`.
+          fallos=0
+          resumen() { printf '%s\n' "$@" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+          falla() { echo "::error::$1"; resumen "- FALLO: $1"; fallos=$((fallos + 1)); }
+          aviso() { echo "::warning::$1"; resumen "- aviso: $1"; }
+          bien() { echo "$1"; resumen "- ok: $1"; }
+          nomedido() { echo "::error::no se pudo medir: $1"; resumen "- NO MEDIDO: $1"; exit 2; }
+
+          case "$MAX_SILENCE_HOURS" in
+            ''|*[!0-9]*) nomedido "max-silence-hours '$MAX_SILENCE_HOURS' no es un entero de horas" ;;
+          esac
+          resumen "### renovate-heartbeat" ""
+          bot_url="${BOT_LOGIN//\[/%5B}"
+          bot_url="${bot_url//\]/%5D}"
+
+          # 1. Issues abiertas del bot: el dashboard y la de configuracion rota.
+          issues="$(gh api --paginate "repos/$REPO/issues?state=open&creator=$bot_url&per_page=100" \
+            --jq '.[] | select(.pull_request == null) | [.number, .updated_at, .title] | @tsv')" \
+            || nomedido "no pude listar las issues de $BOT_LOGIN (hace falta issues: read)"
+
+          rota="$(printf '%s\n' "$issues" | awk -F'\t' '$3 ~ /^Action Required: Fix Renovate Configuration/ { print $1; exit }')"
+          if [ -n "$rota" ]; then
+            falla "Renovate tiene la configuracion rota y no esta renovando nada: issue #$rota."
+          fi
+
+          dash="$(printf '%s\n' "$issues" | awk -F'\t' -v t="$DASHBOARD_TITLE" '$3 == t { print $1 "\t" $2 }')"
+          ndash="$(printf '%s' "$dash" | grep -c . || true)"
+          if [ "$ndash" -eq 0 ]; then
+            falla "no hay una issue abierta '$DASHBOARD_TITLE' de $BOT_LOGIN: Renovate no ha corrido aqui, o el dashboard esta desactivado (el heartbeat lo necesita)."
+          else
+            if [ "$ndash" -gt 1 ]; then
+              aviso "hay $ndash issues '$DASHBOARD_TITLE'; se usa la mas reciente."
+            fi
+            num="$(printf '%s\n' "$dash" | head -1 | cut -f1)"
+            actualizada="$(printf '%s\n' "$dash" | head -1 | cut -f2)"
+            cuerpo="$RUNNER_TEMP/dashboard.md"
+            gh api "repos/$REPO/issues/$num" --jq '.body' > "$cuerpo" \
+              || nomedido "no pude leer la issue #$num"
+
+            # 2. Problemas que Renovate declara en el propio dashboard: aviso, no fallo (suelen ser
+            #    avisos de acceso o de busqueda que no paran la ejecucion).
+            if grep -qi '^## Repository problems' "$cuerpo"; then
+              problemas="$(awk 'tolower($0) ~ /^## repository problems/ { dentro=1; next } /^## / { dentro=0 } dentro && /^ *- / { sub(/^ *- /, ""); print }' "$cuerpo" | head -5 | paste -sd';' -)"
+              aviso "el dashboard #$num declara problemas: ${problemas:-ver la issue}"
+            fi
+
+            # 3. El ping.
+            edad=$(( ( $(date -u +%s) - $(date -u -d "$actualizada" +%s) ) / 3600 ))
+            if grep -qE '\[[xX]\] <!-- manual job -->' "$cuerpo"; then
+              if [ "$edad" -ge "$MAX_SILENCE_HOURS" ]; then
+                falla "el ping del dashboard #$num lleva ${edad} h sin respuesta (umbral ${MAX_SILENCE_HOURS} h): Renovate no se esta ejecutando en este repo."
+              else
+                bien "ping en curso en el dashboard #$num desde hace ${edad} h (umbral ${MAX_SILENCE_HOURS} h)."
+              fi
+            elif grep -qF '[ ] <!-- manual job -->' "$cuerpo"; then
+              if [ "$PING" = "true" ]; then
+                nuevo="$RUNNER_TEMP/dashboard-ping.md"
+                contenido="$(cat "$cuerpo"; printf x)"
+                contenido="${contenido%x}"
+                printf '%s' "${contenido/"[ ] <!-- manual job -->"/"[x] <!-- manual job -->"}" > "$nuevo"
+                gh api -X PATCH "repos/$REPO/issues/$num" -F "body=@$nuevo" --silent \
+                  || nomedido "no pude marcar la casilla del dashboard #$num (hace falta issues: write)"
+                bien "Renovate contesto al ping anterior; ping nuevo enviado en el dashboard #$num."
+              else
+                bien "casilla del dashboard #$num vacia: sin ping pendiente (ping desactivado en esta ejecucion)."
+              fi
+            else
+              if [ "$PING" = "true" ]; then
+                nomedido "el dashboard #$num no tiene la casilla de re-ejecucion (<!-- manual job -->); no hay como hacer ping"
+              fi
+              aviso "el dashboard #$num no tiene la casilla de re-ejecucion; solo comprobaciones de lectura."
+            fi
+          fi
+
+          # 4. PRs del bot con un check cancelado en su cabeza: Renovate solo automergea en verde, y
+          #    un `cancelled` que nadie relanza la deja esperando para siempre.
+          if [ "$STUCK_PRS" = "true" ]; then
+            prs="$(gh api --paginate "repos/$REPO/pulls?state=open&per_page=100" \
+              --jq ".[] | select(.user.login == \"$BOT_LOGIN\") | [.number, .head.sha] | @tsv")" \
+              || nomedido "no pude listar las PRs (hace falta pull-requests: read)"
+            total=0
+            while IFS=$'\t' read -r pr sha; do
+              [ -n "$pr" ] || continue
+              total=$((total + 1))
+              cancelados="$(gh api "repos/$REPO/commits/$sha/check-runs?filter=latest&per_page=100" \
+                --jq '[.check_runs[] | select(.conclusion == "cancelled" or .conclusion == "timed_out") | .name] | join(", ")')" \
+                || nomedido "no pude leer los checks de la PR #$pr (hace falta checks: read)"
+              if [ -n "$cancelados" ]; then
+                falla "PR #$pr de $BOT_LOGIN: check(s) cancelado(s) en su cabeza (${cancelados}). Relanzalos; si se repite, el workflow que los produce cancela ejecuciones del mismo commit."
+              fi
+            done <<< "$prs"
+            bien "PRs abiertas de $BOT_LOGIN revisadas: $total."
+          fi
+
+          if [ "$fallos" -gt 0 ]; then
+            exit 1
+          fi
+          bien "Renovate vivo."

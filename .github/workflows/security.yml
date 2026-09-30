@@ -1,0 +1,451 @@
+# Workflow REUTILIZABLE (`on: workflow_call`): no se dispara en este repo, lo llama un consumidor.
+#
+#   jobs:
+#     security:
+#       uses: igonzalezespi-apps/studio-ci/.github/workflows/security.yml@<sha> # vX.Y.Z
+#
+# Dos comprobaciones en un solo job (`scan`), para que el consumidor vea UN check y pague UN
+# arranque de runner:
+#
+#   1. Secretos: gitleaks con la salida redactada. En una PR mira solo los commits de la PR; en un
+#      push, los commits empujados; en `schedule`/`workflow_dispatch`, la historia entera.
+#   2. Dependencias: `pnpm audit` o `npm audit` segun el lockfile. En una PR o un push solo falla
+#      por lo que ESE cambio anade (cabeza menos base); en `schedule`/`workflow_dispatch`, por el
+#      estado absoluto. Una PR que no toca dependencias no audita nada.
+#
+# El reparto de modos no es cosmetico: un aviso nuevo publicado sobre una dependencia vieja pondria
+# en rojo TODAS las PRs abiertas —las de Renovate tambien, que entonces dejan de automergearse— sin
+# que ninguna lo haya causado. Ese rojo lo da la ejecucion programada, que es la que mide el estado.
+#
+# LA CONCURRENCIA ES LA RAZON DE QUE ESTE FICHERO EXISTA, y esta escrita para que no vuelva a pasar
+# lo que se midio en otro repositorio: 21 de 27 checks `cancelled` y 3 de 47 PRs de Renovate
+# automergeadas. El mecanismo: `opened` y `labeled` llegan casi a la vez sobre el MISMO commit (el
+# bot abre la PR y despues le pone las etiquetas); si los dos caen en un grupo que cancela, uno mata
+# al otro y el `cancelled` se queda pegado a la cabeza de la PR. GitHub la pinta en rojo y Renovate,
+# que solo automergea en verde, la deja esperando para siempre.
+#
+# La regla que sale de ahi: solo se cancela lo que ha quedado VIEJO. Un `opened` o `synchronize`
+# comparte grupo con los de su PR y se cancela cuando llega un commit nuevo: el `cancelled` cae en un
+# commit que ya no es la cabeza y no bloquea nada. Cualquier otro evento (`labeled`, `unlabeled`,
+# `edited`, `reopened`, `ready_for_review`, push, schedule) va a un grupo propio de su ejecucion:
+# ni cancela ni lo cancelan. Y el paso `caller-guard` rechaza el otro modo de reintroducirlo: un
+# consumidor que escucha etiquetas y pone su propio `concurrency` alrededor de esta llamada.
+# `security.test.sh` evalua estas expresiones evento a evento y muere si alguien las "simplifica".
+name: security
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          Runner. Un label (`ubuntu-latest`) o una lista JSON (`["self-hosted","linux"]`). En un repo
+          PUBLICO, solo runners alojados: una PR desde un fork ejecuta su propio workflow.
+        type: string
+        required: false
+        default: ubuntu-latest
+      secrets-scan:
+        description: "Buscar secretos con gitleaks."
+        type: boolean
+        required: false
+        default: true
+      audit:
+        description: "Auditar dependencias npm/pnpm."
+        type: boolean
+        required: false
+        default: true
+      audit-level:
+        description: "Severidad minima que falla: low, moderate, high o critical."
+        type: string
+        required: false
+        default: high
+      working-directory:
+        description: "Carpeta del lockfile, relativa a la raiz del repo."
+        type: string
+        required: false
+        default: "."
+      ignore-advisories:
+        description: >-
+          IDs GHSA que no cuentan, separados por comas o espacios. Cada uno, con su motivo en un
+          comentario del workflow que llama.
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      group: studio-security-${{ github.repository }}-${{ startsWith(github.event_name, 'pull_request') && contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ startsWith(github.event_name, 'pull_request') && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
+    steps:
+      # `pull_request_target` ejecuta con permisos del repo sobre codigo de la PR, y la auditoria
+      # ejecuta el gestor de paquetes que declare ese codigo (corepack lee `packageManager`). Se
+      # corta antes del checkout.
+      - name: Evento admitido
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request_target" ]; then
+            echo "::error::security no se ejecuta en pull_request_target: usa pull_request."
+            exit 1
+          fi
+          echo "evento: $EVENT_NAME"
+
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: El workflow que llama no cancela ejecuciones de etiquetas
+        id: caller-guard
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+
+          try:
+              import yaml
+          except ImportError:
+              print("::warning::caller-guard: sin PyYAML en este runner; no se ha comprobado la concurrencia del workflow que llama.")
+              sys.exit(0)
+
+          ref = os.environ.get("WORKFLOW_REF", "")
+          repo = os.environ.get("REPO", "")
+          path = ref.split("@", 1)[0]
+          if repo and path.startswith(repo + "/"):
+              path = path[len(repo) + 1:]
+          if not path or not os.path.isfile(path):
+              print(f"::warning::caller-guard: no encuentro el workflow que llama ({ref!r}); no se ha comprobado.")
+              sys.exit(0)
+
+          with open(path, encoding="utf-8") as fh:
+              doc = yaml.safe_load(fh) or {}
+          # YAML 1.1 lee la clave `on` como el booleano True.
+          on = doc.get("on", doc.get(True, {}))
+          if isinstance(on, str):
+              on = [on]
+          if isinstance(on, list):
+              on = {ev: None for ev in on}
+          if not isinstance(on, dict):
+              on = {}
+
+          defecto = ["opened", "synchronize", "reopened"]
+          escucha = set()
+          for ev in ("pull_request", "pull_request_target"):
+              if ev not in on:
+                  continue
+              cfg = on[ev] if isinstance(on[ev], dict) else {}
+              tipos = cfg.get("types") or defecto
+              if isinstance(tipos, str):
+                  tipos = [tipos]
+              escucha.update(tipos)
+
+          # Los de codigo: su ejecucion vieja SI se puede cancelar sin bloquear la cabeza.
+          riesgo = sorted(escucha - set(defecto))
+          if not riesgo:
+              print(f"caller-guard: {path} solo escucha eventos de codigo; nada que comprobar.")
+              sys.exit(0)
+
+          quien = []
+          if doc.get("concurrency"):
+              quien.append("el workflow (clave `concurrency` de primer nivel)")
+          for nombre, job in (doc.get("jobs") or {}).items():
+              if isinstance(job, dict) and ".github/workflows/security.yml" in str(job.get("uses", "")) and job.get("concurrency"):
+                  quien.append(f"el job `{nombre}`")
+
+          if quien:
+              print(
+                  f"::error file={path}::{path} escucha {', '.join(riesgo)} y declara `concurrency` en "
+                  f"{' y '.join(quien)}. Un evento de etiqueta entraria en el mismo grupo que el `opened` del "
+                  "mismo commit: lo cancela, o lo deja pendiente y lo cancela el siguiente, y el `cancelled` "
+                  "se queda en la cabeza de la PR (roja, y Renovate no la automergea). Quita ese "
+                  "`concurrency`: security trae el suyo, que solo cancela ejecuciones de commits viejos."
+              )
+              sys.exit(1)
+          print(f"caller-guard: {path} escucha {', '.join(riesgo)} sin `concurrency` propio alrededor de security: OK.")
+          PY
+
+      - name: Instalar gitleaks (version fija, checksum verificado)
+        id: gitleaks-install
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && inputs.secrets-scan }}
+        run: |
+          set -euo pipefail
+          # Subir de version = cambiar las tres lineas a la vez, con los checksums del fichero
+          # `gitleaks_<version>_checksums.txt` de la publicacion. Un checksum viejo con una version
+          # nueva no pasa: el paso falla cerrado.
+          version=8.30.1
+          case "$(uname -s)/$(uname -m)" in
+            Linux/x86_64|Linux/amd64)  arch=x64;   sum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb ;;
+            Linux/aarch64|Linux/arm64) arch=arm64; sum=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080 ;;
+            *) echo "::error::gitleaks: runner no soportado ($(uname -s)/$(uname -m)); solo Linux x64/arm64."; exit 1 ;;
+          esac
+          dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$dir"
+          tgz="$dir/gitleaks.tar.gz"
+          curl -sSfL --retry 3 --retry-delay 2 -o "$tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_${arch}.tar.gz"
+          got="$(sha256sum "$tgz" | cut -d' ' -f1)"
+          if [ "$got" != "$sum" ]; then
+            echo "::error::gitleaks ${version} (${arch}): checksum ${got}, esperado ${sum}. No se ejecuta."
+            exit 1
+          fi
+          tar -xzf "$tgz" -C "$dir" gitleaks
+          "$dir/gitleaks" version
+
+      - name: Secretos (gitleaks)
+        id: secrets
+        if: ${{ !cancelled() && steps.gitleaks-install.outcome == 'success' }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -uo pipefail
+          # `-e` viene puesto desde fuera (`bash -e -o pipefail`): los fallos esperados se recogen
+          # con `|| rc=$?` para poder contarlos antes de salir.
+          gl="$RUNNER_TEMP/gitleaks/gitleaks"
+          informe="$RUNNER_TEMP/gitleaks-report.json"
+          existe() { [ -n "$1" ] && git cat-file -e "$1^{commit}" 2>/dev/null; }
+          ceros=0000000000000000000000000000000000000000
+
+          rango=""
+          case "$EVENT_NAME" in
+            pull_request)
+              # El checkout de una PR es su commit de merge: padre 1 = base, padre 2 = cabeza.
+              if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+                rango="$(git rev-parse 'HEAD^1')..$(git rev-parse 'HEAD^2')"
+              elif existe "$PR_BASE_SHA" && existe "$PR_HEAD_SHA"; then
+                rango="$PR_BASE_SHA..$PR_HEAD_SHA"
+              fi
+              ;;
+            push)
+              if [ "$PUSH_BEFORE" != "$ceros" ] && existe "$PUSH_BEFORE"; then
+                rango="$PUSH_BEFORE..${PUSH_AFTER:-HEAD}"
+              fi
+              ;;
+          esac
+          args=(git --no-banner --no-color --redact --exit-code 3 --report-format json --report-path "$informe")
+          if [ -n "$rango" ]; then
+            args+=("--log-opts=$rango")
+            alcance="commits $rango"
+          else
+            alcance="historia completa"
+          fi
+
+          rc=0
+          "$gl" "${args[@]}" . || rc=$?
+
+          {
+            echo "### security · secretos"
+            echo ""
+            echo "Alcance: ${alcance}."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          case "$rc" in
+            0)
+              echo "gitleaks: sin secretos (${alcance})."
+              echo "Sin secretos." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+              ;;
+            3)
+              node - "$informe" <<'JS'
+          const hallazgos = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+          // Escapes de los comandos de flujo de GitHub: una ruta con `,` o `:` partiria la anotacion.
+          const msg = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+          const prop = (s) => msg(s).replace(/:/g, "%3A").replace(/,/g, "%2C");
+          const filas = [];
+          for (const h of hallazgos) {
+            const donde = `${h.File}:${h.StartLine}`;
+            const commit = String(h.Commit).slice(0, 12);
+            console.log(`::error file=${prop(h.File)},line=${prop(h.StartLine)}::${msg(`gitleaks ${h.RuleID} en ${donde} (commit ${commit}; huella ${h.Fingerprint})`)}`);
+            filas.push(`| \`${h.RuleID}\` | \`${donde}\` | \`${commit}\` | \`${h.Fingerprint}\` |`);
+          }
+          const pie = `${hallazgos.length} secreto(s) posible(s). Falso positivo: su huella va a .gitleaksignore. Real: se rota ANTES de tocar la historia.`;
+          console.log(pie);
+          if (process.env.GITHUB_STEP_SUMMARY) {
+            require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY,
+              ["", "| regla | donde | commit | huella |", "|---|---|---|---|", ...filas, "", pie, ""].join("\n"));
+          }
+          JS
+              exit 1
+              ;;
+            *)
+              echo "::error::gitleaks salio con ${rc}: no se pudo medir (${alcance})."
+              echo "No se pudo medir (gitleaks salio con ${rc})." >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+              exit 2
+              ;;
+          esac
+
+      - name: Dependencias (npm/pnpm audit)
+        id: audit
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && inputs.audit }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          AUDIT_LEVEL: ${{ inputs.audit-level }}
+          WORKDIR: ${{ inputs.working-directory }}
+          IGNORE: ${{ inputs.ignore-advisories }}
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          set -uo pipefail
+          resumen() { printf '%s\n' "$@" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+          resumen "### security · dependencias" ""
+          case "$AUDIT_LEVEL" in
+            low|moderate|high|critical) ;;
+            *) echo "::error::audit-level '$AUDIT_LEVEL' no es low, moderate, high ni critical."; exit 2 ;;
+          esac
+          raiz="$(pwd)"
+          cd -- "$WORKDIR" 2>/dev/null || { echo "::error::working-directory '$WORKDIR' no existe."; exit 2; }
+
+          gestor=""
+          if [ -f pnpm-lock.yaml ]; then gestor=pnpm
+          elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then gestor=npm
+          fi
+          if [ -z "$gestor" ]; then
+            if [ -f yarn.lock ]; then motivo="yarn.lock: este paso solo sabe auditar npm y pnpm"
+            elif [ -f pubspec.lock ]; then motivo="pubspec.lock: pub no tiene auditor propio; lo cubren las alertas de dependencias de GitHub y Renovate"
+            else motivo="sin lockfile de npm ni de pnpm en '$WORKDIR': no hay dependencias que auditar"
+            fi
+            echo "::notice::audit: $motivo."
+            resumen "Sin auditar: $motivo."
+            exit 0
+          fi
+
+          # Base con la que comparar. PR: el padre 1 del commit de merge. Push: el `before`.
+          # schedule/workflow_dispatch: ninguna, y manda el estado absoluto.
+          base=""
+          existe() { [ -n "$1" ] && git cat-file -e "$1^{commit}" 2>/dev/null; }
+          case "$EVENT_NAME" in
+            pull_request)
+              if git rev-parse -q --verify 'HEAD^2' >/dev/null; then base="$(git rev-parse 'HEAD^1')"
+              elif existe "$PR_BASE_SHA"; then base="$PR_BASE_SHA"
+              fi
+              ;;
+            push)
+              if existe "$PUSH_BEFORE"; then base="$PUSH_BEFORE"; fi
+              ;;
+          esac
+          if [ -n "$base" ]; then
+            tocados="$(git diff --name-only "$base" HEAD -- . | grep -E '(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|\.npmrc)$' || true)"
+            if [ -z "$tocados" ]; then
+              echo "audit: el cambio no toca dependencias (base ${base:0:12}); nada que auditar."
+              resumen "El cambio no toca dependencias: no se audita (el estado absoluto lo mide la ejecucion programada)."
+              exit 0
+            fi
+          fi
+
+          if [ "$gestor" = pnpm ] && ! command -v pnpm >/dev/null 2>&1; then
+            if command -v corepack >/dev/null 2>&1; then
+              mkdir -p "$RUNNER_TEMP/corepack-bin"
+              corepack enable --install-directory "$RUNNER_TEMP/corepack-bin" pnpm
+              export PATH="$RUNNER_TEMP/corepack-bin:$PATH"
+            else
+              echo "::error::audit: hay pnpm-lock.yaml pero ni pnpm ni corepack en el runner; no se pudo medir."
+              exit 2
+            fi
+          fi
+
+          lector="$RUNNER_TEMP/audit-lector.js"
+          cat > "$lector" <<'JS'
+          // stdin: salida de `npm audit --json` o `pnpm audit --json`.
+          // stdout: una linea por aviso >= nivel y no ignorado: id<TAB>severidad<TAB>paquete<TAB>titulo<TAB>url
+          // exit 2 si la salida no tiene la forma de un informe (error de red, de registro, de lockfile).
+          const [gestor, nivel, ignora] = process.argv.slice(2);
+          const rango = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
+          // Un GHSA se escribe `GHSA-xxxx-xxxx-xxxx`: prefijo en mayusculas y el resto en minusculas.
+          const canon = (id) => (/^ghsa-/i.test(id) ? "GHSA-" + id.slice(5).toLowerCase() : String(id));
+          const ignorados = new Set((ignora || "").split(/[\s,]+/).filter(Boolean).map(canon));
+          let texto = require("fs").readFileSync(0, "utf8");
+          let d;
+          try { d = JSON.parse(texto); } catch { d = null; }
+          const ghsa = (url) => canon(((url || "").match(/GHSA(-[0-9a-z]{4}){3}/i) || [""])[0]);
+          const avisos = new Map();
+          const anota = (id, sev, paquete, titulo, url) => {
+            id = canon(id);
+            if (!(sev in rango) || rango[sev] < rango[nivel] || ignorados.has(id)) return;
+            avisos.set(id, [id, sev, paquete, (titulo || "").replace(/\s+/g, " "), url || ""].join("\t"));
+          };
+          if (gestor === "pnpm" && d && typeof d.advisories === "object" && d.advisories !== null) {
+            for (const a of Object.values(d.advisories)) {
+              anota(a.github_advisory_id || ghsa(a.url) || `npm-${a.id}`, a.severity, a.module_name, a.title, a.url);
+            }
+          } else if (gestor === "npm" && d && typeof d.vulnerabilities === "object" && d.vulnerabilities !== null) {
+            for (const v of Object.values(d.vulnerabilities)) {
+              for (const via of v.via || []) {
+                if (via && typeof via === "object") anota(ghsa(via.url) || `npm-${via.source}`, via.severity, via.name, via.title, via.url);
+              }
+            }
+          } else {
+            process.stderr.write(`salida de ${gestor} audit sin forma de informe: ${texto.slice(0, 400)}\n`);
+            process.exit(2);
+          }
+          for (const linea of [...avisos.values()].sort()) console.log(linea);
+          JS
+
+          # audita <dir> <salida.tsv>: 0 medido (el tsv puede estar vacio), 2 no medido.
+          audita() {
+            local dir="$1" tsv="$2" rc=0
+            ( cd -- "$dir" && timeout 300 "$gestor" audit --json ) > "$tsv.json" 2> "$tsv.err" || rc=$?
+            # El codigo de salida no dice nada por si solo: 1 es "hay avisos" en los dos gestores,
+            # y tambien "no pude preguntar". Manda la forma del JSON.
+            if [ "$rc" -eq 124 ]; then echo "::error::$gestor audit: sin respuesta en 300 s."; return 2; fi
+            node "$lector" "$gestor" "$AUDIT_LEVEL" "$IGNORE" < "$tsv.json" > "$tsv" 2>> "$tsv.err" || {
+              echo "::error::$gestor audit no devolvio un informe: $(head -c 400 "$tsv.err" | tr '\n' ' ')"
+              return 2
+            }
+          }
+
+          cabeza="$RUNNER_TEMP/audit-cabeza.tsv"
+          audita . "$cabeza" || exit 2
+          if [ ! -s "$cabeza" ]; then
+            echo "audit ($gestor): ningun aviso >= $AUDIT_LEVEL."
+            resumen "$gestor audit: ningun aviso >= $AUDIT_LEVEL."
+            exit 0
+          fi
+
+          nuevos="$cabeza"
+          viejos=""
+          if [ -n "$base" ]; then
+            arbol="$RUNNER_TEMP/audit-base"
+            git -C "$raiz" worktree add --detach -q "$arbol" "$base" || { echo "::error::audit: no pude preparar la base ${base:0:12}."; exit 2; }
+            enbase="$RUNNER_TEMP/audit-base.tsv"
+            : > "$enbase"
+            if [ -f "$arbol/$WORKDIR/pnpm-lock.yaml" ] || [ -f "$arbol/$WORKDIR/package-lock.json" ] || [ -f "$arbol/$WORKDIR/npm-shrinkwrap.json" ]; then
+              audita "$arbol/$WORKDIR" "$enbase" || exit 2
+            fi
+            nuevos="$RUNNER_TEMP/audit-nuevos.tsv"
+            viejos="$RUNNER_TEMP/audit-viejos.tsv"
+            # `FILENAME == ARGV[1]` y no `NR == FNR`: con la base vacia (la PR estrena el lockfile),
+            # `NR == FNR` tambien es cierto en el segundo fichero y todo pasaria por "ya estaba".
+            awk -F'\t' 'FILENAME == ARGV[1] { b[$1] = 1; next } !($1 in b)' "$enbase" "$cabeza" > "$nuevos"
+            awk -F'\t' 'FILENAME == ARGV[1] { b[$1] = 1; next }  ($1 in b)' "$enbase" "$cabeza" > "$viejos"
+          fi
+
+          if [ -n "$viejos" ] && [ -s "$viejos" ]; then
+            while IFS=$'\t' read -r id sev paq tit url; do
+              echo "::warning::$gestor audit: $id ($sev) en $paq ya estaba en la base; no lo trae este cambio. $tit $url"
+            done < "$viejos"
+            resumen "Avisos que ya estaban en la base (no cuentan aqui; los mide la ejecucion programada): $(wc -l < "$viejos")."
+          fi
+          if [ ! -s "$nuevos" ]; then
+            echo "audit ($gestor): este cambio no anade avisos >= $AUDIT_LEVEL."
+            resumen "Este cambio no anade avisos >= $AUDIT_LEVEL."
+            exit 0
+          fi
+          while IFS=$'\t' read -r id sev paq tit url; do
+            echo "::error::$gestor audit: $id ($sev) en $paq. $tit $url"
+          done < "$nuevos"
+          if [ -n "$base" ]; then que="que trae este cambio"; else que="en el estado actual"; fi
+          resumen "Avisos >= $AUDIT_LEVEL $que: $(wc -l < "$nuevos")." "" '```' "$(cut -f1-3 "$nuevos")" '```'
+          exit 1
