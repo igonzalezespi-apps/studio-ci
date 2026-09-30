@@ -1,0 +1,71 @@
+name: context-budget
+description: >-
+  Lo que Claude Code carga en cada sesion tiene presupuesto (CLAUDE.md, estilo, contrato,
+  descripciones de skills y agentes, parrafos fechados) y la configuracion que decide que se
+  carga resuelve a algo que existe (marketplace canonico con ref, outputStyle, claves personales,
+  model/effort de los agentes, pacto unico). La etiqueta de aprobacion deja pasar un exceso de
+  presupuesto; nunca un error de configuracion. Stack-agnostico: bash + python3, sin red.
+
+inputs:
+  path:
+    description: "Raiz del repo a revisar (hace falta un checkout antes)."
+    required: false
+    default: "."
+  mode:
+    description: "enforce (falla) o warn (solo avisa). Vacio = el del JSON de configuracion, o enforce."
+    required: false
+    default: ""
+  config:
+    description: "JSON de configuracion. Vacio = .github/context-budget.json o .context-budget.json si existen."
+    required: false
+    default: ""
+  approval-label:
+    description: "Etiqueta de la PR que aprueba un exceso de presupuesto (size, descriptions, dated)."
+    required: false
+    default: "presupuesto-contexto-aprobado"
+  labels:
+    description: "Etiquetas de la PR, separadas por comas. Por defecto, las del evento."
+    required: false
+    default: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+
+outputs:
+  violations:
+    description: "Numero de violaciones (0 en modo warn)."
+    value: ${{ steps.scan.outputs.violations }}
+  warnings:
+    description: "Numero de avisos."
+    value: ${{ steps.scan.outputs.warnings }}
+
+runs:
+  using: composite
+  steps:
+    # `bash` explicito: sin `shell:` una composite action no arranca.
+    - id: scan
+      shell: bash
+      env:
+        CB_PATH: ${{ inputs.path }}
+        CB_MODE: ${{ inputs.mode }}
+        CB_CONFIG: ${{ inputs.config }}
+        CB_APPROVAL: ${{ inputs.approval-label }}
+        CB_LABELS: ${{ inputs.labels }}
+      run: |
+        set -uo pipefail
+        # `$GITHUB_ACTION_PATH` es la raiz de ESTA action, no la del consumidor.
+        args=(--root "$CB_PATH" --approval-label "$CB_APPROVAL" --labels "$CB_LABELS" --annotations)
+        if [ -n "$CB_MODE" ]; then args+=(--mode "$CB_MODE"); fi
+        if [ -n "$CB_CONFIG" ]; then args+=(--config "$CB_CONFIG"); fi
+        # `|| rc=$?` Y NO `out=$(...); rc=$?`: el shell de un `run:` trae `-e` desde fuera, y una
+        # asignacion cuyo comando sale distinto de 0 mataria el paso antes de imprimir el
+        # hallazgo. Ya le paso a `check-action-pins` v0.6.0.
+        rc=0
+        out=$(bash "$GITHUB_ACTION_PATH/context-budget.sh" "${args[@]}" 2>&1) || rc=$?
+        printf '%s\n' "$out"
+        v=$(printf '%s\n' "$out" | sed -nE 's/^context-budget: ([0-9]+) violacion\(es\), ([0-9]+) aviso.*/\1/p' | tail -1)
+        w=$(printf '%s\n' "$out" | sed -nE 's/^context-budget: ([0-9]+) violacion\(es\), ([0-9]+) aviso.*/\2/p' | tail -1)
+        echo "violations=${v:-0}" >> "$GITHUB_OUTPUT"
+        echo "warnings=${w:-0}" >> "$GITHUB_OUTPUT"
+        {
+          echo "### context-budget"
+          printf '```\n%s\n```\n' "$(printf '%s\n' "$out" | grep -v '^::' || true)"
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit "$rc"

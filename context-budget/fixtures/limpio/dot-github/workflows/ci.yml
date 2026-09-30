@@ -1,0 +1,15 @@
+name: ci
+on: [pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # antes se clonaba desde igonzalezespi/claude-plugins: una linea de procedencia en un comentario no cuenta
+      - run: |
+          git clone --depth 1 --branch main \
+            https://github.com/igonzalezespi-apps/claude-plugins.git "$RUNNER_TEMP/plugins"
+      - uses: actions/checkout@v4
+        with:
+          repository: igonzalezespi-apps/claude-plugins
+          ref: main
+          path: plugins
