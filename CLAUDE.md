@@ -27,4 +27,4 @@ Reusable **composite GitHub Actions** for the maintainer's CI, one directory per
 ## Reserved to the maintainer (escalate, do not decide)
 
 Breaking an action's inputs/outputs (breaks every consumer) · making this repo private ·
-editing this contract · anything touching spend or a published release line.
+anything touching spend or a published release line.
