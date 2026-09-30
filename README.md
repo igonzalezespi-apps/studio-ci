@@ -165,6 +165,83 @@ jobs:
 No checkout needed: it reads the PR through the API. `label` changes the flag; `pr-number`/`repo`
 default to the event's.
 
+### `context-budget`
+
+What Claude Code loads into every session has a budget, and the repo configuration that decides
+*what* is loaded must resolve to something that exists. Eight checks, each named in the output:
+
+| check | what fails it |
+|---|---|
+| `size` | a file over its limit: root `CLAUDE.md` > 3,000 B, `**/output-styles/*.md` > 5,000 B, `**/contract-core.md` > 4,000 characters |
+| `descriptions` | a skill, command or agent `description` (+ `when_to_use`) > 250 characters; a plugin's skill listing (skills + commands without `disable-model-invocation`) summing > 6,000 |
+| `dated` | a dated paragraph or a «this line used to say» note in `CLAUDE.md`, `.claude/rules/**` or `contract-core.md` (history belongs in the commit message) |
+| `marketplace` | the canonical marketplace declared without `"ref": "main"`, or its legacy path in settings/workflows; a workflow that clones it without `--branch main` |
+| `output-style` | an `outputStyle` that does not resolve — Claude Code silently falls back to Default: a plugin style whose plugin is not enabled in the repo, a plugin that does not ship it, a project style that does not exist; optionally, not the agreed one |
+| `user-keys` | a personal key in the committed `.claude/settings.json` (`model`, `effortLevel`, `autoCompactWindow`, or a plugin from a marketplace the repo does not declare) |
+| `agents` | an agent without `model` or `effort` (Haiku is exempt from `effort`), or a read-only agent with `memory` — which grants Read/Write/Edit on its own |
+| `pact` | with a `TASKS.md`, not exactly one `contrato TASKS v2` line in `CLAUDE.md`, or another copy of the pact elsewhere |
+
+`size`, `descriptions` and `dated` are **budget** checks: the approval label (default
+`presupuesto-contexto-aprobado`, set by a person) lets an excess through, still listed as `APROB`.
+The other five are **configuration** checks, and no label makes a missing style exist. A line with
+`context-budget: allow` is skipped by `dated`, `marketplace` and `pact`. Exit `0` clean (warnings
+do not count), `1` violations, `2` could not measure (bad config, unknown flag) — never a silent `0`.
+
+```yaml
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled] # labeled: the approval label re-runs it
+
+permissions:
+  contents: read
+
+jobs:
+  context-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: igonzalezespi-apps/studio-ci/context-budget@vX.Y.Z
+        with:
+          mode: warn # report only, until the repo is on its diet; omit to enforce
+```
+
+Inputs: `path` (default `.`), `mode` (`enforce`|`warn`; empty = the config's, else `enforce`),
+`config`, `approval-label`, `labels` (default: the event's PR labels). Outputs: `violations`,
+`warnings`. Needs a checkout, `bash` and `python3` (stdlib only), no network, no token.
+
+**Per-repo config** — `.github/context-budget.json` (or `.context-budget.json`), every key optional,
+each one **replaces** the default (a list replaces the whole list):
+
+```json
+{
+  "mode": "enforce",
+  "limits": [{ "glob": "CLAUDE.md", "max_bytes": 3000 }, { "glob": "**/contract-core.md", "max_chars": 4000 }],
+  "description_max_chars": 250,
+  "plugin_description_sum_max_chars": 6000,
+  "output_style_expected": "core-dev:owner",
+  "warn_checks": ["marketplace"],
+  "skip_checks": [],
+  "exclude": ["**/node_modules/**", "**/fixtures/**", "**/tests/**"]
+}
+```
+
+The rest (`dated_globs`, `marketplace`, `forbidden_settings_keys`, `allowed_plugin_marketplaces`,
+`pact`, `plugin_description_sum_kinds`) is documented in the defaults at the top of
+`context-budget/context-budget.sh`. An unknown key is an error, not a silent no-op.
+
+**Locally or as a pre-commit** (a repo without CI) — the script is self-contained, so one copy is
+enough:
+
+```sh
+bash context-budget.sh --root . --marketplaces-dir ~/.claude/plugins/marketplaces
+# .githooks/pre-commit
+exec bash scripts/context-budget.sh --root "$(git rev-parse --show-toplevel)"
+```
+
+`--marketplaces-dir` lets `output-style` confirm that a plugin's style really exists; without it
+(as in CI, unless the repo *is* the marketplace) that one fact is reported as not verifiable
+instead of guessed. In a git work tree only tracked and non-ignored files are measured.
+
 ## Release control plane
 
 Three composite actions form the homogeneous release mechanism shared by every consumer repo: derive

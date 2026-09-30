@@ -1,0 +1,16 @@
+{
+  "outputStyle": "nucleo:dueno",
+  "enabledPlugins": {
+    "nucleo@ivan": true
+  },
+  "extraKnownMarketplaces": {
+    "ivan": {
+      "source": {
+        "source": "github",
+        "repo": "igonzalezespi-apps/claude-plugins",
+        "ref": "main"
+      },
+      "autoUpdate": true
+    }
+  }
+}
