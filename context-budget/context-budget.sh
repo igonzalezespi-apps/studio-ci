@@ -22,7 +22,9 @@
 #   user-keys     ninguna clave personal en el settings versionado del repo
 #   agents        cada agente declara `model` y `effort`, y ninguno de solo lectura lleva
 #                 `memory` (que concede Read/Write/Edit por su cuenta)
-#   pact          con `TASKS.md`, exactamente una linea del pacto en CLAUDE.md y ninguna copia
+#   pact          si el repo usa el tablero, exactamente una linea del pacto en CLAUDE.md y
+#                 ninguna copia. Lo decide `pact.required` o, sin el, lo versionado (no solo
+#                 un `TASKS.md` en disco, que los consumidores ignoran en git)
 #
 # Las tres primeras son de PRESUPUESTO: la etiqueta de aprobacion (por defecto
 # `presupuesto-contexto-aprobado`, que pone una persona) las deja pasar sin ocultarlas. Las
@@ -95,6 +97,9 @@ DEFAULTS = {
     "forbidden_settings_keys": ["model", "effortLevel", "autoCompactWindow"],
     "allowed_plugin_marketplaces": [],
     "pact": {
+        # true: aplica siempre; false: no aplica; null: se deduce (ver `pact_applies`).
+        "required": None,
+        "plugin": "tablero",
         "tasks_file": "TASKS.md",
         "marker": "contrato TASKS v2",
         "aliases": ["pacto tablero", "tablero pact"],
@@ -203,6 +208,10 @@ for key in ("warn_checks", "skip_checks", "exclude", "dated_globs", "forbidden_s
             "allowed_plugin_marketplaces", "plugin_description_sum_kinds"):
     if not isinstance(cfg[key], list):
         die("'%s' tiene que ser una lista" % key)
+# `is None`/bool y no `in (None, True, False)`: en Python 0 == False y 1 == True.
+_req = cfg["pact"].get("required") if isinstance(cfg["pact"], dict) else None
+if not (_req is None or isinstance(_req, bool)):
+    die("'pact.required' tiene que ser true, false o no estar; no vale %s" % json.dumps(_req))
 
 MODE = opt["mode"] or cfg.get("mode") or "enforce"
 if MODE not in ("enforce", "warn"):
@@ -785,28 +794,74 @@ def check_agents():
 
 
 # ---------------------------------------------------------------------------------------------
-# pact — con TASKS.md, una linea del pacto en CLAUDE.md y ninguna copia
+# pact — si el repo usa el tablero, una linea del pacto en CLAUDE.md y ninguna copia
 # ---------------------------------------------------------------------------------------------
+# Una entrada de lista (`- `, `* `, `+ `, `1. `), tambien dentro de una cita. En CLAUDE.md un
+# alias solo cuenta como copia del pacto si encabeza una ENTRADA: las copias v1 reales son
+# siempre una regla de la lista, y una frase que solo nombra el pacto (al contar que inyecta el
+# contrato, p. ej.) no lo copia. En los demas ficheros cualquier linea cuenta, como antes: ahi
+# el pacto no pinta nada, y una regla por ruta suele ir en prosa.
+LIST_ITEM_RX = re.compile(r"^\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s+")
+
+
+def pact_line(ln, marker, alias_rx):
+    """La linea es del pacto: lleva el marcador, o es una entrada de lista con un alias."""
+    return bool(marker and marker in ln) or (bool(LIST_ITEM_RX.match(ln)) and any(r.search(ln) for r in alias_rx))
+
+
+def pact_applies(pc, main, lines, marker, alias_rx):
+    """(aplica, motivo). `pact.required` manda; sin el, se deduce del repo.
+
+    POR QUE NO BASTA `TASKS.md`. Es un fichero local de cada maquina y los consumidores lo
+    llevan en `.gitignore`: en el checkout de CI no existe nunca, y el check no actuaba. Por eso
+    cuenta tambien lo VERSIONADO: el plugin del tablero habilitado en `.claude/settings.json`
+    (no en `settings.local.json`, que es personal y tampoco llega a CI) o el pacto ya escrito en
+    CLAUDE.md, para que una copia duplicada o v1 se vea aunque no haya `TASKS.md`."""
+    req = pc.get("required")
+    if req is not None:
+        return req, "pact.required es %s" % ("true" if req else "false")
+    tasks = pc.get("tasks_file") or "TASKS.md"
+    plugin = pc.get("plugin") or "tablero"
+    why = []
+    if os.path.isfile(os.path.join(ROOT, tasks)):
+        why.append("%s en disco" % tasks)
+    st = SETTINGS.get(".claude/settings.json")
+    ep = st.get("enabledPlugins") if isinstance(st, dict) else None
+    if isinstance(ep, dict):
+        on = sorted(k for k, v in ep.items() if v and "@" in k and k.rsplit("@", 1)[0] == plugin)
+        if on:
+            why.append("%s habilitado en .claude/settings.json" % on[0])
+    for n, ln in enumerate(lines, 1):
+        if ALLOW_MARK not in ln and pact_line(ln, marker, alias_rx):
+            why.append("%s:%d lleva el pacto" % (main, n))
+            break
+    if why:
+        return True, ", ".join(why)
+    return False, "sin %s: no aplica (tampoco hay %s habilitado ni el pacto en %s)" % (tasks, plugin, main)
+
+
 def check_pact():
     pc = cfg["pact"]
-    tasks = pc.get("tasks_file") or "TASKS.md"
-    if not os.path.isfile(os.path.join(ROOT, tasks)):
-        notes["pact"].append("sin %s: no aplica" % tasks)
-        return
-    examined["pact"] += 1
     marker = pc.get("marker") or ""
     alias_rx = [re.compile(re.escape(a), re.I) for a in pc.get("aliases") or []]
     main = "CLAUDE.md" if os.path.isfile(os.path.join(ROOT, "CLAUDE.md")) else ".claude/CLAUDE.md"
-    if not os.path.isfile(os.path.join(ROOT, main)):
-        add("pact", "CLAUDE.md", 0, "hay %s y no hay CLAUDE.md con la linea del pacto" % tasks)
+    has_main = os.path.isfile(os.path.join(ROOT, main))
+    lines = read_text(main).split("\n") if has_main else []
+    applies, why = pact_applies(pc, main, lines, marker, alias_rx)
+    if not applies:
+        notes["pact"].append(why if why.startswith("sin ") else "no aplica: " + why)
         return
-    lines = read_text(main).split("\n")
+    examined["pact"] += 1
+    notes["pact"].append("aplica: " + why)
+    if not has_main:
+        add("pact", "CLAUDE.md", 0, "no hay CLAUDE.md con la linea del pacto (aplica: %s)" % why)
+        return
     marked = [n for n, ln in enumerate(lines, 1) if marker in ln]
     if len(marked) != 1:
         add("pact", main, marked[1] if len(marked) > 1 else 0,
-            "%d linea(s) con «%s»: tiene que haber exactamente una" % (len(marked), marker))
+            "%d linea(s) con «%s»: tiene que haber exactamente una (aplica: %s)" % (len(marked), marker, why))
     for n, ln in enumerate(lines, 1):
-        if n not in marked and any(r.search(ln) for r in alias_rx) and ALLOW_MARK not in ln:
+        if n not in marked and ALLOW_MARK not in ln and pact_line(ln, "", alias_rx):
             add("pact", main, n, "copia vieja del pacto fuera de la linea «%s»" % marker)
     for f in FILES:
         if f == main or not matches(f, pc.get("copy_globs") or []):

@@ -179,7 +179,7 @@ What Claude Code loads into every session has a budget, and the repo configurati
 | `output-style` | an `outputStyle` that does not resolve — Claude Code silently falls back to Default: a plugin style whose plugin is not enabled in the repo, a plugin that does not ship it, a project style that does not exist; optionally, not the agreed one |
 | `user-keys` | a personal key in the committed `.claude/settings.json` (`model`, `effortLevel`, `autoCompactWindow`, or a plugin from a marketplace the repo does not declare) |
 | `agents` | an agent without `model` or `effort` (Haiku is exempt from `effort`), or a read-only agent with `memory` — which grants Read/Write/Edit on its own |
-| `pact` | with a `TASKS.md`, not exactly one `contrato TASKS v2` line in `CLAUDE.md`, or another copy of the pact elsewhere |
+| `pact` | when the pact applies, not exactly one `contrato TASKS v2` line in `CLAUDE.md`, an old copy (a list entry with an alias such as `Tablero pact`) or another copy of the pact elsewhere |
 
 `size`, `descriptions` and `dated` are **budget** checks: the approval label (default
 `presupuesto-contexto-aprobado`, set by a person) lets an excess through, still listed as `APROB`.
@@ -228,6 +228,13 @@ each one **replaces** the default (a list replaces the whole list):
 The rest (`dated_globs`, `marketplace`, `forbidden_settings_keys`, `allowed_plugin_marketplaces`,
 `pact`, `plugin_description_sum_kinds`) is documented in the defaults at the top of
 `context-budget/context-budget.sh`. An unknown key is an error, not a silent no-op.
+
+**When `pact` applies** — `"pact": {"required": true}` always, `false` never. Without the key it is
+inferred from what is committed, because `TASKS.md` is usually in `.gitignore` and never reaches a
+CI checkout: it applies if there is a `TASKS.md` on disk, if the committed `.claude/settings.json`
+enables `tablero@<marketplace>`, or if `CLAUDE.md` already carries the marker or an alias on a list
+entry (so a duplicated or v1 pact is caught without `TASKS.md`). The check's line says why it
+applies, or why not.
 
 **Locally or as a pre-commit** (a repo without CI) — the script is self-contained, so one copy is
 enough:

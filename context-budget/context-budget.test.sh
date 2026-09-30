@@ -202,7 +202,38 @@ caso 1 "copia vieja del pacto (v1) junto a la buena" "copia vieja del pacto" \
   'echo "- **Tablero pact** — registro por repo y traspaso en TASKS.md." >> CLAUDE.md'
 caso 1 "copia del pacto en una regla por ruta" "FAIL  [pact] .claude/rules/tablero.md:1: otra copia del pacto" \
   'mkdir -p .claude/rules && echo "Pacto Tablero: deja la entrada en A medias." > .claude/rules/tablero.md'
-caso 0 "sin TASKS.md el pacto no aplica" "sin TASKS.md: no aplica" 'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md'
+caso 0 "sin TASKS.md, sin tablero y sin marcador el pacto no aplica" "sin TASKS.md: no aplica" 'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md'
+# `TASKS.md` va en el .gitignore de los consumidores: en CI no existe nunca. Lo que decide es
+# lo versionado (el tablero habilitado, el pacto en CLAUDE.md) o `pact.required`.
+caso 1 "sin TASKS.md y con el tablero habilitado: falta la linea" "0 linea(s) con «contrato TASKS v2»: tiene que haber exactamente una (aplica: tablero@ivan habilitado" \
+  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; jqset .claude/settings.json "d[\"enabledPlugins\"][\"tablero@ivan\"]=True"'
+caso 0 "sin TASKS.md y con el tablero habilitado: la linea esta" "OK    [pact] 1 revisado(s): aplica: tablero@ivan habilitado" \
+  'rm TASKS.md; jqset .claude/settings.json "d[\"enabledPlugins\"][\"tablero@ivan\"]=True"'
+caso 0 "el tablero deshabilitado (false) no hace aplicar el pacto" "sin TASKS.md: no aplica" \
+  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; jqset .claude/settings.json "d[\"enabledPlugins\"][\"tablero@ivan\"]=False"'
+caso 0 "el tablero en settings.local.json (personal, no llega a CI) no cuenta" "sin TASKS.md: no aplica" \
+  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; echo "{\"enabledPlugins\": {\"tablero@ivan\": true}}" > .claude/settings.local.json'
+caso 1 "sin TASKS.md y con pact.required true: aplica" "(aplica: pact.required es true)" \
+  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; echo "{\"pact\": {\"required\": true}}" > .github/context-budget.json'
+caso 1 "pact.required true sin CLAUDE.md" "no hay CLAUDE.md con la linea del pacto (aplica: pact.required es true)" \
+  'rm TASKS.md CLAUDE.md; echo "{\"pact\": {\"required\": true}}" > .github/context-budget.json'
+caso 0 "pact.required false: no aplica aunque haya TASKS.md y copias" "no aplica: pact.required es false" \
+  'echo "- Otra vez el contrato TASKS v2." >> CLAUDE.md; echo "{\"pact\": {\"required\": false}}" > .github/context-budget.json'
+caso 2 "pact.required que no es booleano" "'pact.required' tiene que ser true, false o no estar" \
+  'echo "{\"pact\": {\"required\": \"si\"}}" > .github/context-budget.json'
+caso 1 "sin TASKS.md, un pacto duplicado en CLAUDE.md se ve igual" "2 linea(s) con «contrato TASKS v2»" \
+  'rm TASKS.md; echo "- Otra vez el contrato TASKS v2." >> CLAUDE.md'
+caso 1 "sin TASKS.md, un pacto v1 en CLAUDE.md se ve igual" "FAIL  [pact] CLAUDE.md:11: copia vieja del pacto" \
+  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; echo "- **Tablero pact** — registro por repo y traspaso en TASKS.md." >> CLAUDE.md'
+# Un alias en CLAUDE.md solo es copia si encabeza una entrada de lista. Una frase que nombra el
+# pacto al contar lo que inyecta el contrato no lo copia; su pareja es el caso «copia vieja» de
+# arriba, que es una entrada y falla.
+caso 0 "una frase que nombra el pacto no es una copia" "OK    [pact] 1 revisado(s)" \
+  'printf "\n> The contract (hard core, rules, language, tablero pact) is injected every session.\n" >> CLAUDE.md'
+caso 0 "una frase que nombra el pacto no hace aplicar el check" "sin TASKS.md: no aplica" \
+  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; printf "\n> The contract (hard core, rules, language, tablero pact) is injected.\n" >> CLAUDE.md'
+caso 1 "un alias en una entrada de lista dentro de una cita si es copia" "copia vieja del pacto" \
+  'printf "\n> - Tablero pact: registro por repo.\n" >> CLAUDE.md'
 
 # --- etiqueta de aprobacion y modos -----------------------------------------------------------
 caso 0 "exceso de presupuesto CON la etiqueta: aprobado y visible" "APROB [size] CLAUDE.md" \
