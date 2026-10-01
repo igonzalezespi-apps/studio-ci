@@ -21,6 +21,10 @@ FIX="$HERE/fixtures/limpio"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0
 R="$TMP/repo"
+# git hermetico: sin la configuracion del usuario (un excludesFile global cambiaria lo que se
+# añade) y sin las variables que exporta un hook, por si esta suite corre dentro de uno.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
 prepara() { # copia el fixture a $R con los nombres reales
   rm -rf "$R"; cp -R "$FIX" "$R"
@@ -52,6 +56,11 @@ t = re.sub(r"^description:.*?(?=^[a-z_-]+:|^---)", "description: " + "d" * n + "
 open(p, "w", encoding="utf-8").write(t)
 PYD
 }
+
+# grande <fichero> <bytes>: un CLAUDE.md de N bytes que conserva la linea del pacto
+grande() { python3 -c 'import sys;h="- contrato TASKS v2\n";open(sys.argv[1],"w").write(h+"x"*(int(sys.argv[2])-len(h)))' "$1" "$2"; }
+# indexa: convierte el fixture en un repo git con todo en el indice (basta el indice, sin commit)
+indexa() { git init -q && git add -A; }
 
 # caso <exit-esperado> <etiqueta> <texto-que-debe-salir> <mutacion> [args del script...]
 caso() {
@@ -163,6 +172,27 @@ caso 0 "plugin externo con copia del marketplace que trae el estilo" "ajeno:duen
   'jqset .claude/settings.json "d[\"outputStyle\"]=\"ajeno:dueno\"; d[\"enabledPlugins\"][\"ajeno@ivan\"]=True"' --marketplaces-dir "$mk"
 caso 1 "plugin externo con copia del marketplace que NO trae el estilo" "no trae el estilo otro" \
   'jqset .claude/settings.json "d[\"outputStyle\"]=\"ajeno:otro\"; d[\"enabledPlugins\"][\"ajeno@ivan\"]=True"' --marketplaces-dir "$mk"
+# Claude Code busca `outputStyle` por clave EXACTA (2.1.286: probado con `claude -p` en un
+# sandbox). Cada caso que falla tiene al lado su pareja con el nombre exacto, que pasa.
+caso 1 "estilo del proyecto con otras mayusculas: cae a Default" \
+  'outputStyle "Breve" no es un estilo integrado ni esta en .claude/output-styles/: cae a Default en silencio (Claude Code distingue mayusculas: existe "breve")' \
+  'jqset .claude/settings.json "d[\"outputStyle\"]=\"Breve\""'
+caso 1 "integrado en minusculas: no es el integrado" '(Claude Code distingue mayusculas: existe "Explanatory")' \
+  'jqset .claude/settings.json "d[\"outputStyle\"]=\"explanatory\""'
+caso 0 "integrado con sus mayusculas (Proactive)" "Proactive (integrado)" 'jqset .claude/settings.json "d[\"outputStyle\"]=\"Proactive\""'
+caso 0 "«Default» con mayuscula acaba en Default, que es lo pedido" "Default (integrado)" \
+  'jqset .claude/settings.json "d[\"outputStyle\"]=\"Default\""'
+caso 1 "estilo de plugin con otras mayusculas" 'no trae el estilo Dueno (trae: dueno) (Claude Code distingue mayusculas: existe "dueno")' \
+  'jqset .claude/settings.json "d[\"outputStyle\"]=\"nucleo:Dueno\""'
+# el `name:` del frontmatter SUSTITUYE al nombre del fichero: `fichero.md` con `name: otro` es «otro»
+caso 1 "el nombre del fichero no vale si el frontmatter trae name" 'outputStyle "fichero" no es un estilo integrado' \
+  'printf -- "---\nname: otro\n---\nx\n" > .claude/output-styles/fichero.md; jqset .claude/settings.json "d[\"outputStyle\"]=\"fichero\""'
+caso 0 "el name del frontmatter si vale" "otro (.claude/output-styles)" \
+  'printf -- "---\nname: otro\n---\nx\n" > .claude/output-styles/fichero.md; jqset .claude/settings.json "d[\"outputStyle\"]=\"otro\""'
+caso 0 "sin name en el frontmatter vale el nombre del fichero" "sinnombre (.claude/output-styles)" \
+  'printf -- "---\ndescription: x\n---\nx\n" > .claude/output-styles/sinnombre.md; jqset .claude/settings.json "d[\"outputStyle\"]=\"sinnombre\""'
+caso 1 "estilo de plugin: el nombre del fichero no vale si trae name" "no trae el estilo fichero (trae: dueno, otro)" \
+  'printf -- "---\nname: otro\n---\nx\n" > plugins/nucleo/output-styles/fichero.md; jqset .claude/settings.json "d[\"outputStyle\"]=\"nucleo:fichero\""'
 caso 1 "estilo distinto del acordado" 'outputStyle "breve", y el acordado es "nucleo:dueno"' \
   'jqset .claude/settings.json "d[\"outputStyle\"]=\"breve\""; echo "{\"output_style_expected\": \"nucleo:dueno\"}" > .context-budget.json'
 caso 1 "sin estilo cuando hay uno acordado" "outputStyle sin declarar" \
@@ -278,6 +308,124 @@ if [ "$rc" -eq 0 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); printf 'FA
 out="$(bash "$CHECK" --root "$R" 2>&1)"; rc=$?
 if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF ".claude/rules/local.md:1"; then pass=$((pass + 1)); else
   fail=$((fail + 1)); printf 'FAIL  el mismo fichero sin ignorar no se midio (exit %s)\n%s\n' "$rc" "$out"; fi
+
+# --- --staged: lo que se va a commitear, no el arbol de trabajo -------------------------------
+# Cada caso con su pareja SIN --staged sobre el mismo arbol: la diferencia es la fuente, no el
+# fixture.
+caso 0 "--staged: un CLAUDE.md grande en disco y SIN añadir no bloquea" "$LIMPIO" \
+  'indexa && grande CLAUDE.md 4000' --staged
+caso 1 "sin --staged, el mismo CLAUDE.md en disco si cuenta" "FAIL  [size] CLAUDE.md: 4.000 B > 3.000 B" \
+  'indexa && grande CLAUDE.md 4000'
+caso 1 "--staged: un CLAUDE.md grande añadido cuenta aunque el disco este bien" "FAIL  [size] CLAUDE.md: 4.000 B > 3.000 B" \
+  'cp CLAUDE.md ../bien.md && grande CLAUDE.md 4000 && indexa && cp ../bien.md CLAUDE.md' --staged
+caso 0 "sin --staged, el mismo caso mide el disco, que esta bien" "$LIMPIO" \
+  'cp CLAUDE.md ../bien.md && grande CLAUDE.md 4000 && indexa && cp ../bien.md CLAUDE.md'
+caso 0 "--staged: la linea del resumen dice que mide el indice" "fichero(s) en el indice)." 'indexa' --staged
+caso 1 "--staged: los ajustes se leen del indice" '"model" es un ajuste personal' \
+  'cp .claude/settings.json ../s.json && jqset .claude/settings.json "d[\"model\"]=\"opus\"" && indexa && cp ../s.json .claude/settings.json' --staged
+caso 0 "--staged: un ajuste cambiado en disco y sin añadir no cuenta" "$LIMPIO" \
+  'indexa && jqset .claude/settings.json "d[\"model\"]=\"opus\""' --staged
+caso 0 "--staged: un fichero quitado del indice no se mide" "$LIMPIO" \
+  'sed -i "/^effort:/d" .claude/agents/lector.md && indexa && git rm -q --cached .claude/agents/lector.md' --staged
+caso 1 "sin --staged, el mismo fichero (sin seguimiento, no ignorado) si" "FAIL  [agents] .claude/agents/lector.md:1: sin effort" \
+  'sed -i "/^effort:/d" .claude/agents/lector.md && indexa && git rm -q --cached .claude/agents/lector.md'
+caso 0 "--staged: un fichero nuevo sin añadir no existe" "$LIMPIO" \
+  'indexa && mkdir -p .claude/rules && echo "Desde el 2026-09-29." > .claude/rules/nueva.md' --staged
+caso 1 "sin --staged, el mismo fichero nuevo si" "FAIL  [dated] .claude/rules/nueva.md:1" \
+  'indexa && mkdir -p .claude/rules && echo "Desde el 2026-09-29." > .claude/rules/nueva.md'
+caso 0 "--staged: el estilo del proyecto se busca en el indice" "breve (.claude/output-styles)" \
+  'jqset .claude/settings.json "d[\"outputStyle\"]=\"breve\"" && indexa && rm .claude/output-styles/breve.md' --staged
+caso 1 "sin --staged, el mismo estilo borrado del disco no existe" 'outputStyle "breve" no es un estilo integrado' \
+  'jqset .claude/settings.json "d[\"outputStyle\"]=\"breve\"" && indexa && rm .claude/output-styles/breve.md'
+caso 1 "--staged: un estilo de plugin que solo esta en disco no existe" "no trae el estilo nuevo (trae: dueno)" \
+  'indexa && printf -- "---\nname: nuevo\n---\nx\n" > plugins/nucleo/output-styles/nuevo.md && jqset .claude/settings.json "d[\"outputStyle\"]=\"nucleo:nuevo\"" && git add .claude/settings.json' --staged
+caso 0 "--staged: el mismo estilo de plugin, añadido, resuelve" "nucleo:nuevo (resuelve)" \
+  'printf -- "---\nname: nuevo\n---\nx\n" > plugins/nucleo/output-styles/nuevo.md && jqset .claude/settings.json "d[\"outputStyle\"]=\"nucleo:nuevo\"" && indexa' --staged
+caso 0 "--staged: una configuracion sin añadir no cuenta" "$LIMPIO" \
+  'indexa && echo "{\"limits\": [{\"glob\": \"CLAUDE.md\", \"max_bytes\": 100}]}" > .github/context-budget.json' --staged
+caso 1 "--staged: la misma configuracion, añadida, si" "FAIL  [size] CLAUDE.md" \
+  'echo "{\"limits\": [{\"glob\": \"CLAUDE.md\", \"max_bytes\": 100}]}" > .github/context-budget.json && indexa' --staged
+caso 0 "--staged: un TASKS.md ignorado no hace aplicar el pacto (como en CI)" "sin TASKS.md: no aplica" \
+  'sed -i "/contrato TASKS v2/d" CLAUDE.md && echo TASKS.md > .gitignore && indexa' --staged
+caso 1 "sin --staged, el mismo TASKS.md en disco si" "0 linea(s) con «contrato TASKS v2»: tiene que haber exactamente una (aplica: TASKS.md en disco" \
+  'sed -i "/contrato TASKS v2/d" CLAUDE.md && echo TASKS.md > .gitignore && indexa'
+caso 0 "--staged: un TASKS.md añadido si hace aplicar el pacto" "aplica: TASKS.md en el indice" 'indexa' --staged
+# un CLAUDE.md que es un enlace simbolico se sigue DENTRO del indice: cuenta el destino añadido
+caso 1 "--staged: un CLAUDE.md enlace simbolico mide el destino del indice" "FAIL  [size] CLAUDE.md: 4.000 B" \
+  'mkdir -p docs && grande docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && grande docs/raiz.md 2000' --staged
+caso 0 "sin --staged, el mismo enlace mide el destino en disco" "$LIMPIO" \
+  'mkdir -p docs && grande docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && grande docs/raiz.md 2000'
+caso 2 "--staged fuera de un repo git: no se puede medir" "--staged necesita que --root" ":" --staged
+caso 2 "--staged en un subdirectorio del repo: no se puede medir" "--staged necesita que --root" \
+  'indexa && mkdir -p sub && touch sub/x && git add sub/x' --staged --root "$R/sub"
+
+# --- --quiet: solo hallazgos --------------------------------------------------------------------
+# corre <mutacion> [args...]: deja la salida en $out y el exit en $rc
+corre() {
+  prepara
+  ( cd "$R" && eval "$1" ) || { rc=99; out="(la mutacion no se pudo aplicar)"; return; }
+  shift; rc=0; out="$(bash "$CHECK" --root "$R" "$@" 2>&1)" || rc=$?
+}
+# comprueba <etiqueta> <condicion>: la condicion se evalua con $out y $rc
+comprueba() {
+  if eval "$2"; then pass=$((pass + 1)); else fail=$((fail + 1)); printf 'FAIL  %s (exit %s)\n%s\n' "$1" "$rc" "$out"; fi
+}
+lineas() { printf '%s\n' "$out" | grep -c .; }
+corre ":" --quiet
+comprueba "--quiet con todo limpio: exit 0 y ni una linea" '[ "$rc" -eq 0 ] && [ -z "$out" ]'
+corre ":"
+comprueba "sin --quiet, lo de siempre: una linea OK por comprobacion y el resumen" \
+  '[ "$rc" -eq 0 ] && [ "$(printf "%s\n" "$out" | grep -c "^OK    \[")" -eq 8 ] && printf "%s\n" "$out" | grep -qF "$LIMPIO"'
+corre 'jqset .claude/settings.json "d[\"model\"]=\"opus\""' --quiet
+comprueba "--quiet con una violacion: su linea y el resumen, nada mas" \
+  '[ "$rc" -eq 1 ] && [ "$(lineas)" -eq 2 ] && printf "%s\n" "$out" | head -1 | grep -q "^FAIL  \[user-keys\]" && printf "%s\n" "$out" | tail -1 | grep -qF "context-budget: 1 violacion(es), 0 aviso(s)"'
+corre 'jqset .claude/settings.json "d[\"model\"]=\"opus\""' --quiet --mode warn
+comprueba "--quiet con un aviso: WARN y el resumen" \
+  '[ "$rc" -eq 0 ] && [ "$(lineas)" -eq 2 ] && printf "%s\n" "$out" | head -1 | grep -q "^WARN  \[user-keys\]"'
+corre 'grande CLAUDE.md 4000' --quiet --labels presupuesto-contexto-aprobado
+comprueba "--quiet con un exceso aprobado: APROB y el resumen" \
+  '[ "$rc" -eq 0 ] && [ "$(lineas)" -eq 2 ] && printf "%s\n" "$out" | head -1 | grep -q "^APROB \[size\] CLAUDE.md"'
+corre 'grande CLAUDE.md 4000' --quiet
+comprueba "--quiet con un exceso sin aprobar: FAIL, resumen y como se aprueba; ni OK ni --" \
+  '[ "$rc" -eq 1 ] && [ "$(lineas)" -eq 3 ] && printf "%s\n" "$out" | grep -q "solo lo aprueba una persona" && ! printf "%s\n" "$out" | grep -qE "^(OK|--)"'
+corre 'echo "{ roto" > .github/context-budget.json' --quiet
+comprueba "--quiet no calla un error de medida (exit 2)" '[ "$rc" -eq 2 ] && printf "%s\n" "$out" | grep -qF "configuracion ilegible"'
+corre 'jqset .claude/settings.json "d[\"model\"]=\"opus\""' --quiet --annotations
+comprueba "--quiet conserva las anotaciones de GitHub" '[ "$rc" -eq 1 ] && printf "%s\n" "$out" | grep -q "^::error "'
+corre 'jqset .claude/settings.json "d[\"model\"]=\"opus\""' --quiet --mode warn --annotations
+comprueba "--quiet en modo warn con anotaciones: el aviso sale como ::warning" '[ "$rc" -eq 0 ] && printf "%s\n" "$out" | grep -q "^::warning "'
+
+# --- de punta a punta: el pre-commit del README con `git commit` de verdad ---------------------
+# Git exporta GIT_INDEX_FILE al hook: `commit -a` y `commit -- ruta` miden su indice temporal.
+prepara
+mkdir -p "$R/.githooks"
+printf '#!/bin/sh\nexec bash "%s" --root "$(git rev-parse --show-toplevel)" --staged --quiet\n' "$CHECK" > "$R/.githooks/pre-commit"
+chmod +x "$R/.githooks/pre-commit"
+g() { git -C "$R" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false "$@"; }
+confirma() { # confirma <exit-esperado> <etiqueta> <texto-o-vacio> <args de git commit...>
+  local want="$1" label="$2" esperado="$3"; shift 3
+  rc=0; out="$(g commit -q "$@" 2>&1)" || rc=$?
+  if [ "$rc" -ne "$want" ]; then
+    fail=$((fail + 1)); printf 'FAIL  pre-commit: %s (esperaba exit %s, salio %s)\n%s\n' "$label" "$want" "$rc" "$out"; return
+  fi
+  if [ -n "$esperado" ] && ! printf '%s' "$out" | grep -qF -- "$esperado"; then
+    fail=$((fail + 1)); printf 'FAIL  pre-commit: %s: la salida no dice «%s»\n%s\n' "$label" "$esperado" "$out"; return
+  fi
+  if [ -z "$esperado" ] && [ -n "$out" ]; then
+    fail=$((fail + 1)); printf 'FAIL  pre-commit: %s: con --quiet y todo bien no debia imprimir nada\n%s\n' "$label" "$out"; return
+  fi
+  pass=$((pass + 1))
+}
+g init -q && g config core.hooksPath .githooks && g add -A
+confirma 0 "el commit limpio entra sin imprimir nada" "" -m inicial
+grande "$R/CLAUDE.md" 4000
+echo "otra linea" >> "$R/README.md"; g add README.md
+confirma 0 "un CLAUDE.md grande sin añadir no bloquea un commit que no lo toca" "" -m "toca el README"
+confirma 1 "commit -a se lleva el CLAUDE.md grande: se rechaza" "FAIL  [size] CLAUDE.md: 4.000 B" -a -m todo
+g add CLAUDE.md; g show HEAD:CLAUDE.md > "$R/CLAUDE.md"
+confirma 1 "CLAUDE.md grande añadido y bien en disco: se rechaza" "FAIL  [size] CLAUDE.md: 4.000 B" -m grande
+echo "y otra" >> "$R/README.md"
+confirma 0 "commit -- README.md no se lleva el CLAUDE.md añadido: entra" "" -m "solo el README" -- README.md
 
 echo "----------------------------------------"
 [ "$fail" -eq 0 ] && { echo "OK: $pass/$((pass + fail)) casos pasan"; exit 0; }
