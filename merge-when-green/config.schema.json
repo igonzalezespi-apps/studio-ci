@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/igonzalezespi-apps/studio-ci/merge-when-green/config.schema.json",
+  "title": "merge-when-green configuration (.github/merge-when-green.json, read from the integration branch)",
+  "description": "This file is riesgo-3 itself: a PR cannot relax its own gate, and the gate never reads it from the PR's head.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "required_checks", "required_push_checks"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "version": {"const": 1},
+    "max_auto_class": {
+      "type": "integer", "minimum": 0, "maximum": 2, "default": 0,
+      "description": "Highest riesgo class merged without the owner. 1 and 2 need a lens verdict pinned to the head SHA (verdict_authors)."
+    },
+    "required_checks": {
+      "type": "array", "minItems": 1,
+      "description": "Jobs that must be green on the PR's head, keyed by workflow FILE and job name.",
+      "items": {"$ref": "#/$defs/check"}
+    },
+    "required_push_checks": {
+      "type": "array", "minItems": 1,
+      "description": "Jobs that must be green on a push to the integration branch: the signal of develop-health (revert-on-red).",
+      "items": {"$ref": "#/$defs/check"}
+    },
+    "state_workflows": {
+      "type": "array", "items": {"type": "string"}, "default": [],
+      "description": "Workflow files that re-read live PR state (labels, title, body) on every event; for them the latest run is the truth. Every other workflow: a failed run is cleared only by a re-run of that same run."
+    },
+    "settle_seconds": {"type": "integer", "minimum": 0, "maximum": 900, "default": 120},
+    "risk_paths": {
+      "type": "array", "default": [],
+      "description": "Repo-specific surfaces. They can only RAISE a class.",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["glob", "class"],
+        "properties": {"glob": {"type": "string"}, "class": {"type": "integer", "minimum": 0, "maximum": 4}, "why": {"type": "string"}}
+      }
+    },
+    "bot_authors": {"type": "array", "items": {"type": "string"}, "default": ["renovate[bot]"]},
+    "renovate_minor_class": {
+      "type": "integer", "minimum": 0, "maximum": 4, "default": 3,
+      "description": "Class of a dependency-bot PR that only bumps versions (every commit the bot's, no install hooks, no foreign registry). 3 keeps them with the owner; lowering it is the owner's decision."
+    },
+    "app_slug": {"type": "string", "description": "Slug of the merge App: its merges are the only ones develop-health reverts."},
+    "verdict_authors": {"type": "array", "items": {"type": "string"}, "default": []},
+    "pr_score": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"total": {"type": "integer"}, "axis_min": {"type": "integer"}},
+      "default": {"total": 22, "axis_min": 4}
+    },
+    "max_reverts_per_day": {"type": "integer", "minimum": 0, "default": 1},
+    "max_candidates": {"type": "integer", "minimum": 1, "default": 5}
+  },
+  "$defs": {
+    "check": {
+      "type": "object", "additionalProperties": false, "required": ["workflow", "job"],
+      "properties": {"workflow": {"type": "string", "description": "file name, e.g. ci.yml"}, "job": {"type": "string", "description": "the job's name as GitHub shows it"}}
+    }
+  }
+}

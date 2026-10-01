@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "max_auto_class": 0,
+  "required_checks": [{"workflow": "ci.yml", "job": "validate actions"}],
+  "required_push_checks": [{"workflow": "ci.yml", "job": "validate actions"}],
+  "state_workflows": ["pr-tldr.yml", "require-semver-label.yml", "context-budget.yml", "pr-title-lint.yml"],
+  "settle_seconds": 120,
+  "app_slug": "",
+  "verdict_authors": []
+}

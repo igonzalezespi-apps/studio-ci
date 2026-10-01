@@ -1,0 +1,340 @@
+# REUSABLE workflow (`on: workflow_call`): squash-merges into the integration branch the pull
+# requests that do not need the owner — riesgo-0..`max_auto_class` (never above 2), CI green at job
+# level, the integration branch green, nothing frozen — one per run, so that between the last green
+# and the first red of the integration branch there is exactly one commit and develop-health can
+# revert it. DRY by default: it labels `riesgo:N` and keeps one comment per PR saying what it WOULD
+# do; nothing is merged until the caller passes `mode: live` AND the repo has the merge App's key.
+#
+#   jobs:
+#     merge-when-green:
+#       uses: igonzalezespi-apps/studio-ci/.github/workflows/merge-when-green.yml@<sha> # vX.Y.Z
+#
+# The full caller (events, the job-level `if:` that keeps a runner from starting, permissions) is in
+# README.md, "merge-when-green.yml". The decision logic is merge-when-green/pr_merge.py.
+#
+# TWO JOBS, TWO TOKENS.
+#   plan   GITHUB_TOKEN only. Reads everything, labels riesgo:N and comments: a write made with
+#          GITHUB_TOKEN triggers no workflow, so labelling costs no CI minutes and no cascade.
+#   merge  the merge App's installation token, minted for THIS repository only, in a job that
+#          declares `environment:`. The key lives in that Environment, whose deployment-branch
+#          policy admits only the default branch: a workflow added by a pull request (any branch,
+#          any event) cannot read it, so a PR cannot mint a token and merge itself. A repository
+#          secret would not give that guarantee. The merge job also refuses unless the run is on
+#          the default branch, the repo is public (Free plan: no Environments in private repos)
+#          and this is not a self-test. The App token only merges and labels revision-humana (the
+#          `labeled` event must wake the TL;DR check); it is revoked at the end of the step.
+#
+# The code runs from THIS repository at `job.workflow_sha` — the commit the caller pinned — never
+# from the caller's checkout, and the pull request's code is never checked out. The caller's
+# integration branch is read as data (policy, config, workflow files) through a sparse checkout.
+#
+# Exit 0 on "wait" and "nothing to do": these runs hang from the integration branch's head commit,
+# which is also the head of the promotion PR, so a red here would read as a red release.
+name: merge-when-green
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "`dry` (default: decide, label, comment) or `live` (also merge). Live needs the App key in the Environment."
+        type: string
+        required: false
+        default: dry
+      pr:
+        description: "Only this PR number (workflow_dispatch). Empty: the PRs of the triggering workflow_run, or every open PR on schedule/dispatch."
+        type: string
+        required: false
+        default: ""
+      config-path:
+        description: "Config file, read from the default branch."
+        type: string
+        required: false
+        default: .github/merge-when-green.json
+      app-client-id:
+        description: "Client ID (Iv…) of the merge App. Empty: the Environment's MERGE_APP_CLIENT_ID variable."
+        type: string
+        required: false
+        default: ""
+      environment:
+        description: "Environment that holds MERGE_APP_PRIVATE_KEY, restricted to the default branch."
+        type: string
+        required: false
+        default: merge-app
+      runs-on:
+        description: "Runner for the plan job in a PRIVATE repo (a label or a JSON list). Public repos always use ubuntu-latest."
+        type: string
+        required: false
+        default: ubuntu-latest
+      allow-hosted:
+        description: "PRIVATE repos only: run on a GitHub-hosted runner (billed minutes, at least one per run, ~96 runs a day with the documented schedule). Without it, a private repo must name its own runner in runs-on or the job does not start."
+        type: boolean
+        required: false
+        default: false
+      comment:
+        description: "Label riesgo:N and keep one comment per evaluated PR."
+        type: boolean
+        required: false
+        default: true
+      selftest:
+        description: "This repo's own CI: dry, no writes, built-in config."
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      decision:
+        description: "JSON: the PR to merge, the PRs to escalate and each evaluated PR's decision."
+        value: ${{ jobs.plan.outputs.decision }}
+
+jobs:
+  plan:
+    name: plan
+    # A private repository pays for hosted minutes (one minute at least per run): the job does not
+    # even start there on a GitHub-hosted label unless the caller opts in with allow-hosted.
+    if: >-
+      !github.event.repository.private || inputs.allow-hosted ||
+      !(startsWith(inputs.runs-on, 'ubuntu-') || startsWith(inputs.runs-on, 'windows-') ||
+        startsWith(inputs.runs-on, 'macos-'))
+    runs-on: ${{ github.event.repository.private && (startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+      checks: read
+      statuses: read
+    concurrency:
+      group: studio-merge-when-green-${{ github.repository }}${{ inputs.selftest && format('-selftest-{0}', github.run_id) || '' }}
+      cancel-in-progress: false
+    outputs:
+      merge_pr: ${{ steps.plan.outputs.merge_pr }}
+      merge_sha: ${{ steps.plan.outputs.merge_sha }}
+      escalate_prs: ${{ steps.plan.outputs.escalate_prs }}
+      decision: ${{ steps.plan.outputs.decision }}
+      live: ${{ steps.gate.outputs.live }}
+    steps:
+      - name: Event, code pin and mode
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+          SELFTEST: ${{ inputs.selftest }}
+          PRIVATE: ${{ github.event.repository.private }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WF_SHA: ${{ job.workflow_sha }}
+          WF_REPO: ${{ job.workflow_repository }}
+        run: |
+          set -uo pipefail
+          die() { echo "::error::merge-when-green: $*"; exit 1; }
+          case "$EVENT_NAME" in
+            pull_request_target) die "never on pull_request_target (it runs with secrets on a PR's behalf)" ;;
+            pull_request) [ "$SELFTEST" = true ] && [ "$MODE" = dry ] || die "pull_request only as a dry self-test" ;;
+            workflow_run)
+              if [ "$RUN_HEAD_REPO" != "$REPO" ]; then
+                echo "the triggering run comes from $RUN_HEAD_REPO: ignored"
+                { echo "skip=true"; echo "live=false"; echo "mode=dry"; } >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            workflow_dispatch | schedule) ;;
+            *) die "unsupported event $EVENT_NAME" ;;
+          esac
+          [ -n "$WF_SHA" ] && [ -n "$WF_REPO" ] || die "job.workflow_sha/job.workflow_repository are empty: cannot pin the code"
+          case "$MODE" in dry | live) ;; *) die "mode must be dry or live, got '$MODE'" ;; esac
+          live=false
+          if [ "$MODE" = live ]; then
+            if [ "$SELFTEST" = true ]; then echo "::notice::self-test: dry"
+            elif [ "$PRIVATE" != false ]; then echo "::warning::live merging needs an Environment, which a private repo on the Free plan cannot have: running dry"
+            elif [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then echo "::warning::live only on the default branch ($REF): running dry"
+            else live=true
+            fi
+          fi
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          echo "mode=$([ "$live" = true ] && echo live || echo dry)" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT_NAME mode=$MODE live=$live code=$WF_REPO@$WF_SHA"
+
+      - name: This repository's code at the pinned commit
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .studio-ci
+          persist-credentials: false
+          sparse-checkout: |
+            risk-class
+            merge-when-green
+
+      - name: The caller's default branch, as data (policy, config, workflows)
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .consumer
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/
+            /scripts/hooks/guard.policy.json
+            /.claude/settings.json
+
+      - name: Plan
+        id: plan
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MWG_READ_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_PRS: ${{ toJSON(github.event.workflow_run.pull_requests.*.number) }}
+          PR: ${{ inputs.pr }}
+          MODE: ${{ steps.gate.outputs.mode }}
+          WRITE: ${{ inputs.comment && !inputs.selftest }}
+          SELFTEST: ${{ inputs.selftest }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Public repos do not pay for minutes: wait out the settle time inside the run instead
+          # of leaving the merge to the next scheduled sweep.
+          VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
+        run: |
+          set -uo pipefail
+          settle_wait=0
+          [ "$VISIBILITY" = public ] && settle_wait=150
+          args=(sweep --repo "$REPO" --mode "$MODE" --plan "$RUNNER_TEMP/plan.json" --repo-dir .consumer
+                --config "$CONFIG_PATH" --run-url "$RUN_URL" --comment "$WRITE" --labels "$WRITE"
+                --max-settle-wait "$settle_wait")
+          # A PR's checks finished: look at that PR only. A push to the integration branch finished
+          # (typically the previous automatic merge): sweep every open PR, the next one may go now.
+          if [ -n "$PR" ]; then
+            args+=(--pr "$PR")
+          elif [ "$EVENT_NAME" = workflow_run ] && [ "$RUN_EVENT" != push ]; then
+            args+=(--prs "$RUN_PRS")
+          fi
+          if [ "$SELFTEST" = true ]; then
+            args+=(--selftest-config .studio-ci/merge-when-green/selftest.json)
+          fi
+          rc=0
+          bash .studio-ci/merge-when-green/pr-merge.sh "${args[@]}" || rc=$?
+          exit "$rc"
+
+  merge:
+    name: merge
+    needs: plan
+    if: needs.plan.outputs.live == 'true' && (needs.plan.outputs.merge_pr != '' || (needs.plan.outputs.escalate_prs != '[]' && needs.plan.outputs.escalate_prs != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+      checks: read
+      statuses: read
+    concurrency:
+      group: studio-merge-when-green-merge-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Only the default branch, only public, only with the key
+        id: gate
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PRIVATE: ${{ github.event.repository.private }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPO: ${{ github.repository }}
+          HAS_KEY: ${{ secrets.MERGE_APP_PRIVATE_KEY != '' }}
+          # The Environment's variables are visible only in a job bound to it, like this one.
+          CLIENT_ID: ${{ inputs.app-client-id || vars.MERGE_APP_CLIENT_ID }}
+          SELFTEST: ${{ inputs.selftest }}
+        run: |
+          set -uo pipefail
+          ok=true
+          [ "$SELFTEST" != true ] || { echo "::warning::self-test never merges"; ok=false; }
+          [ "$PRIVATE" = false ] || { echo "::warning::private repo: no Environment, no merge"; ok=false; }
+          [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ] || { echo "::warning::ref $REF is not the default branch"; ok=false; }
+          case "$WORKFLOW_REF" in
+            "$REPO/.github/workflows/"*"@refs/heads/$DEFAULT_BRANCH") ;;
+            *) echo "::warning::the calling workflow ($WORKFLOW_REF) is not a workflow of the default branch"; ok=false ;;
+          esac
+          [ "$HAS_KEY" = true ] || { echo "::warning::no MERGE_APP_PRIVATE_KEY in the Environment: nothing merged (dry)"; ok=false; }
+          [ -n "$CLIENT_ID" ] || { echo "::warning::no MERGE_APP_CLIENT_ID in the Environment: nothing merged (dry)"; ok=false; }
+          name="${REPO#*/}"
+          [ -n "$name" ] && [ "$name" != "$REPO" ] || { echo "::error::cannot compute the repository name"; exit 1; }
+          echo "repo_name=$name" >> "$GITHUB_OUTPUT"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: This repository's code at the pinned commit
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .studio-ci
+          persist-credentials: false
+          sparse-checkout: |
+            risk-class
+            merge-when-green
+
+      - name: The caller's default branch, as data
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .consumer
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/
+            /scripts/hooks/guard.policy.json
+            /.claude/settings.json
+
+      - name: Mint the App token (this repository only)
+        id: app_token
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.app-client-id || vars.MERGE_APP_CLIENT_ID }}
+          # The runner re-evaluates `with:` for the post step; this step has no outcome while it
+          # runs and has one by then, so the key reaches the main run only.
+          private-key: ${{ !steps.app_token.outcome && secrets.MERGE_APP_PRIVATE_KEY || '' }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.gate.outputs.repo_name }}
+          permission-contents: write
+          permission-pull-requests: write
+          skip-token-revoke: 'true'
+
+      - name: Merge (or escalate)
+        if: steps.app_token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MWG_READ_TOKEN: ${{ github.token }}
+          MWG_WRITE_TOKEN: ${{ steps.app_token.outputs.token }}
+          MWG_WRITE_TOKEN_KIND: app
+          MWG_APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.plan.outputs.merge_pr }}
+          SHA: ${{ needs.plan.outputs.merge_sha }}
+          ESCALATE: ${{ needs.plan.outputs.escalate_prs }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          revoke() { GH_TOKEN="$MWG_WRITE_TOKEN" gh api --method DELETE /installation/token --silent || echo "::warning::could not revoke the App token"; }
+          trap revoke EXIT
+          rc=0
+          for n in $(printf '%s' "${ESCALATE:-[]}" | jq -r '.[]'); do
+            bash .studio-ci/merge-when-green/pr-merge.sh escalate --repo "$REPO" --pr "$n" || rc=1
+          done
+          if [ -n "$PR" ]; then
+            r=0
+            bash .studio-ci/merge-when-green/pr-merge.sh merge --repo "$REPO" --pr "$PR" --sha "$SHA" \
+              --repo-dir .consumer --config "$CONFIG_PATH" --run-url "$RUN_URL" || r=$?
+            # 10/20/30/40: re-decided "not now" with fresh data. Not an error.
+            case "$r" in 0 | 10 | 20 | 30 | 40) ;; *) rc=1 ;; esac
+          fi
+          exit "$rc"

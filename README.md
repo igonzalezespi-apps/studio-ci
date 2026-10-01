@@ -165,6 +165,43 @@ jobs:
 No checkout needed: it reads the PR through the API. `label` changes the flag; `pr-number`/`repo`
 default to the event's.
 
+### `risk-class`
+
+Classifies a pull request into **riesgo-0…riesgo-4** (label `riesgo:N`) — the class decides who has
+to look at it before it merges. The highest class of any rule wins; every file is judged by its new
+**and** its previous name (a rename cannot carry a file out of its class); a repo can only **raise**
+classes (`risk_paths` in `.github/merge-when-green.json`, `reserved_paths` → 2 and
+`reserved_paths_hard` → 3 in its guard policy), never lower the built-in floor.
+
+| class | what puts a PR there (excerpt; the full table is `risk-class/risk_class.py`) | review |
+|---|---|---|
+| 4 | promotion into the protected branch · a person's `semver:major` · migrations, `*.sql`, `schema.prisma` · key material (`*.pem`, `*.key`, `.env*`) · `*.tf`/`*.tfvars` | owner; never automatic |
+| 3 | a long-lived head · `.github/workflows/**`, `CODEOWNERS` · the guard, hooks, `security/**`, `.claude/settings.json` and every repo script its hooks or status line run · the merge gate itself (`risk-class/`, `merge-when-green/`, `develop-health/`, `revert-merge/`, `check-pr-tldr/`, `ci-gate/`) · Renovate config, `.npmrc`, `pnpm-workspace.yaml`, install scripts / `overrides` in `package.json` · `LICENSE` · a major dependency update · an important (security) check that failed at any point | owner (`revision-humana`) |
+| 2 | `CLAUDE.md`, `AGENTS.md`, specs, `infra/**` · `.claude/**`, plugin skills/agents/commands · `action.yml` · `package.json`, `.nvmrc`, `Dockerfile`, a lockfile edited by a person (3 if it adds a source outside the registry) · test/lint/type configs (`tsconfig*`, `vitest.config.*`, `eslint.config.*`) · other `.github/**` · a person's `semver:minor` · more than 200 changed lines of code | Opus-high owner-decision lens |
+| 1 | code, 200 lines or fewer · existing tests edited or removed · a bot bumping action pins only | Sonnet-high review |
+| 0 | docs, `*.md` outside prompt surfaces, change proposals · **added** tests and fixtures · templates, `.gitignore` · an empty diff | none |
+
+A dependency bot's PR that only bumps versions — every commit the bot's **and signed** (the bot's
+name alone is just an e-mail address), `package.json` changing only the versions of packages it
+already had (no new or removed package, no `npm:` alias pointed elsewhere, no git/URL/file source),
+no lockfile source outside the registry — gets `renovate_minor_class` (default **3**: dependency
+updates stay with the owner unless the repo lowers it). A bot PR that fails any of that is never
+below a clean one: `max(3, renovate_minor_class)`. A missing or double `semver:*` label does not
+change the class but stops an automatic merge.
+
+```yaml
+- uses: igonzalezespi-apps/studio-ci/risk-class@<sha> # vX.Y.Z
+  id: risk
+  with:
+    github-token: ${{ github.token }}
+    apply-label: "false"     # "true" sets riesgo:N (needs pull-requests: write)
+# steps.risk.outputs.class / .label / .json
+```
+
+Locally: `risk-class/risk-class.sh --pr N --repo owner/name` (read-only), or
+`--git --base origin/develop` on a checkout. Exit `2` means "could not measure", never riesgo-0;
+a `package.json` it could not read counts as one with install scripts (3).
+
 ### `context-budget`
 
 What Claude Code loads into every session has a budget, and the repo configuration that decides
@@ -398,9 +435,11 @@ Output: `files-changed` — space-separated list of files written, for `git add`
 
 ## Reusable workflows
 
-Two whole workflows (`on: workflow_call`), called with `jobs.<id>.uses` and pinned like the actions.
-Their logic is inline in the YAML (a called workflow cannot read files from this repo at its own
-ref); each one has a suite next to it (`.github/workflows/*.test.sh`) that runs the real `run:` bodies.
+Whole workflows (`on: workflow_call`), called with `jobs.<id>.uses` and pinned like the actions.
+`security.yml` and `renovate-heartbeat.yml` keep their logic inline in the YAML; `merge-when-green.yml`
+and `develop-health.yml` check out this repository at `job.workflow_sha` — the very commit the caller
+pinned — and run the scripts from there. Each has a suite next to it (`.github/workflows/*.test.sh`)
+that runs the real `run:` bodies.
 
 ### `security.yml`
 
@@ -506,6 +545,209 @@ jobs:
 The job runs with the caller's token grant (it declares no `permissions` of its own, so a read-only
 caller can still use `ping: false`). Ticking the box only requests a run: Renovate's own `schedule`
 still decides when PRs open.
+
+## Autonomous merging
+
+Two reusable workflows let a repository merge the pull requests nobody needs to look at, and undo
+such a merge if it turns the integration branch red. **Dry by default**: they classify, label
+`riesgo:N` and keep one comment per PR saying what they *would* do; nothing merges until the repo
+sets its mode to `live` and holds the merge App's key in an Environment.
+
+What is never automatic, whatever the configuration: riesgo-3 and riesgo-4, anything labelled
+`revision-humana`, `sin-revision-independiente`, `no-automerge` or `merge-freeze`, drafts, forks,
+promotions into the protected branch, long-lived heads, PRs touching `.github/workflows/**`, PRs
+without exactly one `semver:*` label, stacked parents, a template that does not tick Squash, a
+Renovate PR that automerges itself, and anything the scripts could not read (they fail closed).
+
+### `merge-when-green.yml`
+
+`plan` (GITHUB_TOKEN) decides; `merge` (the App's token, in a job bound to an Environment) acts.
+One merge per run: the next PR waits until the push checks of the integration branch are green on
+the new head, so between the last green and the first red there is exactly one commit.
+
+A PR merges when **all** of this holds:
+
+- the repo: `.github/merge-when-green.json` valid; guard policy with `agent_may_merge: true` and an
+  integration branch that is the default branch and not the protected one; no `continue-on-error`
+  in its workflows (a swallowed failure reads as green); a `develop-health` workflow; the
+  integration branch green; no open `merge-freeze` issue;
+- the PR: class ≤ `max_auto_class` (0 by default; 1 and 2 also need a lens verdict, below); CI
+  green **at job level**, keyed by workflow file and job name, every `required_checks` entry
+  present and green (a required job that only `skipped` is missing), no red anywhere, nothing
+  pending, `settle_seconds` since the last completion; no important check failed during the PR's
+  life; mergeable.
+
+Right before saying "merge" it reads the PR once more: a new head, a new base, a hold label or any
+label change since the decision started means wait or skip. A PR that **ever** carried a hold label
+stays with a person even if the label is removed (the issue events are read): a session shares the
+owner's account, so removing `revision-humana` is not the owner's word.
+
+Then `PUT /pulls/N/merge` with `merge_method: squash` and `sha` = the evaluated head (a push in
+between makes GitHub refuse), title `<PR title> (#N)`, the commits' bodies, CI-skipping directives
+neutralised and two trailers: `Risk-class: riesgo:N` and `Merge-gate: merge-when-green <run>`. The
+author's own `Risk-class:`/`Merge-gate:` lines are neutralised too, and the readers take the last
+`Risk-class:` line only when the gate's `Merge-gate:` line follows it.
+
+Each run classifies the open PRs first and spends its CI budget (`max_candidates`, 5) on reverts,
+then on the PRs it could merge, then on riesgo-3/4 to escalate; a riesgo-1/2 above
+`max_auto_class` is decided without reading CI and costs nothing.
+A riesgo-3/4 PR by a person, with CI green and no `revision-humana`, gets that label **from the App**
+so the `labeled` event wakes the TL;DR check; a bot's PR is never labelled.
+
+**Lens verdict (riesgo-1/2).** The session reviews the PR (Sonnet-high for 1, Opus-high for 2) and
+posts a comment from an account in `verdict_authors`:
+
+````
+<!-- agent-verdict v1 -->
+```json
+{"head_sha": "<40 hex>", "class": 2, "reviewer": "opus-high", "owner_gate_exit": 0,
+ "pr_score": {"total": 23, "axis_min": 4}, "at": "<ISO time>"}
+```
+````
+
+It counts only if it is the latest such comment, never edited, for the current head, with
+`owner_gate_exit: 0`, a score at or above `pr_score`, and a `class` not below the computed one (a
+higher class wins; 3 or more escalates). A new push voids it. **`verdict_authors` must be an
+identity the agent sessions cannot use** (a workflow with its own App, or a separate bot account):
+if the sessions post as the owner and the owner is a verdict author, a session can clear its own
+PR. Until such an identity exists, keep `max_auto_class` at 0.
+
+**Locally**: `merge-when-green/pr-merge.sh decide --repo owner/name --pr N` (read-only; exit 0
+merge, 10 wait, 20 needs a verdict, 30 escalate, 40 skip, 2 error). `merge` refuses outside GitHub
+Actions and with anything but an installation token scoped to the one repository.
+
+### `develop-health.yml`
+
+Judges the head of the integration branch with `required_push_checks`: green → lifts the freeze it
+opened (an escalated freeze stays open for the owner); a job that never ran (0 steps, no runner,
+`cancelled`, `startup_failure`) → infrastructure, never reverted; a real red → re-runs the failed
+jobs once; red again → freezes automatic merging (an issue labelled `merge-freeze`) and reverts the
+first red push after the last green **only if** it is one single-parent commit, merged by the merge
+App, whose commit trailer says riesgo-0..2, is not itself a revert, and fewer than
+`max_reverts_per_day` reverts happened in 24 h. Otherwise it escalates: the freeze issue gets
+`revision-humana` and a TL;DR (once: an escalated freeze is not rewritten on every run). A person's
+merge is never reverted automatically. The revert is opened by the App (`revert: <title> (#N)`, a
+`revert-of` marker) and merged by `merge-when-green` through its own path, exempt from the freeze
+it lifts, only while the branch is still red with the freeze open, and only if it is exactly what
+GitHub wrote for the App: one signed commit by the App, the same files as the original (old and
+new names), each of them byte-identical to the parent of the reverted commit, CI green, no
+conflicts. Anything pushed on top of it fails that check. While the revert is open develop-health
+re-judges it on every run with those same rules and escalates if it was closed without merging,
+cannot merge (red, in conflict, altered) or has been open for more than two hours. If the branch
+turns green first (a fix went in), it lifts the freeze and closes the revert unmerged.
+
+### Adopting it
+
+1. `.github/merge-when-green.json` on the integration branch (it is riesgo-3 itself, and it is
+   always read from the default branch, never from a PR):
+
+   ```json
+   {
+     "version": 1,
+     "max_auto_class": 0,
+     "required_checks": [{"workflow": "ci.yml", "job": "typecheck + test"}],
+     "required_push_checks": [{"workflow": "ci.yml", "job": "typecheck + test"}],
+     "state_workflows": ["pr-tldr.yml", "require-semver-label.yml", "pr-title-lint.yml"],
+     "settle_seconds": 120,
+     "app_slug": "<the merge App's slug>",
+     "verdict_authors": ["<the account that posts lens verdicts>"]
+   }
+   ```
+
+   `state_workflows`: workflows that re-read live PR state on label/title/body events; for them the
+   latest run is the truth. For every other workflow a failed run is cleared only by a re-run of that
+   same run (a success in another run is a flaky test or a race, not a fix). Schema:
+   `merge-when-green/config.schema.json`.
+
+2. The two callers. In a **public** repo (hosted runners, free):
+
+   ```yaml
+   name: merge-when-green
+   on:
+     workflow_run:
+       # the `name:` of every workflow that reports on a PR, plus the push CI of the integration branch
+       workflows: ["CI", "PR TL;DR", "pr-title-lint", "Require semver label"]
+       types: [completed]
+     workflow_dispatch:
+       inputs:
+         pr: {description: "Only this PR (empty: all)", required: false, default: ""}
+     schedule:
+       - cron: "11,41 * * * *"
+   permissions: {}
+   jobs:
+     merge-when-green:
+       # filtered here, at job level, so a skipped run never starts a runner
+       if: >-
+         github.event_name != 'workflow_run' ||
+         (github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.head_repository.full_name == github.repository)
+       permissions: {contents: read, pull-requests: write, issues: write, actions: read, checks: read, statuses: read}
+       uses: igonzalezespi-apps/studio-ci/.github/workflows/merge-when-green.yml@<sha> # vX.Y.Z
+       with:
+         mode: ${{ vars.MERGE_WHEN_GREEN_MODE || 'dry' }}
+         pr: ${{ inputs.pr || '' }}
+   ```
+
+   ```yaml
+   name: develop-health
+   on:
+     workflow_run:
+       workflows: ["CI"]
+       types: [completed]
+       branches: [develop]
+     workflow_dispatch:
+     schedule:
+       - cron: "17,47 * * * *"
+   permissions: {}
+   jobs:
+     develop-health:
+       if: >-
+         github.event_name != 'workflow_run' ||
+         (github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_repository.full_name == github.repository)
+       permissions: {contents: read, actions: write, issues: write, pull-requests: write, checks: read, statuses: read}
+       uses: igonzalezespi-apps/studio-ci/.github/workflows/develop-health.yml@<sha> # vX.Y.Z
+       with:
+         mode: ${{ vars.MERGE_WHEN_GREEN_MODE || 'dry' }}
+   ```
+
+   The push CI of the integration branch must never cancel or replace a run: every pushed commit
+   needs its own verdict, or a red cannot be tied to one merge. `cancel-in-progress: false` is not
+   enough — GitHub still cancels a *pending* run of the same group when a third one arrives — so
+   give each push its own group:
+
+   ```yaml
+   concurrency:
+     group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+     cancel-in-progress: ${{ github.event_name != 'push' }}
+   ```
+
+   In a **private** repo the plan/assess jobs run where `runs-on` says, and they do not start at
+   all on a GitHub-hosted label unless the caller passes `allow-hosted: true` (billed minutes: with
+   the schedule above that is about 96 runs a day, a minute each at least). Live merging is refused
+   there — the Free plan has no Environments for private repositories, so there is nowhere to keep
+   the key out of reach of a pull request. Add `if: vars.RUNNER_TARGET != ''` to the calling job,
+   pass `runs-on: ${{ vars.RUNNER_TARGET }}`, keep only the `workflow_run` of the CI and drop or
+   thin the schedule. develop-health needs a push CI on the integration branch to have anything to
+   judge.
+
+3. Going live (public repos), by the repository owner:
+   - a GitHub App with **Contents: read & write** and **Pull requests: read & write** (nothing else),
+     installed only on the repositories that run live;
+   - an Environment `merge-app` whose deployment branches are **only the default branch**, holding
+     the secret `MERGE_APP_PRIVATE_KEY` and the variable `MERGE_APP_CLIENT_ID` (the App's Client ID).
+     Never a repository secret: any workflow added by a pull request could read that one;
+   - `app_slug` in the config = the App's slug; the repository variable
+     `MERGE_WHEN_GREEN_MODE=live`;
+   - recommended: protect the integration and the protected branch with the push CI as a required
+     check and `enforce_admins`, so a merge over a red is impossible for everybody; on the protected
+     branch also restrict who can push to the owner (`restrictions.users`), so not even the App can
+     merge into it if a PR is re-pointed in the second between the last read and the merge.
+
+   Off switch: `MERGE_WHEN_GREEN_MODE=dry` (or delete it), or disable the caller workflow.
+
+Both workflows exit 0 on "wait" and "nothing to do": their runs hang from the integration branch's
+head, which is also the head of the promotion PR. API use is printed in each job summary.
 
 ## Versioning
 

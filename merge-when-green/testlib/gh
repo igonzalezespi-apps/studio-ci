@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""A fake `gh` for the test suites: `gh api` only, answered from a JSON route table.
+
+FAKE_GH_DB   routes: {"routes": {"GET <path>": <spec>, "PUT <path>": <spec>, ...}}
+             <spec> = {"status": 200, "body": ...} | {"pages": [page, ...]} | {"seq": [<spec>, ...]}
+             (`seq` answers in order and then repeats the last one)
+FAKE_GH_LOG  one JSON line per call: method, path, token (first 6 chars), input (the --input body)
+
+An unknown GET is a 404 (a test that forgets a route sees the gate fail closed, never pass); an
+unknown write answers 200 {} unless FAKE_GH_WRITE_STATUS says otherwise.
+"""
+import json
+import os
+import sys
+
+
+def main(argv):
+    if not argv or argv[0] != "api":
+        print("fake gh: only `gh api` is supported (%s)" % " ".join(argv), file=sys.stderr)
+        return 1
+    args = argv[1:]
+    method, include, paginate, slurp, inp, path = "GET", False, False, False, None, None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-X", "--method"):
+            method = args[i + 1].upper(); i += 2; continue
+        if a in ("-i", "--include"):
+            include = True; i += 1; continue
+        if a == "--paginate":
+            paginate = True; i += 1; continue
+        if a == "--slurp":
+            slurp = True; i += 1; continue
+        if a == "--input":
+            inp = args[i + 1]; i += 2; continue
+        if a in ("-H", "--header", "-f", "-F", "--jq", "-q"):
+            print("fake gh: flag %s is not expected from the scripts under test" % a, file=sys.stderr)
+            return 1
+        if a == "--silent":
+            i += 1; continue
+        path = a.lstrip("/"); i += 1
+    body_in = None
+    if inp:
+        with open(inp, encoding="utf-8") as fh:
+            body_in = json.load(fh)
+    token = os.environ.get("GH_TOKEN", "")
+    with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"method": method, "path": path, "token": token[:6], "input": body_in}) + "\n")
+    with open(os.environ["FAKE_GH_DB"], encoding="utf-8") as fh:
+        db = json.load(fh)
+    routes = db.get("routes", {})
+    key = "%s %s" % (method, path)
+    spec = routes.get(key)
+    if spec is None and path == "rate_limit":
+        spec = {"body": {"resources": {"core": {"remaining": db.get("remaining", 5000)}}}}
+    if spec is None:
+        spec = {"status": 404, "body": {"message": "Not Found"}} if method == "GET" else \
+            {"status": int(os.environ.get("FAKE_GH_WRITE_STATUS", "200")), "body": {}}
+    if "seq" in spec:
+        state_file = os.environ["FAKE_GH_LOG"] + ".seq"
+        state = {}
+        if os.path.exists(state_file):
+            with open(state_file, encoding="utf-8") as fh:
+                state = json.load(fh)
+        n = state.get(key, 0)
+        state[key] = n + 1
+        with open(state_file, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        spec = spec["seq"][min(n, len(spec["seq"]) - 1)]
+    status = int(spec.get("status", 200))
+    if paginate:
+        pages = spec.get("pages")
+        if pages is None:
+            pages = [spec.get("body")]
+        if status >= 400:
+            print("gh: %s (HTTP %d)" % ((spec.get("body") or {}).get("message", "error"), status), file=sys.stderr)
+            return 1
+        out = pages if slurp else pages[0]
+        sys.stdout.write(json.dumps(out))
+        return 0
+    text = json.dumps(spec.get("body")) if spec.get("body") is not None else ""
+    if include:
+        sys.stdout.write("HTTP/2.0 %d X\r\nContent-Type: application/json\r\n\r\n%s" % (status, text))
+    elif status < 400:
+        sys.stdout.write(text)
+    if status >= 400:
+        print("gh: %s (HTTP %d)" % ((spec.get("body") or {}).get("message", "error"), status), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
