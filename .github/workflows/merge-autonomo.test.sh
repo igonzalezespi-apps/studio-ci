@@ -261,6 +261,14 @@ def body_cases(name, doc):
                                        "SELFTEST": "true"}, cwd=tmp)
         if rc != 0 or "--selftest-config" not in open(log).read():
             fail("%s assess body: self-test config not passed" % name)
+        if "--owner-alert" in open(log).read():
+            fail("%s assess body: the owner alert is on without being asked for" % name)
+        open(log, "w").close()
+        rc, _, out = run_body(assess, {"REPO": "acme/proyecto", "MODE": "dry", "CONFIG_PATH": "c", "RUN_URL": "u",
+                                       "SELFTEST": "false", "OWNER_ALERT": "owner", "OWNER_ALERT_HOURS": "4=0,3=24"},
+                              cwd=tmp)
+        if rc != 0 or "--owner-alert owner --owner-alert-hours 4=0,3=24" not in open(log).read():
+            fail("%s assess body: owner-alert not passed through (%s)" % (name, open(log).read()[-200:]))
 
 
 def eval_if(expr, private, allow, runs_on):

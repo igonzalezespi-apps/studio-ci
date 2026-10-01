@@ -17,6 +17,11 @@
 #
 # Dry by default: in dry mode it writes the job summary and one comment on the culprit PR, nothing
 # else. It exits 0 when it measured, also on a red branch: the red is the finding, not a failure.
+#
+# Opt-in, `owner-alert: <login>`: on the same runs (no run of its own, so no extra minutes), one
+# @mention on each PR waiting on the owner — revision-humana or a promotion — that is riesgo-4, at
+# once, or riesgo-3 after 24 h (`owner-alert-hours`). GitHub's notification is the push; it is
+# written with GITHUB_TOKEN, in dry mode too, never in the self-test.
 name: develop-health
 
 on:
@@ -53,6 +58,16 @@ on:
         type: boolean
         required: false
         default: false
+      owner-alert:
+        description: "GitHub logins (comma-separated) to @mention once on a PR waiting on the owner (revision-humana or a promotion) that is riesgo-3/4 and has waited past owner-alert-hours. Empty (default): off."
+        type: string
+        required: false
+        default: ""
+      owner-alert-hours:
+        description: "Hours a riesgo-4 / riesgo-3 PR waits before the mention, as `4=H,3=H`."
+        type: string
+        required: false
+        default: "4=0,3=24"
     outputs:
       action:
         description: "none | wait | infra | rerun | recover | revert | escalate | skip"
@@ -149,10 +164,15 @@ jobs:
           CONFIG_PATH: ${{ inputs.config-path }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SELFTEST: ${{ inputs.selftest }}
+          OWNER_ALERT: ${{ inputs.owner-alert }}
+          OWNER_ALERT_HOURS: ${{ inputs.owner-alert-hours }}
         run: |
           set -uo pipefail
           args=(--repo "$REPO" --mode "$MODE" --plan "$RUNNER_TEMP/health.json" --repo-dir .consumer
                 --config "$CONFIG_PATH" --run-url "$RUN_URL")
+          if [ -n "${OWNER_ALERT:-}" ]; then
+            args+=(--owner-alert "$OWNER_ALERT" --owner-alert-hours "${OWNER_ALERT_HOURS:-4=0,3=24}")
+          fi
           if [ "$SELFTEST" = true ]; then
             args+=(--selftest-config .studio-ci/merge-when-green/selftest.json)
           fi

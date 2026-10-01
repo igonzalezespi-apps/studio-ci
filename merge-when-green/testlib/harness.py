@@ -125,8 +125,10 @@ class World:
         return p
 
     def open_pulls(self, pulls):
-        self.r("GET", "repos/%s/pulls?state=open&base=develop&sort=created&direction=asc&per_page=100" % self.repo,
-               list(pulls))
+        # Every open PR, whatever its base, as GitHub lists them: a PR stacked on another targets that
+        # one's branch, so only the code may filter by base (a route answering `base=develop` with a
+        # stacked PR in it once hid that the sweep never saw one).
+        self.r("GET", "repos/%s/pulls?state=open&sort=created&direction=asc&per_page=100" % self.repo, list(pulls))
         self.r("GET", "repos/%s/pulls?state=open&per_page=100" % self.repo, list(pulls))
 
     def files(self, n, files):

@@ -291,6 +291,20 @@ S.check("sweep: one comment per evaluated PR", len([c for c in H.writes(res, "PO
 S.check("sweep: the plan carries the squash message",
         any(d.get("message", {}).get("title") == "feat: x (#6)" for d in res["plan"].get("decisions", [])))
 
+# A PR stacked on another targets the parent's branch, so it is not among the candidates; the parent
+# must still see it. In the sweep (what the workflow runs) the parent used to be named for the merge,
+# the merge job re-decided "skip", and the next run named it again: the queue behind it never moved.
+w = world(); p5 = w.green_pr(5, created="2026-10-01T08:00:00Z"); w.files(5, ["docs/a.md"])
+p6 = w.green_pr(6, created="2026-10-01T09:00:00Z"); w.files(6, ["docs/b.md"])
+kid = w.pull(7, base="feat/pr-5")
+w.open_pulls([p5, p6, kid])
+res = sweep(w)
+dec = {d["pr"]: d for d in res["plan"].get("decisions", [])}
+S.check("sweep: a PR with a ready PR stacked on it is skipped, and the next one goes",
+        res["outputs"].get("merge_pr") == "6" and dec.get(5, {}).get("decision") == "skip" and
+        any("stacked" in r for r in dec.get(5, {}).get("reasons", [])), (res["outputs"], dec.get(5)))
+S.check("sweep: the stacked PR itself is not a candidate (it does not target develop)", 7 not in dec, sorted(dec))
+
 w = world(); rp = w.green_pr(5); w.files(5, ["docs/a.md"])
 wr, rev = revert_world()
 wr.green_pr(5); wr.files(5, ["docs/a.md"]); wr.open_pulls([wr.routes["GET repos/%s/pulls/5" % R]["body"], rev])
