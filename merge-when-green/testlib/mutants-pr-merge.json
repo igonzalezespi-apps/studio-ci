@@ -244,5 +244,11 @@
   "why": "a revert merges in conflict",
   "old": "            if fresh.get(\"mergeable\") is not True:\n",
   "new": "            if False:\n"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "the sweep looks for stacked PRs only among the PRs into the integration branch",
+  "old": "        return out, every\n    return pulls, every\n",
+  "new": "        return out, pulls\n    return pulls, pulls\n"
  }
 ]
