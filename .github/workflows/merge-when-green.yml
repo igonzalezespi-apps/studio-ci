@@ -115,7 +115,6 @@ jobs:
           RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WF_SHA: ${{ job.workflow_sha }}
           WF_REPO: ${{ job.workflow_repository }}
-          CLIENT_ID: ${{ inputs.app-client-id || vars.MERGE_APP_CLIENT_ID }}
         run: |
           set -uo pipefail
           die() { echo "::error::merge-when-green: $*"; exit 1; }
@@ -139,7 +138,6 @@ jobs:
             if [ "$SELFTEST" = true ]; then echo "::notice::self-test: dry"
             elif [ "$PRIVATE" != false ]; then echo "::warning::live merging needs an Environment, which a private repo on the Free plan cannot have: running dry"
             elif [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then echo "::warning::live only on the default branch ($REF): running dry"
-            elif [ -z "$CLIENT_ID" ]; then echo "::warning::live without the App's client id: running dry"
             else live=true
             fi
           fi
@@ -238,6 +236,8 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           REPO: ${{ github.repository }}
           HAS_KEY: ${{ secrets.MERGE_APP_PRIVATE_KEY != '' }}
+          # The Environment's variables are visible only in a job bound to it, like this one.
+          CLIENT_ID: ${{ inputs.app-client-id || vars.MERGE_APP_CLIENT_ID }}
           SELFTEST: ${{ inputs.selftest }}
         run: |
           set -uo pipefail
@@ -250,6 +250,7 @@ jobs:
             *) echo "::warning::the calling workflow ($WORKFLOW_REF) is not a workflow of the default branch"; ok=false ;;
           esac
           [ "$HAS_KEY" = true ] || { echo "::warning::no MERGE_APP_PRIVATE_KEY in the Environment: nothing merged (dry)"; ok=false; }
+          [ -n "$CLIENT_ID" ] || { echo "::warning::no MERGE_APP_CLIENT_ID in the Environment: nothing merged (dry)"; ok=false; }
           name="${REPO#*/}"
           [ -n "$name" ] && [ "$name" != "$REPO" ] || { echo "::error::cannot compute the repository name"; exit 1; }
           echo "repo_name=$name" >> "$GITHUB_OUTPUT"

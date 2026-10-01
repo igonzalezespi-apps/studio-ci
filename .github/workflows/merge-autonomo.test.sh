@@ -159,7 +159,6 @@ def plan_gate_cases(name, doc, job_id, has_client=True):
         ("a bogus mode", {"MODE": "yes"}, 1, None),
     ]
     if has_client:
-        c.append(("live without the client id runs dry", {"CLIENT_ID": ""}, 0, {"live": "false"}))
         c.append(("a workflow_run from a fork's branch is skipped", {"RUN_HEAD_REPO": "evil/fork"}, 0, {"skip": "true", "live": "false"}))
     else:
         c.append(("a workflow_run from a fork's branch is refused", {"RUN_HEAD_REPO": "evil/fork"}, 1, None))
@@ -168,13 +167,14 @@ def plan_gate_cases(name, doc, job_id, has_client=True):
 
 APP_BASE = {"REF": "refs/heads/develop", "DEFAULT_BRANCH": "develop", "PRIVATE": "false", "REPO": "acme/proyecto",
             "WORKFLOW_REF": "acme/proyecto/.github/workflows/merge-when-green.yml@refs/heads/develop", "HAS_KEY": "true",
-            "SELFTEST": "false"}
+            "SELFTEST": "false", "CLIENT_ID": "Iv23abc"}
 
 
 def app_gate_cases(name, doc, job_id):
     c = [
         ("all good", {}, 0, {"ok": "true", "repo_name": "proyecto"}),
         ("no key in the Environment", {"HAS_KEY": "false"}, 0, {"ok": "false"}),
+        ("no client id in the Environment", {"CLIENT_ID": ""}, 0, {"ok": "false"}),
         ("private repo", {"PRIVATE": "true"}, 0, {"ok": "false"}),
         ("another ref", {"REF": "refs/heads/feat/x"}, 0, {"ok": "false"}),
         ("a workflow added on another branch", {"WORKFLOW_REF": "acme/proyecto/.github/workflows/x.yml@refs/heads/feat/x"}, 0, {"ok": "false"}),
