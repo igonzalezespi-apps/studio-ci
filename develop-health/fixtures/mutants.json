@@ -130,5 +130,59 @@
   "why": "an escalated freeze is rewritten on every run",
   "old": "        if issue and pr_merge.ESCALATION_LABEL in [lb[\"name\"] for lb in issue.get(\"labels\") or []]:\n",
   "new": "        if False:\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert ignores how long the PR has waited",
+  "old": "        if waited < hours[cls]:\n            continue",
+  "new": "        if False:\n            continue"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert repeats on every run",
+  "old": "                done = True\n                break",
+  "new": "                done = False\n                break"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert on a draft",
+  "old": "        if p.get(\"draft\"):\n            continue",
+  "new": "        if False:\n            continue"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert on a PR nobody flagged",
+  "old": "        if pr_merge.ESCALATION_LABEL not in labels and not promotion:",
+  "new": "        if False:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert trusts anybody's mark",
+  "old": "            if (c.get(\"user\") or {}).get(\"login\") == pr_merge.ACTIONS_BOT and m and created and \\",
+  "new": "            if m and created and \\"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert has no cap per run",
+  "old": "        if sum(1 for e in out if e[\"action\"] in (\"alerted\", \"would alert\")) >= OWNER_ALERT_MAX:",
+  "new": "        if False:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert counts an alert from an earlier spell",
+  "old": "                    created >= since and int(m.group(1)) >= cls:",
+  "new": "                    int(m.group(1)) >= cls:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert classifies a flagged PR but does not keep the class",
+  "old": "            if write:\n                gh.write(\"POST\", \"repos/%s/issues/%d/labels\" % (repo, n), {\"labels\": [\"riesgo:%d\" % cls]})",
+  "new": "            if False:\n                gh.write(\"POST\", \"repos/%s/issues/%d/labels\" % (repo, n), {\"labels\": [\"riesgo:%d\" % cls]})"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert classifies without a cap",
+  "old": "            if classified >= OWNER_ALERT_CLASSIFY_MAX:",
+  "new": "            if False:"
  }
 ]

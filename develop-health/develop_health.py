@@ -27,11 +27,25 @@ It always judges the CURRENT head of the integration branch with the push checks
                       red, in conflict, or open for more than REVERT_STALE_MINUTES → escalate.
   green after a freeze  lift it, and close the App's reverts still open (a fix went in first).
 
-    develop-health.sh --repo R --mode dry|live --plan F [--repo-dir D] [--run-url U]
+It also watches the owner's queue, opt-in (`--owner-alert <login>[,<login>…]`): a PR waiting on
+the owner — open, ready, labelled revision-humana, or a promotion into the protected branch — whose
+class is riesgo-3 or riesgo-4 gets ONE comment that @mentions those accounts once it has waited
+long enough (`--owner-alert-hours`, default `4=0,3=24`: riesgo-4 at once, riesgo-3 after 24 h). The
+mention is GitHub's own notification (mobile push, mail), written with GITHUB_TOKEN: no credential,
+and no run of its own — it rides on the runs this workflow already makes. Lower classes stay in the
+owner's weekly list. The class is the `riesgo:N` label merge-when-green puts (a promotion is 4 by
+definition); a flagged PR without one is classified here with the same classifier and labelled, at
+most OWNER_ALERT_CLASSIFY_MAX per run (merge-when-green never classifies a held PR). Waiting starts
+at the latest of: opened, marked ready, labelled revision-humana. One
+comment per class per waiting spell, at most OWNER_ALERT_MAX per run. Written in dry mode too (it
+is a notice, not an action on the code); never with --selftest-config.
 
-In dry mode it only writes the job summary and one comment on the culprit PR; with
---selftest-config (this repository's own CI) it writes nothing at all. Exit 0 whenever it measured
-(a red develop is a finding, not a failure of this job) · 2 could not measure.
+    develop-health.sh --repo R --mode dry|live --plan F [--repo-dir D] [--run-url U]
+                      [--owner-alert LOGINS [--owner-alert-hours 4=0,3=24]]
+
+In dry mode it only writes the job summary, one comment on the culprit PR and the owner alerts;
+with --selftest-config (this repository's own CI) it writes nothing at all. Exit 0 whenever it
+measured (a red develop is a finding, not a failure of this job) · 2 could not measure.
 """
 import json
 import os
@@ -48,6 +62,10 @@ import pr_merge  # noqa: E402
 
 FREEZE_MARK = "<!-- develop-health v1 freeze -->"
 CULPRIT_MARK = "<!-- develop-health v1 culprit"
+ALERT_MARK = "<!-- owner-alert v1"
+ALERT_MARK_RX = re.compile(r"^<!-- owner-alert v1 class=([0-4]) ")
+OWNER_ALERT_MAX = 5
+OWNER_ALERT_CLASSIFY_MAX = 5
 MAX_PUSHES = 20
 STALL_MINUTES = 60
 REVERT_STALE_MINUTES = 120
@@ -347,6 +365,110 @@ def upsert_culprit(gh, repo, pr, head_sha, note, run_url):
         gh.write("POST", "repos/%s/issues/%d/comments" % (repo, pr), {"body": body})
 
 
+def parse_alert_args(logins, hours):
+    """(['login', ...], {class: hours}). Raises UsageError."""
+    names = [x.strip() for x in (logins or "").split(",") if x.strip()]
+    for n in names:
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", n):
+            raise mwg.UsageError("--owner-alert takes GitHub logins separated by commas, got %r" % n)
+    if len(names) > 5:
+        raise mwg.UsageError("--owner-alert: at most 5 logins")
+    table = {}
+    for part in (hours or "4=0,3=24").split(","):
+        m = re.fullmatch(r"\s*([34])\s*=\s*([0-9]{1,4})\s*", part)
+        if not m:
+            raise mwg.UsageError("--owner-alert-hours is like 4=0,3=24 (classes 3 and 4), got %r" % part)
+        table[int(m.group(1))] = int(m.group(2))
+    return names, table
+
+
+def _latest(events, kind, label=None):
+    """When the newest `kind` event (of that label, for `labeled`) happened; None if never."""
+    times = [mwg.parse_time(e.get("created_at")) for e in events if e.get("event") == kind
+             and (label is None or (e.get("label") or {}).get("name") == label)]
+    times = [t for t in times if t]
+    return max(times) if times else None
+
+
+def owner_alerts(gh, ctx, mentions, hours, write, run_url):
+    """The owner's queue: one @mention per riesgo-3/4 PR that has waited too long (see the module
+    docstring). Returns one entry per PR it looked at."""
+    out = []
+    if not mentions:
+        return out
+    repo = ctx.repo
+    classified = 0
+    for p in gh.list("repos/%s/pulls?state=open" % repo):
+        if p.get("draft"):
+            continue
+        labels = [lb.get("name") for lb in p.get("labels") or []]
+        base, head = (p.get("base") or {}).get("ref"), (p.get("head") or {}).get("ref")
+        same_repo = ((p.get("head") or {}).get("repo") or {}).get("full_name") == repo
+        promotion = bool(ctx.protected) and base == ctx.protected and head == ctx.integration and same_repo
+        if pr_merge.ESCALATION_LABEL not in labels and not promotion:
+            continue
+        classes = [int(x.split(":", 1)[1]) for x in labels if re.fullmatch(r"riesgo:[0-4]", x or "")]
+        cls = 4 if promotion else (max(classes) if classes else None)
+        if cls is not None and cls not in hours:
+            continue
+        n = p["number"]
+        events = gh.list("repos/%s/issues/%d/events" % (repo, n))
+        starts = [mwg.parse_time(p.get("created_at")), _latest(events, "ready_for_review"),
+                  _latest(events, "labeled", pr_merge.ESCALATION_LABEL)]
+        since = max(t for t in starts if t) if any(starts) else mwg.now()
+        waited = (mwg.now() - since).total_seconds() / 3600
+        if cls is None:
+            # merge-when-green never classifies a held PR (a session usually flags it when opening
+            # it), so the class is computed here with the same classifier, and kept as the label:
+            # the next run reads the label instead of the diff. Capped per run.
+            if waited < min(hours.values()):
+                continue
+            if classified >= OWNER_ALERT_CLASSIFY_MAX:
+                out.append({"pr": n, "class": None, "hours": int(waited), "action": "next run (not classified yet)"})
+                continue
+            classified += 1
+            try:
+                cls = pr_merge.classify_pr(ctx, p)[1]["class"]
+            except (mwg.ApiError, mwg.UsageError, ValueError, KeyError, TypeError) as e:
+                out.append({"pr": n, "class": None, "hours": int(waited), "action": "could not classify (%s)" % e})
+                continue
+            if write:
+                gh.write("POST", "repos/%s/issues/%d/labels" % (repo, n), {"labels": ["riesgo:%d" % cls]})
+            if cls not in hours:
+                continue
+        entry = {"pr": n, "class": cls, "hours": int(waited), "action": "waiting"}
+        out.append(entry)
+        if waited < hours[cls]:
+            continue
+        comments = gh.list("repos/%s/issues/%d/comments" % (repo, n))
+        done = False
+        for c in comments:
+            m = ALERT_MARK_RX.match(c.get("body") or "")
+            created = mwg.parse_time(c.get("created_at"))
+            if (c.get("user") or {}).get("login") == pr_merge.ACTIONS_BOT and m and created and \
+                    created >= since and int(m.group(1)) >= cls:
+                done = True
+                break
+        if done:
+            entry["action"] = "already alerted"
+            continue
+        if sum(1 for e in out if e["action"] in ("alerted", "would alert")) >= OWNER_ALERT_MAX:
+            entry["action"] = "next run"
+            continue
+        what = ("una promoción a %s" % ctx.protected) if promotion else "una PR marcada revision-humana"
+        body = ("%s class=%d since=%s -->\n%s esto es %s, riesgo:%d, y lleva %d h esperando tu decisión "
+                "(desde el %s UTC). Su `## TL;DR` dice qué mirar y trae el comando de merge. Es el único aviso "
+                "de esta espera; si no la quieres aquí, quita la marca o ciérrala.\n\nEjecución: %s"
+                % (ALERT_MARK, cls, mwg.iso(since), " ".join("@" + x for x in mentions), what, cls, int(waited),
+                   mwg.iso(since).replace("T", " ").rstrip("Z"), run_url or "(local)"))
+        if write:
+            status, _ = gh.write("POST", "repos/%s/issues/%d/comments" % (repo, n), {"body": body})
+            entry["action"] = "alerted" if status and status < 300 else "alert failed (HTTP %s)" % status
+        else:
+            entry["action"] = "would alert"
+    return out
+
+
 def render(plan):
     out = ["### develop-health · %s · %s" % (plan["repo"], "REAL" if plan["mode"] == "live" else "seco"), "",
            "- cabeza: `%s` · veredicto: %s · acción: **%s**" % ((plan.get("head") or "")[:7], plan.get("verdict", "-"),
@@ -359,13 +481,15 @@ def render(plan):
         a = plan["attribution"]
         out.append("- atribución: último verde `%s`, primer rojo `%s`, PR #%s" % (
             (a.get("last_green") or "")[:7], (a.get("first_red") or "")[:7], a.get("pr", "-")))
+    for a in plan.get("owner_alerts") or []:
+        out.append("- cola del dueño: #%s riesgo:%s, %s h esperando: %s" % (a["pr"], a["class"], a["hours"], a["action"]))
     out.append("- llamadas a la API: %s" % plan.get("api_calls"))
     return "\n".join(out)
 
 
 def main(argv):
     spec = {"repo": "v", "mode": "v", "plan": "v", "repo_dir": "v", "config": "v", "run_url": "v",
-            "selftest_config": "v", "help": "flag"}
+            "selftest_config": "v", "owner_alert": "v", "owner_alert_hours": "v", "help": "flag"}
     try:
         a, pos = mwg.parse_args(argv, spec)
         if a["help"]:
@@ -378,6 +502,7 @@ def main(argv):
             raise mwg.UsageError("--mode must be dry or live")
         if a["selftest_config"] and a["mode"] != "dry":
             raise mwg.UsageError("--selftest-config is dry and writes nothing: --mode dry")
+        mentions, hours = parse_alert_args(a["owner_alert"], a["owner_alert_hours"])
         gh = mwg.GH(os.environ.get("MWG_READ_TOKEN") or None)
         try:
             gh.check_quota()
@@ -387,6 +512,12 @@ def main(argv):
         else:
             ctx = pr_merge.Context(gh, repo, a["repo_dir"], a["config"], a["selftest_config"])
             plan = assess(gh, ctx, a["mode"], a["run_url"], write=not a["selftest_config"])
+            # The owner's queue is not the branch's health: a failure here is reported, and never
+            # turns a measured branch into "could not measure".
+            try:
+                plan["owner_alerts"] = owner_alerts(gh, ctx, mentions, hours, not a["selftest_config"], a["run_url"])
+            except mwg.ApiError as e:
+                plan["notes"].append("owner alert: could not read the queue (%s)" % e)
             if a["selftest_config"]:
                 plan["notes"].append("self-test: nothing written")
         plan["api_calls"] = gh.calls

@@ -256,6 +256,141 @@ S.check("dry: no rerun, no issue, no revert", not [c for c in H.writes(res) if n
         H.writes(res))
 S.check("dry: the culprit gets the SECO comment", any("SECO" in json.dumps(c["input"]) for c in H.writes(res, "POST")))
 
+# ── the owner's queue: one @mention per riesgo-3/4 PR that waited too long ───────────────────────────
+# NOW is 2026-10-01T12:00:00Z (harness). Each PR: labels, when it was labelled revision-humana / marked
+# ready, and the comments already on it.
+def alert_world(prs, **kw):
+    w = world([(G, "success", 1)], **kw)
+    pulls = []
+    for spec in prs:
+        n = spec["n"]
+        p = w.pull(n, labels=spec.get("labels", ()), draft=spec.get("draft", False), base=spec.get("base", "develop"),
+                   head_ref=spec.get("head"), fork=spec.get("fork", False), created=spec.get("created", "2026-09-28T09:00:00Z"))
+        pulls.append(p)
+        ev = [{"event": "labeled", "label": {"name": "revision-humana"}, "created_at": spec["flagged"]}] if spec.get("flagged") else []
+        if spec.get("ready"):
+            ev.append({"event": "ready_for_review", "created_at": spec["ready"]})
+        w.pages("repos/%s/issues/%d/events?per_page=100" % (R, n), [ev])
+        w.comments(n, spec.get("comments", []))
+    w.open_pulls(pulls)
+    return w
+
+
+def alert(w, mentions="owner", hours=None, mode="live", selftest=False):
+    plan = os.path.join(os.environ.get("TMPDIR", "/tmp"), "dh-alert-%d.json" % os.getpid())
+    args = ["--repo", R, "--mode", mode, "--plan", plan, "--run-url", "https://x/run/3"]
+    if mentions is not None:
+        args += ["--owner-alert", mentions]
+    if hours:
+        args += ["--owner-alert-hours", hours]
+    if selftest:
+        args += ["--selftest-config", os.path.join(H.ROOT, "merge-when-green", "selftest.json")]
+    res = H.run_script(DH, args, w)
+    res["plan"] = json.load(open(plan)) if os.path.exists(plan) else {}
+    os.path.exists(plan) and os.unlink(plan)
+    res["alerts"] = {a["pr"]: a["action"] for a in res["plan"].get("owner_alerts") or []}
+    res["posted"] = [c for c in H.writes(res, "POST") if c["path"].endswith("/comments")]
+    return res
+
+
+def mention_on(res, n):
+    return [c for c in res["posted"] if c["path"].endswith("/issues/%d/comments" % n)]
+
+
+FLAG3 = {"labels": ("riesgo:3", "revision-humana", "semver:minor")}
+res = alert(alert_world([dict(FLAG3, n=11, flagged="2026-09-30T10:00:00Z")]))
+S.check("riesgo-3 flagged 26 h ago: one comment that @mentions the owner", res["rc"] == 0 and
+        res["alerts"].get(11) == "alerted" and len(mention_on(res, 11)) == 1 and
+        "@owner" in mention_on(res, 11)[0]["input"]["body"] and
+        mention_on(res, 11)[0]["input"]["body"].startswith("<!-- owner-alert v1 class=3 "), (res["alerts"], res["err"]))
+S.check("...and the branch's own verdict is untouched", res["plan"].get("action") == "none", res["plan"].get("action"))
+res = alert(alert_world([dict(FLAG3, n=11, flagged="2026-10-01T02:00:00Z")]))
+S.check("riesgo-3 flagged 10 h ago: waits, no comment", res["alerts"].get(11) == "waiting" and not res["posted"], res["alerts"])
+res = alert(alert_world([{"n": 12, "labels": ("riesgo:4", "revision-humana"), "flagged": "2026-10-01T11:59:00Z"}]))
+S.check("riesgo-4 flagged a minute ago: at once", res["alerts"].get(12) == "alerted" and len(mention_on(res, 12)) == 1, res["alerts"])
+res = alert(alert_world([{"n": 13, "base": "main", "head": "develop", "created": "2026-10-01T11:00:00Z"}]))
+S.check("a promotion into main is riesgo-4 by definition: at once", res["alerts"].get(13) == "alerted" and
+        "class=4" in mention_on(res, 13)[0]["input"]["body"], res["alerts"])
+res = alert(alert_world([{"n": 13, "base": "main", "head": "develop", "fork": True}]))
+S.check("a 'promotion' from a fork is not one", 13 not in res["alerts"] and not res["posted"], res["alerts"])
+res = alert(alert_world([{"n": 14, "labels": ("riesgo:2", "revision-humana"), "flagged": "2026-09-25T10:00:00Z"}]))
+S.check("riesgo-2 flagged a week ago: weekly list only, no mention", 14 not in res["alerts"] and not res["posted"], res["alerts"])
+res = alert(alert_world([{"n": 15, "labels": ("riesgo:3",), "created": "2026-09-25T10:00:00Z"}]))
+S.check("riesgo-3 not flagged: not waiting on the owner", 15 not in res["alerts"] and not res["posted"], res["alerts"])
+res = alert(alert_world([{"n": 16, "labels": ("riesgo:4", "revision-humana"), "flagged": "2026-09-25T10:00:00Z", "draft": True}]))
+S.check("a draft is not ready for the owner", 16 not in res["alerts"] and not res["posted"], res["alerts"])
+BOT_ALERT = {"id": 70, "user": {"login": "github-actions[bot]"}, "created_at": "2026-09-30T11:00:00Z",
+             "updated_at": "2026-09-30T11:00:00Z", "body": "<!-- owner-alert v1 class=3 since=x -->\n@owner ..."}
+res = alert(alert_world([dict(FLAG3, n=11, flagged="2026-09-29T10:00:00Z", comments=[BOT_ALERT])]))
+S.check("already alerted in this spell: no second comment", res["alerts"].get(11) == "already alerted" and not res["posted"], res["alerts"])
+res = alert(alert_world([dict(FLAG3, n=11, flagged="2026-09-30T10:00:00Z",
+                              comments=[dict(BOT_ALERT, created_at="2026-09-29T08:00:00Z")])]))
+S.check("an alert from an earlier spell (before the latest flag) does not count", res["alerts"].get(11) == "alerted", res["alerts"])
+res = alert(alert_world([dict(FLAG3, n=11, flagged="2026-09-29T10:00:00Z", comments=[dict(BOT_ALERT, user={"login": "dev"})])]))
+S.check("someone else's comment with the mark does not count", res["alerts"].get(11) == "alerted", res["alerts"])
+res = alert(alert_world([{"n": 12, "labels": ("riesgo:4", "revision-humana"), "flagged": "2026-09-29T10:00:00Z",
+                          "comments": [BOT_ALERT]}]))
+S.check("the class rose from 3 to 4 since the alert: alert again", res["alerts"].get(12) == "alerted", res["alerts"])
+res = alert(alert_world([dict(FLAG3, n=11, flagged="2026-09-29T10:00:00Z", ready="2026-10-01T10:00:00Z")]))
+S.check("marked ready 2 h ago: the wait starts there", res["alerts"].get(11) == "waiting" and not res["posted"], res["alerts"])
+w = alert_world([dict(FLAG3, n=11, flagged="2026-09-30T10:00:00Z")])
+res = alert(w, mentions=None)
+S.check("off by default: without --owner-alert the queue is not even read",
+        not any("pulls?state=open" in (c["path"] or "") for c in res["calls"]) and not res["posted"], res["calls"][-3:])
+res = alert(w, hours="3=48")
+S.check("--owner-alert-hours 3=48: 26 h is not enough", res["alerts"].get(11) == "waiting" and not res["posted"], res["alerts"])
+res = alert(w, mode="dry")
+S.check("dry mode: the notice is written too (it is not an action on the code)", res["alerts"].get(11) == "alerted", res["alerts"])
+res = alert(w, mode="dry", selftest=True)
+S.check("self-test: never written", res["alerts"].get(11) == "would alert" and not H.writes(res), (res["alerts"], H.writes(res)))
+many = [dict(FLAG3, n=20 + i, flagged="2026-09-29T10:00:00Z") for i in range(7)]
+res = alert(alert_world(many))
+S.check("at most 5 mentions per run, the rest next run", len(res["posted"]) == 5 and
+        sorted(res["alerts"].values()).count("next run") == 2, res["alerts"])
+res = alert(w, mentions="owner,bad login!")
+S.check("a mention that is not a login: usage error, nothing read", res["rc"] == 2 and not res["calls"], res["err"])
+res = alert(w, hours="2=5")
+S.check("--owner-alert-hours only knows classes 3 and 4", res["rc"] == 2, res["err"])
+# A session flags a PR when it opens it, and merge-when-green never classifies a held PR: no riesgo
+# label. The alert classifies it with the same classifier and keeps the class as the label.
+def unlabelled(n, files, flagged="2026-09-30T10:00:00Z"):
+    return {"n": n, "labels": ("revision-humana", "semver:minor"), "flagged": flagged, "files": files}
+
+
+def alert_world_files(prs):
+    w = alert_world(prs)
+    for spec in prs:
+        if spec.get("files"):
+            w.files(spec["n"], spec["files"])
+            w.commits(spec["n"])
+    return w
+
+
+res = alert(alert_world_files([unlabelled(31, [".github/workflows/ci.yml"])]))
+S.check("flagged, no riesgo label, a workflow change: classified riesgo-3, labelled, alerted",
+        res["alerts"].get(31) == "alerted" and any(c["path"].endswith("/issues/31/labels") and
+        c["input"] == {"labels": ["riesgo:3"]} for c in H.writes(res, "POST")), (res["alerts"], H.writes(res)))
+res = alert(alert_world_files([unlabelled(32, ["CLAUDE.md"])]))
+S.check("flagged, no riesgo label, riesgo-2 content: labelled, not alerted",
+        32 not in res["alerts"] and not res["posted"] and any(c["path"].endswith("/issues/32/labels") and
+        c["input"] == {"labels": ["riesgo:2"]} for c in H.writes(res, "POST")), (res["alerts"], H.writes(res)))
+res = alert(alert_world_files([unlabelled(40 + i, ["CLAUDE.md"]) for i in range(6)]))
+S.check("at most 5 classifications per run", sum(1 for c in H.writes(res, "POST") if c["path"].endswith("/labels")) == 5
+        and list(res["alerts"].values()) == ["next run (not classified yet)"], res["alerts"])
+res = alert(alert_world_files([unlabelled(31, [".github/workflows/ci.yml"])]), mode="dry", selftest=True)
+S.check("self-test: classified but not labelled", res["alerts"].get(31) == "would alert" and not H.writes(res), H.writes(res))
+w = alert_world([unlabelled(33, None)])
+res = alert(w)
+S.check("a PR it cannot classify is reported, the run goes on", res["rc"] == 0 and
+        str(res["alerts"].get(33, "")).startswith("could not classify"), res["alerts"])
+
+w = alert_world([])
+w.r("GET", "repos/%s/pulls?state=open&per_page=100" % R, {"message": "boom"}, status=500)
+res = alert(w)
+S.check("the queue cannot be read: the branch's verdict still stands, and it says so",
+        res["rc"] == 0 and res["plan"].get("action") == "none" and "owner alert" in json.dumps(res["plan"]["notes"]),
+        (res["rc"], res["plan"].get("notes"), res["err"]))
+
 # ── self-test: this repository's own CI reads a real repo and writes nothing at all ─────────────────
 SC = os.path.join(H.ROOT, "merge-when-green", "selftest.json")
 VA = "validate actions"  # the job selftest.json requires
