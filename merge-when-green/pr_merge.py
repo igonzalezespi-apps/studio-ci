@@ -95,6 +95,9 @@ def compose_message(pull, commits, cls, run_url):
 # ── context: everything read once per run ────────────────────────────────────────────────────────
 class Context:
     def __init__(self, gh, repo, repo_dir=None, config_path=None, selftest_config=None):
+        if config_path and (".." in config_path or config_path.startswith("/")
+                            or not re.fullmatch(r"[\w./-]+", config_path)):
+            raise mwg.UsageError("--config must be a path inside the repository, got %r" % config_path)
         self.gh, self.repo = gh, repo
         self.meta = gh.get("repos/%s" % repo)
         self.default_branch = self.meta["default_branch"]

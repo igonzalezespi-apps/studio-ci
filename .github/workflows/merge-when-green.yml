@@ -189,12 +189,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # Public repos do not pay for minutes: wait out the settle time inside the run instead
           # of leaving the merge to the next scheduled sweep.
-          SETTLE_WAIT: ${{ github.event.repository.private && '0' || '150' }}
+          VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
         run: |
           set -uo pipefail
+          settle_wait=0
+          [ "$VISIBILITY" = public ] && settle_wait=150
           args=(sweep --repo "$REPO" --mode "$MODE" --plan "$RUNNER_TEMP/plan.json" --repo-dir .consumer
                 --config "$CONFIG_PATH" --run-url "$RUN_URL" --comment "$WRITE" --labels "$WRITE"
-                --max-settle-wait "$SETTLE_WAIT")
+                --max-settle-wait "$settle_wait")
           # A PR's checks finished: look at that PR only. A push to the integration branch finished
           # (typically the previous automatic merge): sweep every open PR, the next one may go now.
           if [ -n "$PR" ]; then

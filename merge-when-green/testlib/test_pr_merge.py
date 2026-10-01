@@ -476,6 +476,10 @@ S.check("self-test refuses to write", res["rc"] == 2 and not H.writes(res), res[
 res = sweep(w, "live", extra=["--pr", "5", "--comment", "false", "--labels", "false", "--selftest-config", sc])
 S.check("self-test refuses live", res["rc"] == 2)
 
+w = world(); add_pr(w, 5)
+res = H.run_script(PM, ["decide", "--repo", R, "--pr", "5", "--config", "../../etc/passwd"], w)
+S.check("usage: a config path outside the repository -> exit 2", res["rc"] == 2, res)
+
 # ── usage ────────────────────────────────────────────────────────────────────────────────────────
 for label, args in (("decide --repo without value", ["decide", "--pr", "5", "--repo"]),
                     ("sweep bad mode", ["sweep", "--repo", R, "--mode", "yes"]),

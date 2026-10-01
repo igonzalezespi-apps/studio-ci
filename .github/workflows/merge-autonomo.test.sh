@@ -209,7 +209,7 @@ def body_cases(name, doc):
         plan = step(doc["jobs"]["plan"], "Plan")["run"]
         env = {"REPO": "acme/proyecto", "EVENT_NAME": "workflow_run", "RUN_EVENT": "pull_request", "RUN_PRS": "[5, 6]", "PR": "", "MODE": "dry",
                "WRITE": "true", "SELFTEST": "false", "CONFIG_PATH": ".github/merge-when-green.json", "RUN_URL": "u",
-               "SETTLE_WAIT": "150"}
+               "VISIBILITY": "public"}
         for label, extra, want in (("workflow_run passes its PRs", {}, "--prs [5, 6]"),
                                    ("dispatch with a PR", {"EVENT_NAME": "workflow_dispatch", "PR": "7"}, "--pr 7"),
                                    ("self-test uses the built-in config and writes nothing",
@@ -220,6 +220,11 @@ def body_cases(name, doc):
             calls = open(log).read()
             if rc != 0 or want not in calls or (extra.get("SELFTEST") == "true" and "--selftest-config" not in calls):
                 fail("%s plan body: %s (rc %s) %s %s" % (name, label, rc, calls, out[-200:]))
+        for vis, want in (("public", "--max-settle-wait 150"), ("private", "--max-settle-wait 0")):
+            open(log, "w").close()
+            run_body(plan, dict(env, VISIBILITY=vis), cwd=tmp)
+            if want not in open(log).read():
+                fail("%s plan body: %s repo should pass %s" % (name, vis, want))
         open(log, "w").close()
         rc, _, out = run_body(plan, dict(env, RUN_EVENT="push", RUN_PRS="[]"), cwd=tmp)
         calls = open(log).read()
