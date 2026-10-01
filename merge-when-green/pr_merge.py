@@ -46,6 +46,9 @@ ACTIONS_BOT = "github-actions[bot]"
 SKIP_CI = re.compile(r"\[(skip ci|ci skip|no ci|skip actions|actions skip)\]", re.I)
 SKIP_CHECKS = re.compile(r"^(\s*skip-checks\s*):", re.I | re.M)
 TRAILER_RX = re.compile(r"^Risk-class:\s*riesgo:([0-4])\s*$", re.M)
+MERGE_GATE_RX = re.compile(r"^Merge-gate:\s*merge-when-green\b", re.M)
+TRAILER_LIKE = re.compile(r"^(\s*)(risk-class|merge-gate)(\s*):", re.I | re.M)
+MAX_REVERT_FILES = 20
 REVERT_MARK_RX = re.compile(r"<!--\s*revert-of:\s*#(\d+)\s+sha:\s*([0-9a-f]{40})\s*-->")
 
 
@@ -71,8 +74,26 @@ def neutralize(text):
     return SKIP_CHECKS.sub(lambda m: "%s (neutralized by merge-when-green):" % m.group(1), text)
 
 
+def neutralize_trailers(text):
+    """The author's text must not carry the gate's trailers: develop-health and revert-merge read
+    the class from the squash commit, and a `Risk-class: riesgo:3` line in a commit body would let
+    the author pick the class of their own merge (and so block its automatic revert)."""
+    return TRAILER_LIKE.sub(lambda m: "%s%s (from the PR, ignored)%s:" % (m.group(1), m.group(2), m.group(3)),
+                            text or "")
+
+
+def trailer_class(message):
+    """The class the gate wrote into a squash commit: the LAST `Risk-class:` line, and only when a
+    `Merge-gate: merge-when-green` line follows it (the gate writes both as the final paragraph).
+    None if there is none."""
+    found = list(TRAILER_RX.finditer(message or ""))
+    if not found or not MERGE_GATE_RX.search(message, found[-1].end()):
+        return None
+    return int(found[-1].group(1))
+
+
 def compose_message(pull, commits, cls, run_url):
-    title = "%s (#%d)" % (pull["title"].strip(), pull["number"])
+    title = "%s (#%d)" % (neutralize_trailers(pull["title"]).strip(), pull["number"])
     parts = []
     msgs = [((c.get("commit") or {}).get("message") or "") for c in commits]
     if len(msgs) == 1:
@@ -88,8 +109,8 @@ def compose_message(pull, commits, cls, run_url):
                 block += "\n\n" + "\n".join("  " + ln if ln else "" for ln in body.strip("\n").splitlines())
             parts.append(block)
     trailers = "Risk-class: riesgo:%d\nMerge-gate: merge-when-green %s" % (cls, run_url or "(local)")
-    body = "\n\n".join(parts + [trailers])
-    return neutralize(title), neutralize(body)
+    body = "\n\n".join([neutralize(neutralize_trailers(p)) for p in parts] + [trailers])
+    return neutralize(title), body
 
 
 # ── context: everything read once per run ────────────────────────────────────────────────────────
@@ -107,6 +128,7 @@ class Context:
         self.blockers = []      # repo-level reasons nothing can merge (config, policy, workflows)
         self.waits = []         # repo-level reasons to wait (develop red, freeze)
         self.policy = mwg.load_policy(files) or {}
+        self.hook_paths = risk_class.hook_paths(files.read(".claude/settings.json"))
         raw = files.read(config_path or mwg.CONFIG_PATH)
         if raw is None and selftest_config:
             with open(selftest_config, encoding="utf-8") as fh:
@@ -270,8 +292,32 @@ def check_verdict(data, head_sha, cls, cfg):
     return True, vcls, ""
 
 
+def _blob_id(gh, repo, path, ref):
+    """What is at `path` in `ref`: "file:<blob sha>", "dir", or None if nothing is there."""
+    data = gh.get_or_none(mwg.contents_path(repo, path, ref))
+    if data is None:
+        return None
+    if isinstance(data, list):
+        return "dir"
+    return "%s:%s" % (data.get("type"), data.get("sha"))
+
+
+def ever_held(ctx, pull):
+    """A hold label put on the PR at ANY time: once a person was asked to look, removing the label
+    (a session shares the owner's account) does not send the PR back to the automatic path."""
+    if getattr(ctx, "ignore_holds", False):
+        return []
+    events = ctx.gh.list("repos/%s/issues/%d/events" % (ctx.repo, pull["number"]))
+    return sorted({((e.get("label") or {}).get("name") or "") for e in events if e.get("event") == "labeled"}
+                  & set(HUMAN_LABELS))
+
+
 def revert_check(ctx, pull):
-    """(ok, original-class, reason) for a PR that claims to revert an automatic merge."""
+    """(ok, original-class, reason) for a PR that claims to revert an automatic merge. It must be
+    exactly what GitHub's revertPullRequest wrote for the App: one signed commit by the App, the
+    same files as the original, and each of them, at the revert's head, byte-identical to the
+    parent of the reverted commit. Anything pushed on top of it fails the check (and develop-health
+    escalates), whoever pushed it."""
     app = bot_login(ctx.cfg.get("app_slug"))
     if not app or (pull.get("user") or {}).get("login") != app:
         return False, None, "a revert must be opened by the merge App"
@@ -285,20 +331,63 @@ def revert_check(ctx, pull):
     if (orig.get("merged_by") or {}).get("login") != app:
         return False, None, "#%d was not merged by the App" % orig_n
     commit = ctx.gh.get("repos/%s/commits/%s" % (ctx.repo, orig_sha))
-    t = TRAILER_RX.search((commit.get("commit") or {}).get("message") or "")
-    if not t:
+    ocls = trailer_class((commit.get("commit") or {}).get("message") or "")
+    if ocls is None:
         return False, None, "the reverted commit has no Risk-class trailer"
-    ocls = int(t.group(1))
     if ocls > 2:
         return False, ocls, "the reverted commit is riesgo:%d" % ocls
-    mine = sorted(f["filename"] for f in ctx.gh.list("repos/%s/pulls/%d/files" % (ctx.repo, pull["number"])))
-    theirs = sorted(f["filename"] for f in ctx.gh.list("repos/%s/pulls/%d/files" % (ctx.repo, orig_n)))
+    parents = commit.get("parents") or []
+    if len(parents) != 1:
+        return False, ocls, "the reverted commit is not a single-parent squash"
+    commits = ctx.gh.list("repos/%s/pulls/%d/commits" % (ctx.repo, pull["number"]))
+    if len(commits) != 1:
+        return False, ocls, "the revert has %d commits, not the one GitHub wrote for the App" % len(commits)
+    c = commits[0]
+    who = ((c.get("author") or {}).get("login"), (c.get("committer") or {}).get("login"))
+    signed = ((c.get("commit") or {}).get("verification") or {}).get("verified") is True
+    if who[0] != app or who[1] not in (app, "web-flow") or not signed:
+        return False, ocls, "the revert's commit is by %s/%s%s, not the App's signed commit" % (
+            who[0] or "?", who[1] or "?", "" if signed else ", unsigned")
+
+    def names(files):
+        return sorted({n for f in files for n in (f.get("filename"), f.get("previous_filename")) if n})
+    mine = names(ctx.gh.list("repos/%s/pulls/%d/files" % (ctx.repo, pull["number"])))
+    theirs = names(ctx.gh.list("repos/%s/pulls/%d/files" % (ctx.repo, orig_n)))
     if mine != theirs:
         return False, ocls, "the revert does not touch exactly the files of #%d" % orig_n
+    if len(mine) > MAX_REVERT_FILES:
+        return False, ocls, "%d files: too many to compare one by one (max %d)" % (len(mine), MAX_REVERT_FILES)
+    before = parents[0].get("sha") or ""
+    for name in mine:
+        if _blob_id(ctx.gh, ctx.repo, name, pull["head"]["sha"]) != _blob_id(ctx.gh, ctx.repo, name, before):
+            return False, ocls, "%s at the revert's head is not what it was before #%d" % (name, orig_n)
     return True, ocls, "reverts #%d (riesgo:%d)" % (orig_n, ocls)
 
 
-def decide_pr(ctx, pull, open_pulls=()):
+def classify_pr(ctx, pull):
+    facts, _ = risk_class.collect_api(ctx.gh, ctx.repo, pull["number"], ctx.policy, ctx.cfg, pull=pull,
+                                      hooks=getattr(ctx, "hook_paths", None))
+    return facts, risk_class.classify(facts, ctx.policy, ctx.cfg)
+
+
+def recheck(ctx, pull, head_sha, labels):
+    """Read the PR once more right before saying "merge": what a person or a session changed while
+    this run was deciding (a new head, a new base, a hold label) must not ride on the old answer."""
+    fresh = ctx.gh.get("repos/%s/pulls/%d" % (ctx.repo, pull["number"]))
+    if fresh["head"]["sha"] != head_sha:
+        return "wait", "the head moved while deciding", fresh
+    again = static_skip(ctx, fresh)
+    if again:
+        return "skip", "changed while deciding: %s" % again, fresh
+    if fresh["base"]["ref"] != pull["base"]["ref"] or sorted(labels_of(fresh)) != sorted(labels):
+        return "wait", "the base or the labels changed while deciding", fresh
+    held = ever_held(ctx, fresh)
+    if held:
+        return "skip", "was labelled %s at some point: it stays with a person" % ", ".join(held), fresh
+    return None, "", fresh
+
+
+def decide_pr(ctx, pull, open_pulls=(), pre=None):
     gh, cfg = ctx.gh, ctx.cfg
     if ctx.hard_blockers:
         return result(pull, "skip", ["repo not eligible: %s" % b for b in ctx.hard_blockers], static=True)
@@ -312,6 +401,18 @@ def decide_pr(ctx, pull, open_pulls=()):
     # A revert of an automatic merge: own path, exempt from the freeze, a red develop, the class
     # ceiling, the lens verdict, semver and the method — those are what it exists to undo.
     if REVERT_LABEL in labels:
+        # it exists to lift a red develop-health froze; once the branch is green again (a fix went
+        # in first) undoing the PR would only throw work away, and might turn it red again
+        health = (ctx.develop or {}).get("verdict")
+        if health == "green":
+            return result(pull, "skip", ["%s is green again: the revert is not needed (develop-health closes it)"
+                                         % ctx.integration], revert=True)
+        if health != "red":
+            return result(pull, "wait", ["%s is %s: the revert waits for its verdict" % (ctx.integration, health)],
+                          revert=True)
+        if not ctx.freeze:
+            return result(pull, "skip", ["no merge-freeze issue is open: develop-health did not ask for it"],
+                          revert=True)
         ok, ocls, why = revert_check(ctx, pull)
         if not ok:
             return result(pull, "skip", ["invalid revert: %s" % why], revert=True)
@@ -321,13 +422,19 @@ def decide_pr(ctx, pull, open_pulls=()):
                                 state_workflows=cfg["state_workflows"], settle=cfg["settle_seconds"])
         ci = {k: v[k] for k in ("verdict", "red", "pending", "missing", "required_green", "required_total", "settle_left")}
         if v["verdict"] == "green":
+            what, why2, fresh = recheck(ctx, pull, head_sha, labels)
+            if what:
+                return result(pull, what, [why2], revert=True, cls=ocls, ci=ci)
+            if fresh.get("mergeable") is not True:
+                return result(pull, "wait" if fresh.get("mergeable") is None else "skip",
+                              ["GitHub is still computing mergeability" if fresh.get("mergeable") is None
+                               else "merge conflicts"], revert=True, cls=ocls, ci=ci)
             return result(pull, "merge", [why], revert=True, cls=ocls, ci=ci)
         if v["verdict"] == "red":
             return result(pull, "skip", ["the revert's CI is red: develop-health escalates"], revert=True, cls=ocls, ci=ci)
         return result(pull, "wait", ["CI %s" % v["verdict"]], revert=True, cls=ocls, ci=ci)
 
-    facts, _ = risk_class.collect_api(gh, ctx.repo, pull["number"], ctx.policy, cfg, pull=pull)
-    rc = risk_class.classify(facts, ctx.policy, cfg)
+    facts, rc = pre or classify_pr(ctx, pull)
     cls = rc["class"]
     is_bot = rc["bot"]
     base_kw = {"risk": {k: rc[k] for k in ("class", "label", "review", "reasons", "files", "lines_code", "bot")}}
@@ -401,9 +508,9 @@ def decide_pr(ctx, pull, open_pulls=()):
                   "unsettled": "settling, %ds left" % v["settle_left"]}.get(v["verdict"], "")
         return result(pull, "wait", ["CI %s: %s" % (v["verdict"], detail)], cls=cls, **base_kw)
 
-    fresh = gh.get("repos/%s/pulls/%d" % (ctx.repo, pull["number"]))
-    if fresh["head"]["sha"] != head_sha:
-        return result(pull, "wait", ["the head moved while deciding"], cls=cls, **base_kw)
+    what, why, fresh = recheck(ctx, pull, head_sha, labels)
+    if what:
+        return result(pull, what, [why], cls=cls, **base_kw)
     if fresh.get("mergeable") is None:
         return result(pull, "wait", ["GitHub is still computing mergeability"], cls=cls, **base_kw)
     if fresh.get("mergeable") is False or fresh.get("mergeable_state") == "dirty":
@@ -589,24 +696,63 @@ def cmd_sweep(a):
     plan["waits"] = list(ctx.waits)
     plan["develop"] = ctx.develop
     pulls, open_pulls = candidates(ctx, only)
-    # reverts first, then oldest first; static skips cost nothing and are not counted
-    pulls = sorted(pulls, key=lambda p: (REVERT_LABEL not in labels_of(p), p.get("created_at") or ""))
+    # Classify first (a few calls per PR), then spend the CI budget where a merge or an escalation
+    # can come out: reverts, then the PRs at or under max_auto_class, then riesgo-3/4 (to escalate),
+    # oldest first in each tier. A riesgo-1/2 above max_auto_class is decided without reading CI and
+    # costs no budget, so a queue of them can never starve a riesgo-0 opened after them.
+    max_auto = int(ctx.cfg.get("max_auto_class", 0))
     budget = int(a["max_candidates"] or ctx.cfg.get("max_candidates", 5))
+    pre = {}
+    quota_at = gh.calls
+    try:
+        for pull in pulls:
+            if len(pre) >= 4 * budget:  # GITHUB_TOKEN has 1,000 requests an hour per repository
+                break
+            if static_skip(ctx, pull) is None and REVERT_LABEL not in labels_of(pull):
+                if gh.calls - quota_at >= 40:
+                    quota_at = gh.calls
+                    gh.check_quota()
+                try:
+                    pre[pull["number"]] = classify_pr(ctx, pull)
+                except (mwg.ApiError, mwg.UsageError, ValueError, KeyError, TypeError) as e:
+                    pre[pull["number"]] = e  # decided below as "could not measure"
+    except mwg.QuotaLow as e:
+        plan["waits"].append("API quota: %s" % e)
+        return finish()
+
+    def cls_of(pull):
+        p = pre.get(pull["number"])
+        return p[1]["class"] if isinstance(p, tuple) else None
+
+    def tier(pull):
+        if REVERT_LABEL in labels_of(pull):
+            return 0
+        c = cls_of(pull)
+        return 1 if c is not None and c <= max_auto else 2
+    pulls = sorted(pulls, key=lambda p: (tier(p), p.get("created_at") or ""))
     evaluated = 0
     max_wait = int(a["max_settle_wait"] or 0)
     for pull in pulls:
-        if static_skip(ctx, pull) is None:
+        p = pre.get(pull["number"])
+        cheap = isinstance(p, Exception) or (cls_of(pull) is not None and max_auto < cls_of(pull) <= 2)
+        if static_skip(ctx, pull) is None and not cheap:
             if evaluated >= budget:
                 plan["decisions"].append(result(pull, "wait", ["over max_candidates=%d this run" % budget]))
                 continue
             evaluated += 1
         try:
-            gh.check_quota() if gh.calls and gh.calls % 40 == 0 else None
-            d = decide_pr(ctx, pull, open_pulls)
+            if gh.calls - quota_at >= 40:
+                quota_at = gh.calls
+                gh.check_quota()
+            if isinstance(p, Exception):
+                raise p
+            d = decide_pr(ctx, pull, open_pulls, pre=p)
             if d["decision"] == "wait" and (d.get("ci") or {}).get("verdict") == "unsettled" and \
                     0 < d["ci"]["settle_left"] <= max_wait and not plan["merge_pr"]:
                 _sleep(d["ci"]["settle_left"] + 5)
-                d = decide_pr(ctx, gh.get("repos/%s/pulls/%d" % (repo, pull["number"])), open_pulls)
+                again = gh.get("repos/%s/pulls/%d" % (repo, pull["number"]))
+                d = decide_pr(ctx, again, open_pulls,
+                              pre=p if isinstance(p, tuple) and again["head"]["sha"] == pull["head"]["sha"] else None)
         except mwg.QuotaLow as e:
             plan["waits"].append("API quota: %s" % e)
             break

