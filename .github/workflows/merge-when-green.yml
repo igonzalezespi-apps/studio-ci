@@ -65,6 +65,11 @@ on:
         type: string
         required: false
         default: ubuntu-latest
+      allow-hosted:
+        description: "PRIVATE repos only: run on a GitHub-hosted runner (billed minutes, at least one per run, ~96 runs a day with the documented schedule). Without it, a private repo must name its own runner in runs-on or the job does not start."
+        type: boolean
+        required: false
+        default: false
       comment:
         description: "Label riesgo:N and keep one comment per evaluated PR."
         type: boolean
@@ -83,6 +88,12 @@ on:
 jobs:
   plan:
     name: plan
+    # A private repository pays for hosted minutes (one minute at least per run): the job does not
+    # even start there on a GitHub-hosted label unless the caller opts in with allow-hosted.
+    if: >-
+      !github.event.repository.private || inputs.allow-hosted ||
+      !(startsWith(inputs.runs-on, 'ubuntu-') || startsWith(inputs.runs-on, 'windows-') ||
+        startsWith(inputs.runs-on, 'macos-'))
     runs-on: ${{ github.event.repository.private && (startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on) || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
@@ -168,6 +179,7 @@ jobs:
           sparse-checkout: |
             /.github/
             /scripts/hooks/guard.policy.json
+            /.claude/settings.json
 
       - name: Plan
         id: plan
@@ -279,6 +291,7 @@ jobs:
           sparse-checkout: |
             /.github/
             /scripts/hooks/guard.policy.json
+            /.claude/settings.json
 
       - name: Mint the App token (this repository only)
         id: app_token

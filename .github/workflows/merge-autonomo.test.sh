@@ -263,10 +263,45 @@ def body_cases(name, doc):
             fail("%s assess body: self-test config not passed" % name)
 
 
+def eval_if(expr, private, allow, runs_on):
+    """The job-level `if:` that keeps a private repo off hosted runners, evaluated for real: the
+    expression is translated to Python (only the operators it uses) and run per scenario."""
+    py = re.sub(r"startsWith\(inputs\.runs-on, '([^']*)'\)", r"runs_on.startswith('\1')", expr)
+    py = py.replace("github.event.repository.private", "private").replace("inputs.allow-hosted", "allow")
+    py = py.replace("||", " or ").replace("&&", " and ")
+    py = re.sub(r"!(?!=)", " not ", py)
+    if re.search(r"[A-Za-z_.-]+\.[A-Za-z_-]+", py.replace("runs_on.startswith", "")):
+        raise ValueError("unexpected context in the hosted-runner condition: %s" % expr)
+    return bool(eval(py, {}, {"private": private, "allow": allow, "runs_on": runs_on}))
+
+
+def hosted_cases(name, job_id, job):
+    expr = str(job.get("if") or "")
+    cases = (("public, hosted", False, False, "ubuntu-latest", True),
+             ("private, hosted by default: never starts", True, False, "ubuntu-latest", False),
+             ("private, another hosted image", True, False, "macos-14", False),
+             ("private, opted in", True, True, "ubuntu-latest", True),
+             ("private, own runner label", True, False, "self-hosted", True),
+             ("private, own runner JSON list", True, False, '["self-hosted", "studio"]', True))
+    for label, private, allow, runs_on, want in cases:
+        try:
+            got = eval_if(expr, private, allow, runs_on)
+        except Exception as e:  # noqa: BLE001
+            got = "error %s" % e
+        if got is not want:
+            fail("%s/%s hosted-runner guard: %s -> %s (want %s)" % (name, job_id, label, got, want))
+
+
 def main(path):
     name = os.path.basename(path)
     text, doc = load(path)
     static_rules(name, text, doc)
+    hosted_cases(name, "plan" if "plan" in doc["jobs"] else "assess", doc["jobs"].get("plan") or doc["jobs"]["assess"])
+    for jid, job in doc["jobs"].items():
+        for s in steps_of(job):
+            w = s.get("with") or {}
+            if w.get("path") == ".consumer" and "/.claude/settings.json" not in str(w.get("sparse-checkout", "")):
+                fail("%s/%s: the caller's .claude/settings.json is not read (hook scripts would not be class 3)" % (name, jid))
     if name == "merge-when-green.yml":
         plan_gate_cases(name, doc, "plan")
         app_gate_cases(name, doc, "merge")
@@ -336,6 +371,9 @@ mutate "$MWG" "a wait counts as a failure" 'text.replace("0 | 10 | 20 | 30 | 40)
 mutate "$MWG" "pull_request_target accepted" 'text.replace("pull_request_target) die", "pull_request_target) true", 1)'
 mutate "$DH" "the revert job without an Environment" 'text.replace("    environment: ${{ inputs.environment }}\n", "", 1)'
 mutate "$DH" "the revert on any ref" 'text.replace("[ \"$REF\" = \"refs/heads/$DEFAULT_BRANCH\" ] || { echo \"::warning::ref $REF is not the default branch\"; ok=false; }", "true", 1)'
+mutate "$MWG" "a private repo runs the plan on a hosted runner" 'text.replace("!github.event.repository.private || inputs.allow-hosted ||", "true ||", 1)'
+mutate "$DH" "a private repo runs assess on a hosted runner" 'text.replace("!github.event.repository.private || inputs.allow-hosted ||", "true ||", 1)'
+mutate "$MWG" "the plan does not read the hook settings" 'text.replace("            /.claude/settings.json\n", "", 1)'
 mutate "$DH" "the assess job reads the key" 'text.replace("          MWG_READ_TOKEN: ${{ github.token }}\n          REPO: ${{ github.repository }}\n          MODE:", "          MWG_READ_TOKEN: ${{ github.token }}\n          K: ${{ secrets.MERGE_APP_PRIVATE_KEY }}\n          REPO: ${{ github.repository }}\n          MODE:", 1)'
 
 echo
