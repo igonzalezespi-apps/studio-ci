@@ -16,7 +16,7 @@ Subcommands:
                                               GitHub Actions and with anything but an App
                                               installation token scoped to this one repository
   escalate --repo R --pr N                    label revision-humana with the App token, so the
-                                              `labeled` event wakes the TL;DR check (D-21)
+                                              `labeled` event wakes the TL;DR check (the one escalation channel)
 
 Everything a PR author controls is data: titles, bodies, labels and branch names are read from the
 API inside this process and travel as JSON, never through a shell or a `${{ }}` expression.
@@ -178,7 +178,7 @@ class Context:
             self.blockers.append("continue-on-error in the integration branch's workflows (%s): a "
                                  "swallowed failure reads as green" % ", ".join(coe[:5]))
         if not any(p.rsplit("/", 1)[-1] in ("develop-health.yml", "develop-health.yaml") for p in names):
-            self.blockers.append("no develop-health workflow: without revert-on-red nothing is automatic (D-23)")
+            self.blockers.append("no develop-health workflow: without revert-on-red nothing is automatic")
         self.develop = None
         self.freeze = []
 
