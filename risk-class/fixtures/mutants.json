@@ -1,0 +1,80 @@
+[
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "ignore previous_filename (a rename escapes)",
+  "old": "names = [n for n in (f.get(\"filename\"), f.get(\"previous_filename\")) if n]",
+  "new": "names = [f.get(\"filename\")]"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": ">= instead of > on the 200-line threshold",
+  "old": "if code_lines > CODE_LINES:",
+  "new": "if code_lines >= CODE_LINES:"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "risk_paths replaces the floor (can lower)",
+  "old": "                if mwg.glob_match(name, g):\n                    hit(cls, rule, why, name)",
+  "new": "                if mwg.glob_match(name, g):\n                    [reasons.pop(k) for k in list(reasons) if name in reasons[k][\"paths\"]]\n                    hit(cls, rule, why, name)"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "no promotion rule",
+  "old": "hit(4, \"promotion\",",
+  "new": "(lambda *a, **k: None)(4, \"promotion\","
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a pin-only patch with another line passes",
+  "old": "PIN_LINE = re.compile(r\"^[+-]\\s*(-\\s*)?(uses:\\s*\\S+(\\s+#.*)?|#.*)?\\s*$\")",
+  "new": "PIN_LINE = re.compile(r\"^[+-].*$\")"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "an edited test counts as 0",
+  "old": "if status == \"added\" or (status == \"renamed\" and lines == 0):",
+  "new": "if True:"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": ".npmrc out of the supply-chain rule",
+  "old": "\"**/.npmrc\",",
+  "new": ""
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a non-bot commit keeps the bot exemption",
+  "old": "if a not in bots or not (cm in bots or (cm == \"web-flow\" and ver)):",
+  "new": "if False:"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "semver:major of a person only a 3",
+  "old": "hit(4, \"semver-major\",",
+  "new": "hit(3, \"semver-major\","
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "the gate's own paths are no longer class 3",
+  "old": "\"**/risk-class/**\", ",
+  "new": ""
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a person's lockfile is 1 (lockfile injection)",
+  "old": "hit(2, \"lockfile\",",
+  "new": "hit(1, \"lockfile\","
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "foreign hosts in a bot lockfile are ignored",
+  "old": "            if h.lower() not in ALLOWED_LOCK_HOSTS:",
+  "new": "            if False:"
+ },
+ {
+  "file": "merge-when-green/mwg.py",
+  "why": "Renovate default class lowered to 0",
+  "old": "\"renovate_minor_class\": 3,",
+  "new": "\"renovate_minor_class\": 0,"
+ }
+]
