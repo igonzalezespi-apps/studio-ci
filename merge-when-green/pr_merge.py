@@ -609,15 +609,21 @@ def read_gh():
 
 
 def candidates(ctx, only=None):
-    pulls = ctx.gh.list("repos/%s/pulls?state=open&base=%s&sort=created&direction=asc" % (ctx.repo, ctx.integration)) \
-        if ctx.integration else []
+    """(the PRs to decide: open, into the integration branch, oldest first; EVERY open PR). The second
+    list is where decide_pr looks for PRs stacked on a candidate, and a stacked PR targets the
+    candidate's branch, not the integration branch: a list filtered by base never shows one. So it is
+    one list of every open PR (the same single paginated call), filtered here."""
+    if not ctx.integration:
+        return [], []
+    every = ctx.gh.list("repos/%s/pulls?state=open&sort=created&direction=asc" % ctx.repo)
+    pulls = [p for p in every if (p.get("base") or {}).get("ref") == ctx.integration]
     if only is not None:
         have = {p["number"]: p for p in pulls}
         out = []
         for n in only:
             out.append(have.get(n) or ctx.gh.get("repos/%s/pulls/%d" % (ctx.repo, n)))
-        return out, pulls
-    return pulls, pulls
+        return out, every
+    return pulls, every
 
 
 def cmd_decide(a):
