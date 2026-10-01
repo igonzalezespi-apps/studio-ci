@@ -176,16 +176,18 @@ classes (`risk_paths` in `.github/merge-when-green.json`, `reserved_paths` → 2
 | class | what puts a PR there (excerpt; the full table is `risk-class/risk_class.py`) | review |
 |---|---|---|
 | 4 | promotion into the protected branch · a person's `semver:major` · migrations, `*.sql`, `schema.prisma` · key material (`*.pem`, `*.key`, `.env*`) · `*.tf`/`*.tfvars` | owner; never automatic |
-| 3 | a long-lived head · `.github/workflows/**`, `CODEOWNERS` · the guard, hooks, `security/**`, `.claude/settings.json` · the merge gate itself (`risk-class/`, `merge-when-green/`, `develop-health/`, `revert-merge/`, `check-pr-tldr/`, `ci-gate/`) · Renovate config, `.npmrc`, `pnpm-workspace.yaml`, install scripts / `overrides` in `package.json` · `LICENSE` · a major dependency update · an important (security) check that failed at any point | owner (`revision-humana`) |
-| 2 | `CLAUDE.md`, `AGENTS.md`, specs, `infra/**` · `.claude/**`, plugin skills/agents/commands · `action.yml` · `package.json`, `.nvmrc`, `Dockerfile`, a lockfile edited by a person · test/lint/type configs (`tsconfig*`, `vitest.config.*`, `eslint.config.*`) · other `.github/**` · a person's `semver:minor` · more than 200 changed lines of code | Opus-high owner-decision lens |
+| 3 | a long-lived head · `.github/workflows/**`, `CODEOWNERS` · the guard, hooks, `security/**`, `.claude/settings.json` and every repo script its hooks or status line run · the merge gate itself (`risk-class/`, `merge-when-green/`, `develop-health/`, `revert-merge/`, `check-pr-tldr/`, `ci-gate/`) · Renovate config, `.npmrc`, `pnpm-workspace.yaml`, install scripts / `overrides` in `package.json` · `LICENSE` · a major dependency update · an important (security) check that failed at any point | owner (`revision-humana`) |
+| 2 | `CLAUDE.md`, `AGENTS.md`, specs, `infra/**` · `.claude/**`, plugin skills/agents/commands · `action.yml` · `package.json`, `.nvmrc`, `Dockerfile`, a lockfile edited by a person (3 if it adds a source outside the registry) · test/lint/type configs (`tsconfig*`, `vitest.config.*`, `eslint.config.*`) · other `.github/**` · a person's `semver:minor` · more than 200 changed lines of code | Opus-high owner-decision lens |
 | 1 | code, 200 lines or fewer · existing tests edited or removed · a bot bumping action pins only | Sonnet-high review |
 | 0 | docs, `*.md` outside prompt surfaces, change proposals · **added** tests and fixtures · templates, `.gitignore` · an empty diff | none |
 
-A dependency bot's PR that only bumps versions — every commit the bot's, `package.json` changing
-only dependency versions, no lockfile source outside the registry — gets `renovate_minor_class`
-(default **3**: dependency updates stay with the owner unless the repo lowers it). Any other bot PR
-is judged as a person's. A missing or double `semver:*` label does not change the class but stops
-an automatic merge.
+A dependency bot's PR that only bumps versions — every commit the bot's **and signed** (the bot's
+name alone is just an e-mail address), `package.json` changing only the versions of packages it
+already had (no new or removed package, no `npm:` alias pointed elsewhere, no git/URL/file source),
+no lockfile source outside the registry — gets `renovate_minor_class` (default **3**: dependency
+updates stay with the owner unless the repo lowers it). A bot PR that fails any of that is never
+below a clean one: `max(3, renovate_minor_class)`. A missing or double `semver:*` label does not
+change the class but stops an automatic merge.
 
 ```yaml
 - uses: igonzalezespi-apps/studio-ci/risk-class@<sha> # vX.Y.Z
@@ -197,7 +199,8 @@ an automatic merge.
 ```
 
 Locally: `risk-class/risk-class.sh --pr N --repo owner/name` (read-only), or
-`--git --base origin/develop` on a checkout. Exit `2` means "could not measure", never riesgo-0.
+`--git --base origin/develop` on a checkout. Exit `2` means "could not measure", never riesgo-0;
+a `package.json` it could not read counts as one with install scripts (3).
 
 ### `context-budget`
 
@@ -574,9 +577,20 @@ A PR merges when **all** of this holds:
   pending, `settle_seconds` since the last completion; no important check failed during the PR's
   life; mergeable.
 
+Right before saying "merge" it reads the PR once more: a new head, a new base, a hold label or any
+label change since the decision started means wait or skip. A PR that **ever** carried a hold label
+stays with a person even if the label is removed (the issue events are read): a session shares the
+owner's account, so removing `revision-humana` is not the owner's word.
+
 Then `PUT /pulls/N/merge` with `merge_method: squash` and `sha` = the evaluated head (a push in
 between makes GitHub refuse), title `<PR title> (#N)`, the commits' bodies, CI-skipping directives
-neutralised and two trailers: `Risk-class: riesgo:N` and `Merge-gate: merge-when-green <run>`.
+neutralised and two trailers: `Risk-class: riesgo:N` and `Merge-gate: merge-when-green <run>`. The
+author's own `Risk-class:`/`Merge-gate:` lines are neutralised too, and the readers take the last
+`Risk-class:` line only when the gate's `Merge-gate:` line follows it.
+
+Each run classifies the open PRs first and spends its CI budget (`max_candidates`, 5) on reverts,
+then on the PRs it could merge, then on riesgo-3/4 to escalate; a riesgo-1/2 above
+`max_auto_class` is decided without reading CI and costs nothing.
 A riesgo-3/4 PR by a person, with CI green and no `revision-humana`, gets that label **from the App**
 so the `labeled` event wakes the TL;DR check; a bot's PR is never labelled.
 
@@ -593,7 +607,10 @@ posts a comment from an account in `verdict_authors`:
 
 It counts only if it is the latest such comment, never edited, for the current head, with
 `owner_gate_exit: 0`, a score at or above `pr_score`, and a `class` not below the computed one (a
-higher class wins; 3 or more escalates). A new push voids it.
+higher class wins; 3 or more escalates). A new push voids it. **`verdict_authors` must be an
+identity the agent sessions cannot use** (a workflow with its own App, or a separate bot account):
+if the sessions post as the owner and the owner is a verdict author, a session can clear its own
+PR. Until such an identity exists, keep `max_auto_class` at 0.
 
 **Locally**: `merge-when-green/pr-merge.sh decide --repo owner/name --pr N` (read-only; exit 0
 merge, 10 wait, 20 needs a verdict, 30 escalate, 40 skip, 2 error). `merge` refuses outside GitHub
@@ -608,9 +625,16 @@ jobs once; red again → freezes automatic merging (an issue labelled `merge-fre
 first red push after the last green **only if** it is one single-parent commit, merged by the merge
 App, whose commit trailer says riesgo-0..2, is not itself a revert, and fewer than
 `max_reverts_per_day` reverts happened in 24 h. Otherwise it escalates: the freeze issue gets
-`revision-humana` and a TL;DR. A person's merge is never reverted automatically. The revert is
-opened by the App (`revert: <title> (#N)`, a `revert-of` marker) and merged by `merge-when-green`
-through its own path: same files as the original, CI green, exempt from the freeze it lifts.
+`revision-humana` and a TL;DR (once: an escalated freeze is not rewritten on every run). A person's
+merge is never reverted automatically. The revert is opened by the App (`revert: <title> (#N)`, a
+`revert-of` marker) and merged by `merge-when-green` through its own path, exempt from the freeze
+it lifts, only while the branch is still red with the freeze open, and only if it is exactly what
+GitHub wrote for the App: one signed commit by the App, the same files as the original (old and
+new names), each of them byte-identical to the parent of the reverted commit, CI green, no
+conflicts. Anything pushed on top of it fails that check. While the revert is open develop-health
+re-judges it on every run with those same rules and escalates if it was closed without merging,
+cannot merge (red, in conflict, altered) or has been open for more than two hours. If the branch
+turns green first (a fix went in), it lifts the freeze and closes the revert unmerged.
 
 ### Adopting it
 
@@ -687,15 +711,25 @@ through its own path: same files as the original, CI green, exempt from the free
          mode: ${{ vars.MERGE_WHEN_GREEN_MODE || 'dry' }}
    ```
 
-   The push CI of the integration branch must not cancel itself
-   (`cancel-in-progress: false` for it): every pushed commit needs its own verdict, or a red cannot
-   be tied to one merge.
+   The push CI of the integration branch must never cancel or replace a run: every pushed commit
+   needs its own verdict, or a red cannot be tied to one merge. `cancel-in-progress: false` is not
+   enough — GitHub still cancels a *pending* run of the same group when a third one arrives — so
+   give each push its own group:
 
-   In a **private** repo the plan/assess jobs run where `runs-on` says (pass your self-hosted
-   label: hosted minutes are billed) and live merging is refused — the Free plan has no Environments
-   for private repositories, so there is nowhere to keep the key out of reach of a pull request.
-   Add `if: vars.RUNNER_TARGET != ''` to the calling job, keep only the `workflow_run` of the CI and
-   drop or thin the schedule.
+   ```yaml
+   concurrency:
+     group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+     cancel-in-progress: ${{ github.event_name != 'push' }}
+   ```
+
+   In a **private** repo the plan/assess jobs run where `runs-on` says, and they do not start at
+   all on a GitHub-hosted label unless the caller passes `allow-hosted: true` (billed minutes: with
+   the schedule above that is about 96 runs a day, a minute each at least). Live merging is refused
+   there — the Free plan has no Environments for private repositories, so there is nowhere to keep
+   the key out of reach of a pull request. Add `if: vars.RUNNER_TARGET != ''` to the calling job,
+   pass `runs-on: ${{ vars.RUNNER_TARGET }}`, keep only the `workflow_run` of the CI and drop or
+   thin the schedule. develop-health needs a push CI on the integration branch to have anything to
+   judge.
 
 3. Going live (public repos), by the repository owner:
    - a GitHub App with **Contents: read & write** and **Pull requests: read & write** (nothing else),
@@ -706,7 +740,9 @@ through its own path: same files as the original, CI green, exempt from the free
    - `app_slug` in the config = the App's slug; the repository variable
      `MERGE_WHEN_GREEN_MODE=live`;
    - recommended: protect the integration and the protected branch with the push CI as a required
-     check and `enforce_admins`, so a merge over a red is impossible for everybody.
+     check and `enforce_admins`, so a merge over a red is impossible for everybody; on the protected
+     branch also restrict who can push to the owner (`restrictions.users`), so not even the App can
+     merge into it if a PR is re-pointed in the second between the last read and the merge.
 
    Off switch: `MERGE_WHEN_GREEN_MODE=dry` (or delete it), or disable the caller workflow.
 
