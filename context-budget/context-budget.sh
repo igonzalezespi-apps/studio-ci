@@ -17,8 +17,10 @@
 #   dated         parrafos fechados o notas de «antes decia» en los ficheros de reglas
 #   marketplace   el marketplace canonico se declara con su ruta canonica y con `ref`; la
 #                 ruta antigua no aparece en ajustes ni workflows
-#   output-style  `outputStyle` resuelve a un estilo que existe (y su plugin esta habilitado);
-#                 si la configuracion fija `output_style_expected`, es ese y no otro
+#   output-style  `outputStyle` resuelve a un estilo que existe (y su plugin esta habilitado),
+#                 con el nombre EXACTO que usa Claude Code: distingue mayusculas, y el `name:`
+#                 del frontmatter sustituye al nombre del fichero; si la configuracion fija
+#                 `output_style_expected`, es ese y no otro
 #   user-keys     ninguna clave personal en el settings versionado del repo
 #   agents        cada agente declara `model` y `effort`, y ninguno de solo lectura lleva
 #                 `memory` (que concede Read/Write/Edit por su cuenta)
@@ -33,7 +35,7 @@
 # Uso:
 #   context-budget.sh [--root DIR] [--config FICHERO] [--mode enforce|warn]
 #                     [--labels "a,b"] [--approval-label ETIQUETA]
-#                     [--marketplaces-dir DIR] [--annotations]
+#                     [--marketplaces-dir DIR] [--annotations] [--staged] [--quiet]
 #
 #   --root              raiz del repo a revisar (por defecto, el directorio actual)
 #   --config            JSON de configuracion; por defecto `.github/context-budget.json` o
@@ -44,9 +46,17 @@
 #   --marketplaces-dir  copia local de los marketplaces (p. ej. ~/.claude/plugins/marketplaces)
 #                       para comprobar que el estilo de un plugin existe de verdad
 #   --annotations       ademas, lineas `::error`/`::warning` para GitHub Actions
+#   --staged            mide lo que se va a commitear: los ficheros del indice de git con el
+#                       contenido añadido, no el arbol de trabajo. Lo que no esta en el indice
+#                       (sin añadir, o ignorado como `settings.local.json` o `TASKS.md`) no
+#                       existe, como en el checkout de CI. Exige que --root sea la raiz de un
+#                       repo git
+#   --quiet             solo hallazgos: nada si no hay ninguno; si los hay, sus lineas
+#                       (FAIL, WARN, APROB) y el resumen, sin las lineas OK. Los errores de
+#                       medida (exit 2) salen siempre
 #
 # Como pre-commit (un repo sin CI): en `.githooks/pre-commit`,
-#   exec bash ruta/a/context-budget.sh --root "$(git rev-parse --show-toplevel)"
+#   exec bash ruta/a/context-budget.sh --root "$(git rev-parse --show-toplevel)" --staged --quiet
 #
 # Salida: una linea por hallazgo y un resumen «context-budget: N violacion(es), ...».
 # Exit 0 si no hay violaciones (los avisos no cuentan), 1 si hay, 2 si no se puede medir
@@ -63,6 +73,7 @@ esac
 command -v python3 > /dev/null 2>&1 || { echo "context-budget: falta python3" >&2; exit 2; }
 
 exec python3 - "$@" <<'PY'
+import io
 import json
 import os
 import re
@@ -120,7 +131,8 @@ DEFAULTS = {
 
 CHECKS = ["size", "descriptions", "dated", "marketplace", "output-style", "user-keys", "agents", "pact"]
 BUDGET_CHECKS = {"size", "descriptions", "dated"}  # las que la etiqueta puede aprobar
-BUILTIN_STYLES = {"default", "explanatory", "learning"}
+# Los integrados de Claude Code 2.1.286, con sus mayusculas (ademas de «default»).
+BUILTIN_STYLES = {"Proactive", "Concise", "Explanatory", "Learning"}
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 ALLOW_MARK = "context-budget: allow"
 
@@ -149,19 +161,20 @@ sys.excepthook = _crash
 # ---------------------------------------------------------------------------------------------
 args = sys.argv[1:]
 opt = {"root": ".", "config": "", "mode": "", "labels": "", "approval": "presupuesto-contexto-aprobado",
-       "mkt_dir": "", "annotations": False}
+       "mkt_dir": "", "annotations": False, "staged": False, "quiet": False}
 i = 0
 while i < len(args):
     a = args[i]
     flag_map = {"--root": "root", "--config": "config", "--mode": "mode", "--labels": "labels",
                 "--approval-label": "approval", "--marketplaces-dir": "mkt_dir"}
+    bool_map = {"--annotations": "annotations", "--staged": "staged", "--quiet": "quiet"}
     if a in flag_map:
         if i + 1 >= len(args):
             die("falta valor para " + a)
         opt[flag_map[a]] = args[i + 1]
         i += 2
-    elif a == "--annotations":
-        opt["annotations"] = True
+    elif a in bool_map:
+        opt[bool_map[a]] = True
         i += 1
     else:
         die("argumento desconocido '%s'" % a)
@@ -170,19 +183,170 @@ ROOT = os.path.abspath(opt["root"])
 if not os.path.isdir(ROOT):
     die("no existe el directorio %s" % ROOT)
 
+
+# ---------------------------------------------------------------------------------------------
+# De donde se lee: el arbol de trabajo (por defecto) o, con `--staged`, el indice de git.
+#
+# POR QUE `--staged`. Como pre-commit, medir el disco se equivoca en los dos sentidos: un
+# CLAUDE.md demasiado grande y SIN añadir bloquea un commit que no lo toca, y uno que esta bien
+# en disco deja pasar el indice que no lo esta. Con `--staged` cada fichero se lee del indice
+# (`git cat-file`), que es lo que el commit va a guardar, y lo que no esta en el se ignora: la
+# misma vista que tendra el checkout de CI despues del push. Git exporta `GIT_INDEX_FILE` al
+# hook, asi que `git commit -a` y `git commit -- ruta` (que usan un indice temporal) se miden
+# tal cual.
+# ---------------------------------------------------------------------------------------------
+def _decode_text(raw):
+    # Lo mismo que `open(..., encoding="utf-8", errors="replace").read()`, saltos de linea
+    # universales incluidos: las dos fuentes miden el mismo texto igual.
+    return io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8", errors="replace").read()
+
+
+def git_toplevel():
+    """La raiz del repo git si ROOT lo es; None si no es un repo o ROOT es un subdirectorio."""
+    try:
+        top = subprocess.run(["git", "-C", ROOT, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return top if top and os.path.realpath(top) == os.path.realpath(ROOT) else None
+
+
+class TreeSource:
+    """El disco. Una ruta relativa cuelga de ROOT; una absoluta (la copia de los marketplaces)
+    se lee tal cual."""
+    where = "en disco"
+
+    def _p(self, rel):
+        return os.path.join(ROOT, rel)
+
+    def isfile(self, rel):
+        return os.path.isfile(self._p(rel))
+
+    def isdir(self, rel):
+        return os.path.isdir(self._p(rel))
+
+    def listdir(self, rel):
+        try:
+            return sorted(os.listdir(self._p(rel)))
+        except OSError:
+            return []
+
+    def read_bytes(self, rel):
+        with open(self._p(rel), "rb") as fh:
+            return fh.read()
+
+
+class IndexSource:
+    """El indice de git (`--staged`): solo las entradas en la etapa 0 y sin submodulos; cada
+    blob se lee por su SHA. Los enlaces simbolicos (de un fichero o de un directorio de la ruta)
+    se siguen DENTRO del indice; si llevan fuera de el, lo que apuntan no existe, como en el
+    checkout de CI."""
+    where = "en el indice"
+
+    def __init__(self):
+        try:
+            raw = subprocess.run(["git", "-C", ROOT, "ls-files", "-z", "--cached", "--stage"],
+                                 capture_output=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError) as exc:
+            die("--staged: no se pudo leer el indice de git (%s)" % exc)
+        self.entries = {}
+        for rec in raw.split(b"\0"):
+            if not rec or b"\t" not in rec:
+                continue
+            meta, path = rec.split(b"\t", 1)
+            mode, sha, stage = meta.decode().split(" ")
+            if stage != "0" or mode == "160000":
+                continue  # sin resolver (el commit no sale igual) o submodulo (no es un fichero)
+            self.entries[path.decode("utf-8", "replace")] = (mode, sha)
+        self._blobs = {}
+
+    @staticmethod
+    def _norm(rel):
+        rel = os.path.normpath(rel).replace(os.sep, "/") if rel else ""
+        return "" if rel == "." else rel
+
+    def _blob(self, sha):
+        if sha not in self._blobs:
+            try:
+                self._blobs[sha] = subprocess.run(["git", "-C", ROOT, "cat-file", "blob", sha],
+                                                  capture_output=True, check=True).stdout
+            except (OSError, subprocess.CalledProcessError) as exc:
+                die("--staged: no se pudo leer el blob %s del indice (%s)" % (sha, exc))
+        return self._blobs[sha]
+
+    def _real(self, rel):
+        """La ruta del indice tras seguir los enlaces simbolicos de cualquier tramo de `rel`;
+        None si sale del repo o hay un ciclo."""
+        rel = self._norm(rel)
+        for _ in range(16):
+            if os.path.isabs(rel) or rel == ".." or rel.startswith("../"):
+                return None
+            parts = rel.split("/") if rel else []
+            for k in range(1, len(parts) + 1):
+                head = "/".join(parts[:k])
+                ent = self.entries.get(head)
+                if ent is not None and ent[0] == "120000":
+                    target = self._blob(ent[1]).decode("utf-8", "replace")
+                    if os.path.isabs(target):
+                        return None
+                    rel = self._norm(os.path.join(os.path.dirname(head), target, *parts[k:]))
+                    break
+            else:
+                return rel
+        return None
+
+    def isfile(self, rel):
+        return self._real(rel) in self.entries
+
+    def _prefix(self, rel):
+        real = self._real(rel)
+        return None if real is None else (real + "/" if real else "")
+
+    def isdir(self, rel):
+        prefix = self._prefix(rel)
+        return prefix is not None and any(p.startswith(prefix) for p in self.entries)
+
+    def listdir(self, rel):
+        prefix = self._prefix(rel)
+        if prefix is None:
+            return []
+        return sorted({p[len(prefix):].split("/", 1)[0] for p in self.entries if p.startswith(prefix)})
+
+    def read_bytes(self, rel):
+        real = self._real(rel)
+        if real not in self.entries:
+            raise FileNotFoundError(rel)
+        return self._blob(self.entries[real][1])
+
+
+if opt["staged"]:
+    if git_toplevel() is None:
+        die("--staged necesita que --root (%s) sea la raiz de un repo git" % ROOT)
+    SRC = IndexSource()
+else:
+    SRC = TreeSource()
+DISK = TreeSource()
+
 cfg = json.loads(json.dumps(DEFAULTS))
 cfg_path = opt["config"]
 if not cfg_path:
     for cand in (".github/context-budget.json", ".context-budget.json"):
-        if os.path.isfile(os.path.join(ROOT, cand)):
+        if SRC.isfile(cand):
             cfg_path = os.path.join(ROOT, cand)
             break
 elif not os.path.isabs(cfg_path) and not os.path.isfile(cfg_path):
     cfg_path = os.path.join(ROOT, cfg_path)
 if cfg_path:
+    # Con `--staged`, la configuracion del repo tambien es la del indice; un `--config` que no
+    # esta en el (fuera del repo, o sin añadir) se lee del disco, porque lo ha nombrado alguien.
+    cfg_rel = os.path.relpath(os.path.abspath(cfg_path), ROOT)
+    inside = cfg_rel != ".." and not cfg_rel.startswith("../")
+    cfg_src = SRC if inside and SRC.isfile(cfg_rel) else DISK
     try:
-        with open(cfg_path, encoding="utf-8") as fh:
-            user_cfg = json.load(fh)
+        # `decode` estricto, como el `open(..., encoding="utf-8")` de siempre: un JSON que no
+        # es UTF-8 es ilegible, no se arregla con caracteres de sustitucion.
+        raw_cfg = cfg_src.read_bytes(cfg_rel if cfg_src is SRC else os.path.abspath(cfg_path))
+        user_cfg = json.loads(raw_cfg.decode("utf-8"))
     except (OSError, ValueError) as exc:
         die("configuracion ilegible (%s): %s" % (cfg_path, exc))
     if not isinstance(user_cfg, dict):
@@ -261,13 +425,14 @@ def matches(path, patterns):
 
 # ---------------------------------------------------------------------------------------------
 # Ficheros: los de git (versionados + nuevos no ignorados) si ROOT es un repo; si no, el arbol.
+# Con `--staged`, solo los del indice.
 # ---------------------------------------------------------------------------------------------
 def list_files():
+    if opt["staged"]:
+        return [f for f in sorted(SRC.entries) if SRC.isfile(f) and not matches(f, cfg["exclude"])]
     files = None
     try:
-        top = subprocess.run(["git", "-C", ROOT, "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, check=True).stdout.strip()
-        if os.path.realpath(top) == os.path.realpath(ROOT):
+        if git_toplevel() is not None:
             raw = subprocess.run(["git", "-C", ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
                                  capture_output=True, check=True).stdout
             files = sorted({p for p in raw.decode("utf-8", "replace").split("\0") if p})
@@ -289,13 +454,11 @@ FILES = list_files()
 
 
 def read_text(rel):
-    with open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace") as fh:
-        return fh.read()
+    return _decode_text(SRC.read_bytes(rel))
 
 
 def read_bytes(rel):
-    with open(os.path.join(ROOT, rel), "rb") as fh:
-        return fh.read()
+    return SRC.read_bytes(rel)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -528,12 +691,10 @@ SETTINGS_FILES = [".claude/settings.json", ".claude/settings.local.json"]
 
 def load_settings(rel):
     """dict, o None si no existe. Un JSON roto es un hallazgo, no un exit 2."""
-    p = os.path.join(ROOT, rel)
-    if not os.path.isfile(p):
+    if not SRC.isfile(rel):
         return None
     try:
-        with open(p, encoding="utf-8") as fh:
-            d = json.load(fh)
+        d = json.loads(SRC.read_bytes(rel).decode("utf-8"))
         return d if isinstance(d, dict) else {}
     except ValueError as exc:
         add("user-keys", rel, 0, "JSON ilegible: Claude Code lo ignora entero (%s)" % exc)
@@ -636,60 +797,77 @@ def enabled_plugins():
     return names
 
 
-def style_names_in(dir_rel_or_abs, absolute=False):
-    """Nombres de estilo (fichero sin .md y `name:` del frontmatter) de un directorio."""
+def style_names_in(src, d):
+    """Nombres de estilo de un directorio, como los registra Claude Code: el `name:` del
+    frontmatter si lo hay y, si no, el nombre del fichero sin `.md`. Uno u otro, nunca los dos,
+    y con sus mayusculas (ver `check_output_style`)."""
     out = set()
-    base = dir_rel_or_abs if absolute else os.path.join(ROOT, dir_rel_or_abs)
-    if not os.path.isdir(base):
+    if not src.isdir(d):
         return out
-    for n in os.listdir(base):
+    for n in src.listdir(d):
         if not n.endswith(".md"):
             continue
-        out.add(n[:-3].lower())
+        name = None
         try:
-            with open(os.path.join(base, n), encoding="utf-8", errors="replace") as fh:
-                data, _ = parse_frontmatter(fh.read())
-            if data and data.get("name"):
-                out.add(str(data["name"]).strip().lower())
+            data, _ = parse_frontmatter(_decode_text(src.read_bytes(os.path.join(d, n))))
+            raw = data.get("name") if data else None
+            # `name:` vacio o nulo en YAML: Claude Code cae al nombre del fichero
+            if raw is not None and not (isinstance(raw, str) and raw.strip() in ("", "~", "null", "Null", "NULL")):
+                name = str(raw)
         except OSError:
             pass
+        out.add(name or n[:-3])
     return out
 
 
-def plugin_style_dirs(plugin_dir_abs):
-    dirs = [os.path.join(plugin_dir_abs, "output-styles")]
-    pj = os.path.join(plugin_dir_abs, ".claude-plugin", "plugin.json")
+def plugin_style_dirs(src, pdir):
+    dirs = [os.path.join(pdir, "output-styles")]
+    pj = os.path.join(pdir, ".claude-plugin", "plugin.json")
     try:
-        with open(pj, encoding="utf-8") as fh:
-            decl = json.load(fh).get("outputStyles")
+        decl = json.loads(src.read_bytes(pj).decode("utf-8")).get("outputStyles")
         for d in as_list(decl) if not isinstance(decl, list) else decl:
-            dirs.append(os.path.normpath(os.path.join(plugin_dir_abs, str(d))))
+            dirs.append(os.path.normpath(os.path.join(pdir, str(d))))
     except (OSError, ValueError, AttributeError):
         pass
     return dirs
 
 
 def find_plugin_dir(plugin, mkts):
-    """Directorio absoluto del plugin: en ESTE repo, o en la copia local del marketplace."""
+    """(fuente, directorio) del plugin: en ESTE repo (con la fuente del repo, que con `--staged`
+    es el indice), o en la copia local del marketplace (siempre el disco)."""
     for base, name in ROOTS.items():
         if name == plugin and not name.startswith("(proyecto)"):
-            return os.path.join(ROOT, base)
+            return SRC, base
     if opt["mkt_dir"]:
         for mkt in sorted(mkts):
-            mroot = os.path.join(os.path.expanduser(opt["mkt_dir"]), mkt)
+            mroot = os.path.join(os.path.abspath(os.path.expanduser(opt["mkt_dir"])), mkt)
             try:
                 with open(os.path.join(mroot, ".claude-plugin", "marketplace.json"), encoding="utf-8") as fh:
                     for p in json.load(fh).get("plugins", []):
                         if p.get("name") == plugin and isinstance(p.get("source"), str):
-                            return os.path.normpath(os.path.join(mroot, p["source"]))
+                            return DISK, os.path.normpath(os.path.join(mroot, p["source"]))
             except (OSError, ValueError, AttributeError):
                 pass
             cand = os.path.join(mroot, "plugins", plugin)
             if os.path.isdir(cand):
-                return cand
-    return None
+                return DISK, cand
+    return None, None
 
 
+def case_hint(name, candidates):
+    """Si `name` solo existe con otras mayusculas, lo dice: es el error que no se ve."""
+    same = sorted(c for c in candidates if c != name and c.lower() == name.lower())
+    return (" (Claude Code distingue mayusculas: existe \"%s\")" % same[0]) if same else ""
+
+
+# COMO RESUELVE CLAUDE CODE `outputStyle` (2.1.286, leido en el binario y probado en vivo).
+# Junta los integrados y los de cada fuente en un objeto cuya clave es el nombre del estilo
+# (`plugin:nombre` en los de plugin) y busca el valor de `outputStyle` por CLAVE EXACTA; si no
+# esta, cae a Default sin decir nada. Asi que «Pinya» no encuentra `pinya.md`, «explanatory» no
+# es el integrado «Explanatory», y un fichero con `name:` en el frontmatter solo se llama asi
+# (`x.md` con `name: otro` no responde a «x»). Probado con `claude -p` en un sandbox: con
+# `pinya.md`, «pinya» aplica el estilo y «Pinya» no. Cualquier variante de «default» acaba en
+# Default, que es lo pedido: esa si vale.
 def check_output_style():
     enabled = enabled_plugins()
     want = cfg.get("output_style_expected") or ""
@@ -708,8 +886,8 @@ def check_output_style():
         if not isinstance(style, str) or not style.strip():
             add("output-style", rel, 0, "outputStyle vacio o no es texto: cae a Default en silencio")
             continue
-        s = style.strip()
-        if s.lower() in BUILTIN_STYLES:
+        s = style  # sin `strip`: Claude Code tampoco lo recorta
+        if s.strip().lower() == "default" or s in BUILTIN_STYLES:
             notes["output-style"].append("%s: %s (integrado)" % (rel, s))
             continue
         if ":" in s:
@@ -718,25 +896,26 @@ def check_output_style():
                 add("output-style", rel, 0, "outputStyle \"%s\": el plugin %s no esta habilitado en los ajustes del "
                     "repo, y sin el el estilo cae a Default en silencio" % (s, plugin))
                 continue
-            pdir = find_plugin_dir(plugin, enabled[plugin])
+            psrc, pdir = find_plugin_dir(plugin, enabled[plugin])
             if pdir is None:
                 notes["output-style"].append("%s: %s (plugin habilitado; el estilo no se puede ver sin una copia del "
                                              "marketplace)" % (rel, s))
                 continue
             found = set()
-            for d in plugin_style_dirs(pdir):
-                found |= style_names_in(d, absolute=True)
-            if name.lower() not in found:
-                add("output-style", rel, 0, "outputStyle \"%s\": el plugin %s no trae el estilo %s (trae: %s)"
-                    % (s, plugin, name, ", ".join(sorted(found)) or "ninguno"))
+            for d in plugin_style_dirs(psrc, pdir):
+                found |= style_names_in(psrc, d)
+            if name not in found:
+                add("output-style", rel, 0, "outputStyle \"%s\": el plugin %s no trae el estilo %s (trae: %s)%s"
+                    % (s, plugin, name, ", ".join(sorted(found)) or "ninguno", case_hint(name, found)))
             else:
                 notes["output-style"].append("%s: %s (resuelve)" % (rel, s))
         else:
-            if s.lower() in style_names_in(".claude/output-styles"):
+            project = style_names_in(SRC, ".claude/output-styles")
+            if s in project:
                 notes["output-style"].append("%s: %s (.claude/output-styles)" % (rel, s))
             else:
                 add("output-style", rel, 0, "outputStyle \"%s\" no es un estilo integrado ni esta en "
-                    ".claude/output-styles/: cae a Default en silencio" % s)
+                    ".claude/output-styles/: cae a Default en silencio%s" % (s, case_hint(s, project | BUILTIN_STYLES)))
 
 
 def check_user_keys():
@@ -816,15 +995,16 @@ def pact_applies(pc, main, lines, marker, alias_rx):
     llevan en `.gitignore`: en el checkout de CI no existe nunca, y el check no actuaba. Por eso
     cuenta tambien lo VERSIONADO: el plugin del tablero habilitado en `.claude/settings.json`
     (no en `settings.local.json`, que es personal y tampoco llega a CI) o el pacto ya escrito en
-    CLAUDE.md, para que una copia duplicada o v1 se vea aunque no haya `TASKS.md`."""
+    CLAUDE.md, para que una copia duplicada o v1 se vea aunque no haya `TASKS.md`. Con
+    `--staged` tambien `TASKS.md` se busca en el indice: lo ignorado no cuenta, como en CI."""
     req = pc.get("required")
     if req is not None:
         return req, "pact.required es %s" % ("true" if req else "false")
     tasks = pc.get("tasks_file") or "TASKS.md"
     plugin = pc.get("plugin") or "tablero"
     why = []
-    if os.path.isfile(os.path.join(ROOT, tasks)):
-        why.append("%s en disco" % tasks)
+    if SRC.isfile(tasks):
+        why.append("%s %s" % (tasks, SRC.where))
     st = SETTINGS.get(".claude/settings.json")
     ep = st.get("enabledPlugins") if isinstance(st, dict) else None
     if isinstance(ep, dict):
@@ -844,8 +1024,8 @@ def check_pact():
     pc = cfg["pact"]
     marker = pc.get("marker") or ""
     alias_rx = [re.compile(re.escape(a), re.I) for a in pc.get("aliases") or []]
-    main = "CLAUDE.md" if os.path.isfile(os.path.join(ROOT, "CLAUDE.md")) else ".claude/CLAUDE.md"
-    has_main = os.path.isfile(os.path.join(ROOT, main))
+    main = "CLAUDE.md" if SRC.isfile("CLAUDE.md") else ".claude/CLAUDE.md"
+    has_main = SRC.isfile(main)
     lines = read_text(main).split("\n") if has_main else []
     applies, why = pact_applies(pc, main, lines, marker, alias_rx)
     if not applies:
@@ -901,17 +1081,28 @@ def annot(kind, check, path, line, msg):
     print("::%s %stitle=context-budget [%s]::%s" % (kind, (loc + ",") if loc else "", check, clean))
 
 
+# `--quiet`: solo las lineas de hallazgo (FAIL, WARN, APROB) y el resumen, y nada si no hay
+# ninguno. Para un pre-commit: las lineas OK de cada commit son contexto que se paga en cada
+# sesion que commitea. Los errores de medida van a stderr con exit 2 y no pasan por aqui.
+QUIET = opt["quiet"]
+
+
+def info(line):
+    if not QUIET:
+        print(line)
+
+
 for c in CHECKS:
     if c in cfg["skip_checks"]:
-        print("--    [%s] desactivada por la configuracion" % c)
+        info("--    [%s] desactivada por la configuracion" % c)
         continue
     items = by_check[c]
     if not items:
         extra = "; ".join(notes[c][:6])
         if examined[c]:
-            print("OK    [%s] %d revisado(s)%s" % (c, examined[c], (": " + extra) if extra else ""))
+            info("OK    [%s] %d revisado(s)%s" % (c, examined[c], (": " + extra) if extra else ""))
         else:
-            print("--    [%s] %s" % (c, extra or "nada que revisar"))
+            info("--    [%s] %s" % (c, extra or "nada que revisar"))
         continue
     for check, path, line, msg in items:
         where = path + (":%d" % line if line else "")
@@ -929,12 +1120,14 @@ for c in CHECKS:
             print("WARN  [%s] %s: %s" % (c, where, msg))
             annot("warning", c, path, line, msg)
 
-print("----------------------------------------")
+if QUIET and not (n_fail or n_warn or n_ok_label):
+    sys.exit(0)
+info("----------------------------------------")
 tail = ""
 if n_ok_label:
     tail = ", %d aprobada(s) por la etiqueta '%s'" % (n_ok_label, opt["approval"])
-print("context-budget: %d violacion(es), %d aviso(s)%s (modo %s, %d fichero(s) en el arbol)."
-      % (n_fail, n_warn, tail, MODE, len(FILES)))
+print("context-budget: %d violacion(es), %d aviso(s)%s (modo %s, %d fichero(s) %s)."
+      % (n_fail, n_warn, tail, MODE, len(FILES), "en el indice" if opt["staged"] else "en el arbol"))
 if n_fail and not APPROVED and any(f[0] in BUDGET_CHECKS for f in findings):
     print("Un exceso de presupuesto (size, descriptions, dated) solo lo aprueba una persona, con la etiqueta '%s'."
           % opt["approval"])

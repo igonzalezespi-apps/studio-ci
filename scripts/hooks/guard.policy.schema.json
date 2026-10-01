@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/igonzalezespi-apps/claude-plugins/core-dev/guard.policy.schema.json",
+  "$id": "urn:core-dev:guard.policy.schema.json",
   "title": "bash-guard policy",
   "description": "Repo-specific parameters for the vendored bash-guard.sh. Everything here is per-repo; the guard core is identical across repos. Strict defaults apply when a key (or the whole file) is absent: an absent policy never weakens the guard.",
   "type": "object",
@@ -14,12 +14,12 @@
     "require_pr_label": {
       "type": "boolean",
       "default": true,
-      "description": "Whether `gh pr create` must carry --label: the release gate of the studio products reads a semver label from the PR. false only in a repository whose releases do not read PR labels (e.g. release-please from the commits). The waiver covers PRs in THIS repository only: one opened toward another repository, or whose target the guard cannot prove, still needs the label."
+      "description": "Whether `gh pr create` must carry --label: the release gate of a product repository reads a semver label from the PR. false only in a repository whose releases do not read PR labels (e.g. release-please from the commits, or a version bump in a manifest). The waiver covers PRs that LAND in this repository, from any session: a `gh pr create --repo <this repo>` run elsewhere reads this value from this repository's origin, as a cross-repository merge does. A PR toward another repository follows that repository's own value, and one whose target or policy the guard cannot read still needs the label."
     },
     "protected_branch": {
       "type": "string",
       "default": "main",
-      "description": "The reviewed/released line. Direct push is forbidden and merging a PR into it is human-only. Universal value 'main' in this fleet."
+      "description": "The reviewed/released line. Direct push is forbidden and merging a PR into it is human-only. Universal value 'main' in this fleet. It also binds pushes from OTHER repositories' sessions (git -C, a URL): the guard reads this value from this repository's origin, so a repository that vendors no policy has no protected branch for the guard, and one whose policy cannot be read gets 'main'."
     },
     "integration_branch": {
       "type": "string",

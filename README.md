@@ -176,10 +176,19 @@ What Claude Code loads into every session has a budget, and the repo configurati
 | `descriptions` | a skill, command or agent `description` (+ `when_to_use`) > 250 characters; a plugin's skill listing (skills + commands without `disable-model-invocation`) summing > 6,000 |
 | `dated` | a dated paragraph or a «this line used to say» note in `CLAUDE.md`, `.claude/rules/**` or `contract-core.md` (history belongs in the commit message) |
 | `marketplace` | the canonical marketplace declared without `"ref": "main"`, or its legacy path in settings/workflows; a workflow that clones it without `--branch main` |
-| `output-style` | an `outputStyle` that does not resolve — Claude Code silently falls back to Default: a plugin style whose plugin is not enabled in the repo, a plugin that does not ship it, a project style that does not exist; optionally, not the agreed one |
+| `output-style` | an `outputStyle` that does not resolve — Claude Code silently falls back to Default: a plugin style whose plugin is not enabled in the repo, a plugin that does not ship it, a project style that does not exist, or a name that only matches with different capitalisation; optionally, not the agreed one |
 | `user-keys` | a personal key in the committed `.claude/settings.json` (`model`, `effortLevel`, `autoCompactWindow`, or a plugin from a marketplace the repo does not declare) |
 | `agents` | an agent without `model` or `effort` (Haiku is exempt from `effort`), or a read-only agent with `memory` — which grants Read/Write/Edit on its own |
 | `pact` | when the pact applies, not exactly one `contrato TASKS v2` line in `CLAUDE.md`, an old copy (a list entry with an alias such as `Tablero pact`) or another copy of the pact elsewhere |
+
+**How a style name resolves** — exactly as Claude Code resolves it (verified on 2.1.286, in the
+binary and with a live `claude -p` run): the lookup is **case-sensitive**, and a style is named
+by its frontmatter `name:` when it has one, otherwise by its file name without `.md` — one or the
+other, never both. So `"Pinya"` does not find `pinya.md`, `"explanatory"` is not the built-in
+`Explanatory`, and `x.md` with `name: other` answers only to `"other"` (`"plugin:other"` for a
+plugin style). The built-ins are `default`, `Proactive`, `Concise`, `Explanatory` and `Learning`;
+any spelling of `default` ends in Default, which is what it asks for. When the name exists with
+other capitalisation, the failure line says which one.
 
 `size`, `descriptions` and `dated` are **budget** checks: the approval label (default
 `presupuesto-contexto-aprobado`, set by a person) lets an excess through, still listed as `APROB`.
@@ -242,12 +251,31 @@ enough:
 ```sh
 bash context-budget.sh --root . --marketplaces-dir ~/.claude/plugins/marketplaces
 # .githooks/pre-commit
-exec bash scripts/context-budget.sh --root "$(git rev-parse --show-toplevel)"
+exec bash scripts/context-budget.sh --root "$(git rev-parse --show-toplevel)" --staged --quiet
 ```
 
 `--marketplaces-dir` lets `output-style` confirm that a plugin's style really exists; without it
 (as in CI, unless the repo *is* the marketplace) that one fact is reported as not verifiable
-instead of guessed. In a git work tree only tracked and non-ignored files are measured.
+instead of guessed. By default it measures the **work tree**: in a git work tree, tracked and
+non-ignored files, with their content on disk.
+
+- `--staged` measures **what the commit will record**: the files in the git index, read from the
+  index (`git cat-file`), not from disk. A file that is not in the index does not exist for it
+  (unstaged, or ignored such as `.claude/settings.local.json` or `TASKS.md`), which is the view a
+  CI checkout gets after the push. So an oversized `CLAUDE.md` left unstaged no longer blocks a
+  commit that does not touch it, and one that is fine on disk but oversized in the index no
+  longer slips through. The config file is read from the index too (an explicit `--config` that
+  is not in the index is read from disk). Git hands the hook the index it is about to commit, so
+  `git commit -a` and `git commit -- <path>` are measured as they will land. It needs `--root` to
+  be the top of a git work tree (exit `2` otherwise). Without the flag, a pre-commit measures the
+  work tree, as before.
+- `--quiet` prints **findings only**: nothing at all when there are none; otherwise the `FAIL`,
+  `WARN` and `APROB` lines and the summary, without the `OK` lines. Exit codes do not change, and a
+  could-not-measure error (exit `2`) is always printed. Meant for a pre-commit, where a dozen `OK`
+  lines on every commit are context paid by every session that commits.
+
+Both are flags of the script, not inputs of the action: CI measures its checkout, which is
+already what was committed. The default output is unchanged.
 
 ## Release control plane
 

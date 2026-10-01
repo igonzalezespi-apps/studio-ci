@@ -2,12 +2,20 @@
 # ============================================================================
 # bash-guard.sh — PreToolUse guard (matcher: Bash) for Claude Code
 # ============================================================================
-# Canonical source: igonzalezespi-apps/claude-plugins, plugins/core-dev/scripts/hooks/bash-guard.sh.
+# Canonical source: plugins/core-dev/scripts/hooks/bash-guard.sh of the core-dev plugin; in
+# a vendored copy, the .vendor.lock next to this file names the repository and commit.
 # This file is VENDORED (committed) into each consuming repo and cabled from its
 # settings.json — it is NOT a plugin hook, because ${CLAUDE_PLUGIN_ROOT} does
 # not exist inside a git hook and a repo must keep enforcing without the plugin.
 # The universal core is identical across repos; everything repo-specific lives
 # in guard.policy.json next to this file.
+#
+# ONE EXCEPTION: the guard's own source repository. There the guard is the code
+# being edited, so running the working tree's copy would let a half-edited guard
+# or policy decide for the session that is editing it. In that repository alone,
+# core-dev's plugin hook (source-guard.sh, next to this file) runs the PUBLISHED
+# copy from the plugin cache as `bash-guard.sh --project <dir>`: see "Which
+# repository, and which copy of its policy" below. Consumers never pass it.
 #
 # Harness contract: reads the tool-call JSON from STDIN
 #   {"tool_name":"Bash","tool_input":{"command":"..."}, ...}
@@ -23,7 +31,11 @@
 # simple tokenizer — another interpreter, an indirection, a script written first
 # and run afterwards — is NOT guaranteed to be intercepted. The guard is also
 # fail-open: if command extraction fails (node absent, malformed JSON), it
-# allows — a broken tripwire must not take down the harness.
+# allows — a broken tripwire must not take down the harness. The same holds for
+# a crash: Claude Code blocks only on exit 2, so any other exit lets the command
+# run. The one place that fails CLOSED instead is the source repository, where
+# source-guard.sh turns every exit other than 0 and 2 (and a missing node) into
+# a deny.
 #
 # Do NOT assume a server-side backstop behind it. Branch protection, rulesets and
 # required status checks are per-repository settings that this guard neither reads
@@ -35,7 +47,9 @@
 # — lets the suite simulate "on main"/"on a PR branch" deterministically. In
 # production the branch resolves via `git branch --show-current` (empty in
 # detached HEAD or outside a repo → treated as not-main).
-# BASH_GUARD_POLICY: override of the policy path, TEST-ONLY.
+# BASH_GUARD_POLICY: override of the policy path, TEST-ONLY. It wins over both
+# modes below; source-guard.sh strips every BASH_GUARD_* variable before it runs
+# the published guard, so in production it can only come from a test.
 # BASH_GUARD_PR_BASE: override of a PR's base branch, TEST-ONLY (avoids a network
 # call to gh in the merge-to-integration check).
 # BASH_GUARD_PR_HEAD: override of a PR's head branch, TEST-ONLY (same lookup).
@@ -49,10 +63,48 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --- Which repository, and which copy of its policy --------------------------
+# VENDORED (no arguments; every consumer). The protected repository is the one
+# that holds this file, and its policy is guard.policy.json next to it: $HERE is
+# <repo>/scripts/hooks, the path the rest of the tooling reads the policy from
+# ($CLAUDE_PROJECT_DIR/scripts/hooks/guard.policy.json) whenever the hook runs
+# as wired. $CLAUDE_PROJECT_DIR is NOT consulted: it names the session, and a
+# session in one repository running another repository's vendored guard must
+# get that repository's policy AND identity, never one of each (see
+# project_identities and the "production anchor" cases of the suite).
+#
+# PUBLISHED (`--project <dir>`; only source-guard.sh passes it). The guard runs
+# from the plugin cache, outside the repository it protects, and the guard.policy.json
+# next to it is the plugin's FIXTURE, not anyone's policy. So:
+#   - the protected repository is <dir> (source-guard.sh derives it from
+#     $CLAUDE_PROJECT_DIR);
+#   - its policy is <dir>'s scripts/hooks/guard.policy.json AS ORIGIN'S DEFAULT
+#     BRANCH CARRIES IT — reviewed and merged — and never the working tree's,
+#     which the session itself may be editing. Read from the local remote-tracking
+#     ref first (`git show`, no network per command), then from the API through
+#     target_policy_tsv (the reader a cross-repo `gh pr merge` already uses), and
+#     failing both, strict defaults. A local edit of the policy applies once it
+#     is merged and fetched, not before.
+# A `--project` that is empty or not a directory leaves no repository to call
+# ours and no policy to read: every push counts as ours and the defaults apply.
+PUBLISHED=0
+PUBLISHED_PROJECT=""
+case "${1:-}" in
+  --project) PUBLISHED=1; PUBLISHED_PROJECT="${2:-}" ;;
+  --project=*) PUBLISHED=1; PUBLISHED_PROJECT="${1#--project=}" ;;
+esac
+# The directory whose repository this guard protects (see project_identities).
+if [ "$PUBLISHED" -eq 1 ]; then
+  ANCHOR_ROOT="$PUBLISHED_PROJECT"
+else
+  ANCHOR_ROOT="$HERE"
+fi
+
 # --- Policy (repo-specific parameters; strict defaults if absent) ------------
 # Read once via node into shell-safe variables. Missing/invalid file → strict
 # defaults: no generated trees, agent may not merge, main protected, egress
 # restricted to localhost. Strict-by-default: an absent policy never weakens.
+# Loaded by load_policy, called once the helpers it needs are defined.
 POLICY_FILE="${BASH_GUARD_POLICY:-$HERE/guard.policy.json}"
 # The reader itself, kept in a variable: the SAME strict-defaults parser has to serve
 # both this repo's policy and (in check_pr_merge) a target repo's. Two copies would
@@ -81,7 +133,6 @@ for (const t of trees) if (typeof t === "string" && t) out.push("TREE\t" + t);
 for (const h of egress) if (typeof h === "string" && h) out.push("EGRESS\t" + h);
 process.stdout.write(out.join("\n") + "\n");
 '
-POLICY_TSV="$(node -e "$POLICY_READER" "$POLICY_FILE" 2>/dev/null || true)"
 
 AGENT_MAY_MERGE=false
 REQUIRE_PR_LABEL=true
@@ -91,25 +142,38 @@ LONG_LIVED_BRANCHES=()
 GEN_REGEN_HINT=""
 GEN_TREES=()
 EGRESS_ALLOW=()
-if [ -n "$POLICY_TSV" ]; then
-  while IFS=$'\t' read -r key val; do
-    case "$key" in
-      MERGE) AGENT_MAY_MERGE="$val" ;;
-      PRLABEL) REQUIRE_PR_LABEL="$val" ;;
-      PROTECTED) PROTECTED_BRANCH="$val" ;;
-      INTEGRATION) INTEGRATION_BRANCH="$val" ;;
-      LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
-      REGEN) GEN_REGEN_HINT="$val" ;;
-      TREE) [ -n "$val" ] && GEN_TREES+=("$val") ;;
-      EGRESS) [ -n "$val" ] && EGRESS_ALLOW+=("$val") ;;
-    esac
-  done <<<"$POLICY_TSV"
-fi
-# Fallback if the policy provided no egress allow-list (defensive; the node
-# reader already defaults, but never leave the list empty → would allow all).
-if [ "${#EGRESS_ALLOW[@]}" -eq 0 ]; then
-  EGRESS_ALLOW=("localhost" "127.0.0.1" "::1")
-fi
+# Sets the globals above from the policy of the mode in force. A function, called
+# right before the segments are checked, only because the published mode needs
+# helpers defined further down (published_policy_tsv); the vendored mode reads the
+# same file with the same reader as ever.
+load_policy() {
+  local POLICY_TSV key val
+  if [ "$PUBLISHED" -eq 1 ] && [ -z "${BASH_GUARD_POLICY:-}" ]; then
+    POLICY_TSV="$(published_policy_tsv "$PUBLISHED_PROJECT")"
+  else
+    POLICY_TSV="$(node -e "$POLICY_READER" "$POLICY_FILE" 2>/dev/null || true)"
+  fi
+  if [ -n "$POLICY_TSV" ]; then
+    while IFS=$'\t' read -r key val; do
+      case "$key" in
+        MERGE) AGENT_MAY_MERGE="$val" ;;
+        PRLABEL) REQUIRE_PR_LABEL="$val" ;;
+        PROTECTED) PROTECTED_BRANCH="$val" ;;
+        INTEGRATION) INTEGRATION_BRANCH="$val" ;;
+        LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
+        REGEN) GEN_REGEN_HINT="$val" ;;
+        TREE) [ -n "$val" ] && GEN_TREES+=("$val") ;;
+        EGRESS) [ -n "$val" ] && EGRESS_ALLOW+=("$val") ;;
+      esac
+    done <<<"$POLICY_TSV"
+  fi
+  # Fallback if the policy provided no egress allow-list (defensive; the node
+  # reader already defaults, but never leave the list empty → would allow all).
+  if [ "${#EGRESS_ALLOW[@]}" -eq 0 ]; then
+    EGRESS_ALLOW=("localhost" "127.0.0.1" "::1")
+  fi
+  return 0
+}
 
 # The repository-selecting global options of the git command being analysed (-C,
 # --git-dir, -c ...), set by check_git for its segment. Empty = git's own discovery.
@@ -139,13 +203,28 @@ git_clean() {
     -u GIT_OBJECT_DIRECTORY -u GIT_NAMESPACE git "$@"
 }
 
-# Is the path a real environment file? (.env.example templates are not)
+# Is the path a real environment file? A committed TEMPLATE is not: env.example, and every
+# .env name whose LAST suffix is .example, .sample or .template (.env.example,
+# .env.production.example, .env.local.sample). Only the suffix decides, because it survives
+# every expansion: a glob or a brace that ENDS in `.example` can only produce names that end
+# in `.example`. Before 2026-09-30 only `.env.example` itself was a template: reading
+# `.env.prod.example` with cat/grep/sed was denied as a credential dump while `cp` of the same
+# file passed (a partner repository's review of its guard; 2 such denies in the transcripts of the 30 days to
+# 2026-09-30), so what the agent learnt was the detour, not the rule.
+# Everything else under .env stays a secret: the real files, a backup of a template
+# (.env.example.bak), a brace that ends elsewhere (.env.{prod,example}) and an unexpanded
+# glob (.env*, .env?) that would cover the real files when executed.
 is_env_file() {
   local base="${1##*/}"
   case "$base" in
-    .env.example | env.example) return 1 ;;
-    # Also unexpanded glob patterns (.env*, .env?) that would cover the real
-    # files when executed.
+    env.example) return 1 ;;
+    # ...unless the name holds an expansion: the shell may split that word, and then a piece
+    # need not end in the suffix (`.env.$X.example` with X=' .env ' reads .env). Such a name is
+    # judged like any other .env name below, as it was before templates were recognised.
+    *'$'* | *'`'*) ;;
+    .env*.example | .env*.sample | .env*.template) return 1 ;;
+  esac
+  case "$base" in
     .env | .env.* | '.env*'* | '.env?'*) return 0 ;;
   esac
   return 1
@@ -312,9 +391,14 @@ remote_identity() {
 # agent around, or $CLAUDE_PROJECT_DIR, which names the session and not the owner
 # of the policy loaded above. Every remote counts, fetch and push URLs alike: when
 # in doubt the rule stays on, and a remote of ours is a doubt.
+# The PUBLISHED guard (`--project <dir>`) lives in the plugin cache, outside any
+# repository, so there the anchor is <dir> — the repository whose policy it loaded.
+# An empty anchor is refused before git sees it: `git -C ""` is the cwd, which
+# would make whatever repository the agent stands in "ours".
 # TEST-ONLY override: BASH_GUARD_PROJECT_ROOT.
 project_identities() {
-  local root="${BASH_GUARD_PROJECT_ROOT:-$HERE}" remotes="" urls="" r u
+  local root="${BASH_GUARD_PROJECT_ROOT:-$ANCHOR_ROOT}" remotes="" urls="" r u
+  [ -n "$root" ] && [ -d "$root" ] || return 0
   git_clean -C "$root" rev-parse --git-dir >/dev/null 2>&1 || return 0
   remote_identity "$(cd "$root" 2>/dev/null && pwd -P)"
   printf '\n'
@@ -365,9 +449,12 @@ identity_in() {
 }
 
 # Is this push aimed at the repository that vendored this guard? True (0) unless it
-# is PROVEN foreign — see the fail-closed paragraph above.
+# is PROVEN foreign — see the fail-closed paragraph above. When it returns 1 it leaves
+# the foreign destinations, one identity per line, in PUSH_FOREIGN_IDS.
+PUSH_FOREIGN_IDS=""
 push_targets_this_repo() {
   local remote="$1" ids="" dests="" u d foreign=0
+  PUSH_FOREIGN_IDS=""
   command_relocates && return 0
   ids="$(project_identities)" || ids=""
   [ -n "${ids//$'\n'/}" ] || return 0
@@ -377,48 +464,75 @@ push_targets_this_repo() {
     d="$(remote_identity "$u")" || d=""
     [ -n "$d" ] || return 0
     identity_in "$d" "$ids" && return 0
+    identity_in "$d" "$PUSH_FOREIGN_IDS" || PUSH_FOREIGN_IDS+="$d"$'\n'
     foreign=1
   done <<<"$dests"
   [ "$foreign" -eq 1 ] || return 0
   return 1
 }
 
-# May this `gh pr create` go without --label? Only when this repository's policy says
-# `require_pr_label: false` AND the PR provably lands in THIS repository. The waiver is
-# this repository's to give, like the protected branch, and must not travel to another
-# one whose release gate does read the label. Same fail-closed shape as the push, with
-# the opposite default: `--repo` names the target (OWNER/REPO, HOST/OWNER/REPO or a
-# URL); without it gh uses the repository of the directory it runs in, so every remote
-# there must be ours. A relocation in the command (a `cd`, GH_REPO=), a --repo that does
-# not parse, or not knowing which repository this is keeps the label required.
+# The protected branch of a FOREIGN push destination, by ITS OWN policy — not ours, which
+# is not in charge there, and not "none", which let a session rooted in one consumer push
+# straight to another consumer's main. Prints the branch; prints nothing when the destination
+# provably vendors no policy (then pushing to its main may well be its flow: the case that
+# made foreign pushes exempt in the first place, 2026-08-03); prints the strict default
+# `main` when the policy exists but cannot be read, or cannot be looked for.
+#   owner/name   the API, as a cross-repository merge reads it (api_policy_tsv: 404 = none).
+#   local:<dir>  that repository's own HEAD commit (committed, never a working tree).
+destination_protected_branch() {
+  local id="$1" tsv="" rc=0 tmp key val prot="main"
+  case "$id" in
+    local:*)
+      if git_clean --git-dir="${id#local:}" cat-file -e HEAD:scripts/hooks/guard.policy.json 2>/dev/null; then
+        tmp="$(mktemp 2>/dev/null)" || { printf 'main'; return 0; }
+        git_clean --git-dir="${id#local:}" show HEAD:scripts/hooks/guard.policy.json >"$tmp" 2>/dev/null || true
+        tsv="$(policy_tsv_from_file "$tmp")"
+        rm -f "$tmp"
+      else
+        # No commit yet, or a HEAD without the file: no policy. A git that cannot even open
+        # the directory is not proof of that.
+        git_clean --git-dir="${id#local:}" rev-parse --git-dir >/dev/null 2>&1 || printf 'main'
+        return 0
+      fi
+      ;;
+    */*)
+      tsv="$(api_policy_tsv "$id")" || rc=$?
+      [ "$rc" -eq 3 ] && return 0
+      ;;
+  esac
+  while IFS=$'\t' read -r key val; do
+    [ "$key" = PROTECTED ] && [ -n "$val" ] && prot="$val"
+  done <<<"$tsv"
+  printf '%s' "$prot"
+}
+
+# May this `gh pr create` go without --label? Only when the policy of the repository the PR
+# LANDS IN says `require_pr_label: false`: the label is that repository's release gate, so the
+# waiver is that repository's to give. Which repository that is, is merge_target's answer — the
+# same one a merge gets, with the same fail-closed shape and the opposite default:
+#   this repository   -> the policy loaded at the top of this file;
+#   another one       -> ITS guard.policy.json, read from its origin like a merge reads it. Until
+#                        2026-09-30 a --repo naming another repository kept the label required no
+#                        matter what that repository said, so a session rooted in one consumer
+#                        could not open a PR in a repository that does not read labels without a
+#                        deny and a retry;
+#   cannot tell       -> required (a relocation in the command, a --repo that does not parse, a
+#                        cwd whose remotes are not all ours, a --repo or an option the shell
+#                        fills in later: $2 = 1).
+# A policy that cannot be read keeps it required too: not knowing is never a waiver.
 pr_label_waived() {
-  local repo="$1" ids="" t="" remotes="" urls="" r u d any=0
-  [ "$REQUIRE_PR_LABEL" = "false" ] || return 1
-  command_relocates && return 1
-  ids="$(project_identities)" || ids=""
-  [ -n "${ids//$'\n'/}" ] || return 1
-  if [ -n "$repo" ]; then
-    case "$repo" in
-      *://*) t="$(remote_identity "$repo")" ;;
-      */*/*) t="$(remote_identity "ssh://h/${repo#*/}")" ;;
-      */*) t="$(remote_identity "ssh://h/$repo")" ;;
-    esac
-    [ -n "$t" ] || return 1
-    identity_in "$t" "$ids"
-    return
-  fi
-  remotes="$(git remote 2>/dev/null)" || return 1
-  for r in $remotes; do
-    urls+="$(git remote get-url --all "$r" 2>/dev/null)"$'\n'
-  done
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
-    d="$(remote_identity "$u")" || d=""
-    [ -n "$d" ] || return 1
-    identity_in "$d" "$ids" || return 1
-    any=1
-  done <<<"$urls"
-  [ "$any" -eq 1 ]
+  local repo="$1" unknown="${2:-0}" target="" rc=0 tsv
+  [ "$unknown" = 1 ] && return 1
+  target="$(merge_target "$repo")" || rc=$?
+  case "$rc" in
+    0) [ "$REQUIRE_PR_LABEL" = "false" ] ;;
+    1)
+      tsv="$(target_policy_tsv "$target")"
+      [ -n "$tsv" ] || return 1
+      identity_in $'PRLABEL\tfalse' "$tsv"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 check_git_push() {
@@ -464,11 +578,24 @@ check_git_push() {
       "use git push --force-with-lease toward your PR branch (never toward ${PROTECTED_BRANCH})"
   fi
 
-  # Everything below is the protected-branch rule, which is THIS repository's policy.
-  # The --no-verify and --force checks above stay unconditional: they are rules about
-  # the agent, not about any repository.
+  # Everything below is the protected-branch rule, which is the policy of the repository
+  # the push LANDS IN. The --no-verify and --force checks above stay unconditional: they
+  # are rules about the agent, not about any repository.
+  #   - this repository (or not provably another one): the policy loaded at the top;
+  #   - another repository: ITS policy (destination_protected_branch), so a session rooted
+  #     here cannot push to another consumer's main, while a repository that vendors no
+  #     policy — whose flow may be pushing to main — keeps no protected branch at all.
+  local protected_set="$PROTECTED_BRANCH" whose="" id p
   if ! push_targets_this_repo "${positional[0]:-$repo_opt}"; then
-    return 0
+    protected_set=""
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      p="$(destination_protected_branch "$id")"
+      [ -n "$p" ] || continue
+      protected_set+="$p"$'\n'
+      whose+="${whose:+, }${id}"
+    done <<<"$PUSH_FOREIGN_IDS"
+    [ -n "$protected_set" ] || return 0
   fi
 
   # Resolve the push target(s). positional[0] is the remote (name or URL); the
@@ -479,16 +606,21 @@ check_git_push() {
     refspecs=("${positional[@]:1}")
   fi
 
+  # Where the protected branch comes from, for the message: a foreign destination's own
+  # policy is named, so the reader looks at the right file.
+  local by="" r dst
+  [ -n "$whose" ] && by=" in ${whose}, by that repository's own guard.policy.json"
+
   if [ "${#refspecs[@]}" -eq 0 ]; then
     # push with no refspec: with push.default=simple the target is the current branch
-    if [ "$(current_branch)" = "$PROTECTED_BRANCH" ]; then
-      deny "git push from ${PROTECTED_BRANCH} pushes directly to ${PROTECTED_BRANCH}" \
+    dst="$(current_branch)"
+    if [ -n "$dst" ] && identity_in "$dst" "$protected_set"; then
+      deny "git push from ${dst} pushes directly to ${dst}${by}" \
         "work on a PR branch (git checkout -b <type>/<issue>-description) and open a PR"
     fi
     return 0
   fi
 
-  local r dst
   for r in "${refspecs[@]}"; do
     r="${r#+}"
     if [[ "$r" == *:* ]]; then
@@ -501,11 +633,11 @@ check_git_push() {
     if [ "$dst" = "HEAD" ]; then
       dst="$(current_branch)"
     fi
-    if [ "$dst" = "$PROTECTED_BRANCH" ]; then
+    if [ -n "$dst" ] && identity_in "$dst" "$protected_set"; then
       # The alternative names the branch, or the worktree with -C: a bare `HEAD`
       # resolves wherever the session happens to stand, so what this message
       # suggests must never contain one.
-      deny "push targeting ${PROTECTED_BRANCH} is forbidden (${PROTECTED_BRANCH} is protected for humans)" \
+      deny "push targeting ${dst} is forbidden (${dst} is protected for humans${by})" \
         "push your PR branch by name (git push -u origin <branch>) or from its worktree (git -C <worktree> push -u origin HEAD), and open a PR"
     fi
   done
@@ -579,8 +711,8 @@ pr_refs() {
   # The `--repo` of the original command MUST be forwarded. The hook runs in
   # whatever directory the session's shell is in (or in $CLAUDE_PROJECT_DIR, when
   # a repo wires it with a `cd`), and neither is the PR's repository, so without
-  # it `gh pr view` resolves the number against the wrong repo. Measured from the
-  # studio repo against a product PR: "Could not resolve to a PullRequest with the
+  # it `gh pr view` resolves the number against the wrong repo. Measured from one
+  # repo against a PR of another: "Could not resolve to a PullRequest with the
   # number of 439", which the fail-closed branch below turns into the protected
   # branch — so every cross-repo merge was denied no matter what the policy said.
   if [ -n "$repo" ]; then
@@ -622,6 +754,17 @@ is_long_lived_branch() {
   return 1
 }
 
+# The "owner/name" a gh --repo value names (OWNER/REPO, HOST/OWNER/REPO or a URL), lowercase;
+# nothing when it does not parse.
+repo_arg_identity() {
+  case "$1" in
+    *://*) remote_identity "$1" ;;
+    */*/*) remote_identity "ssh://h/${1#*/}" ;;
+    */*) remote_identity "ssh://h/$1" ;;
+  esac
+  return 0
+}
+
 # Which repository does this `gh pr merge` land in, and is it THIS one — the one
 # that vendored this guard, whose policy was loaded at the top of this file?
 # Prints the target's "owner/name" (lowercase) and returns:
@@ -650,11 +793,7 @@ merge_target() {
     ids="$(project_identities)" || ids=""
   fi
   if [ -n "$repo" ]; then
-    case "$repo" in
-      *://*) t="$(remote_identity "$repo")" ;;
-      */*/*) t="$(remote_identity "ssh://h/${repo#*/}")" ;;
-      */*) t="$(remote_identity "ssh://h/$repo")" ;;
-    esac
+    t="$(repo_arg_identity "$repo")"
     [ -n "$t" ] || return 2
     printf '%s' "$t"
     identity_in "$t" "$ids" && return 0
@@ -691,20 +830,75 @@ policy_tsv_from_file() {
 # read it, which the caller MUST treat as a denial.
 # TEST-ONLY override: BASH_GUARD_TARGET_POLICY (a file path).
 target_policy_tsv() {
-  local repo="$1" content tmp tsv
+  local repo="$1"
   if [ -n "${BASH_GUARD_TARGET_POLICY:-}" ]; then
     policy_tsv_from_file "$BASH_GUARD_TARGET_POLICY"
     return 0
   fi
-  content="$(gh api "repos/${repo}/contents/scripts/hooks/guard.policy.json" --jq .content 2>/dev/null \
-    | base64 -d 2>/dev/null || true)"
-  [ -n "$content" ] || return 0
-  tmp="$(mktemp)" || return 0
-  printf '%s' "$content" > "$tmp"
+  api_policy_tsv "$repo" || true
+}
+
+# <owner/name>'s guard.policy.json as its default branch carries it, through the API. Prints
+# the policy TSV and returns 0 when it was read; returns 3 when the repository PROVABLY vendors
+# no policy (HTTP 404: no such file, or no repository this token can see); returns 1 for
+# anything else (no network, rate limit, an answer that does not decode). Only a push needs the
+# difference — for a merge both mean "unknown", which denies — because "no policy" is exactly
+# the repository whose own flow may be to push to its main (see check_git_push).
+api_policy_tsv() {
+  local repo="$1" content="" err="" rc=0 tmp tsv
+  err="$(mktemp 2>/dev/null)" || return 1
+  content="$(gh api "repos/${repo}/contents/scripts/hooks/guard.policy.json" --jq .content 2>"$err")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if grep -q 'HTTP 404' "$err" 2>/dev/null; then rc=3; else rc=1; fi
+    rm -f "$err"
+    return "$rc"
+  fi
+  rm -f "$err"
+  content="$(printf '%s' "$content" | base64 -d 2>/dev/null)" || return 1
+  [ -n "$content" ] || return 1
+  tmp="$(mktemp 2>/dev/null)" || return 1
+  printf '%s' "$content" >"$tmp"
   tsv="$(policy_tsv_from_file "$tmp")"
   rm -f "$tmp"
+  [ -n "$tsv" ] || return 1
   printf '%s' "$tsv"
 }
+
+# The policy of the repository the PUBLISHED guard protects (`--project <dir>`), as
+# origin's default branch carries it — never the working tree's (see "Which
+# repository, and which copy of its policy" at the top). Empty output = could not
+# read it, and the caller keeps the strict defaults.
+#   1. refs/remotes/origin/HEAD, resolved and read with `git show`: no network per
+#      command. It moves on fetch (and on a push to that branch), not on an edit.
+#   2. The API, through target_policy_tsv, for a clone without origin/HEAD or a ref
+#      that lacks the file. Only for a GitHub-shaped origin: a local path has no API.
+published_policy_tsv() {
+  local root="$1" ref="" tmp="" tsv="" url="" id=""
+  [ -n "$root" ] && [ -d "$root" ] || return 0
+  ref="$(git_clean -C "$root" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)" || ref=""
+  if [ -n "$ref" ] && tmp="$(mktemp 2>/dev/null)"; then
+    if git_clean -C "$root" show "${ref}:scripts/hooks/guard.policy.json" >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+      tsv="$(policy_tsv_from_file "$tmp")"
+    fi
+    rm -f "$tmp"
+  fi
+  if [ -z "$tsv" ]; then
+    url="$(git_clean -C "$root" remote get-url origin 2>/dev/null)" || url=""
+    id="$(remote_identity "$url")"
+    case "$id" in
+      local:*) ;;
+      ?*/?*) tsv="$(target_policy_tsv "$id")" ;;
+    esac
+  fi
+  printf '%s' "$tsv"
+}
+
+# Half of the merges this guard could not resolve in the 30 days to 2026-09-30 (20 of 38) were
+# not merges at all: `gh pr merge <n>` as TEXT inside another command — a sed pattern editing a
+# doc, a grep, a python string. The guard reads every quoted span as a possible command too,
+# because `bash -c "…"` does run it, and it cannot tell a pattern from a script without letting
+# some script through. So those stay denied, and the message says how to do the edit instead.
+MERGE_MENTION_HINT="If this is text that is not meant to run (a sed or grep pattern, a doc being edited), the guard reads quoted text as a possible command too: make the edit with the Edit tool instead"
 
 # A `gh pr merge` attempt. Three independent negatives, in this order:
 #   1. the policy does not grant agent_may_merge;
@@ -725,8 +919,32 @@ target_policy_tsv() {
 # are reassigned rather than shadowed on purpose: this process exits right after,
 # and threading four values through three helpers would be the kind of change
 # that quietly stops covering one of them.
+# Two things are settled before whose policy decides, both about READING the command:
+#   - a PR or a --repo the shell fills in later (`gh pr merge $N --repo "$R"`, a loop, a
+#     substitution, an option that expands into options) cannot be looked up: the guard reads
+#     the command BEFORE it runs. It is denied, as it always was — but saying why, instead of
+#     "could not resolve PR '$N'", which sent the agent to check a number that was fine.
+#   - a PR given by URL names its repository: `gh pr merge https://github.com/o/n/pull/5` lands
+#     in o/n from any directory, so that is the target (and a --repo naming another repository
+#     next to it cannot be told apart from it: denied).
 check_pr_merge() {
-  local pr="$1" repo="${2:-}" refs base head target rc=0 tsv foreign=0
+  local pr="$1" repo="${2:-}" pr_exp="${3:-0}" repo_exp="${4:-0}" refs base head target rc=0 tsv foreign=0
+  local url_repo="" shown
+  if [ "$pr_exp" = 1 ] || [ "$repo_exp" = 1 ]; then
+    shown="gh pr merge ${pr}${repo:+ --repo $repo}"
+    shown="${shown//\$__GUARD_SUBST__/\$(…)}"
+    deny "'${shown}' names its PR or its repository with something the shell fills in later (a variable, a substitution, a loop), and the guard reads the command before it runs, so it cannot look the PR up" \
+      "write both literally, one merge per command: gh pr merge <number> --repo <owner>/<name>"
+  fi
+  url_repo="$(pr_url_repo "$pr")"
+  if [ -n "$url_repo" ]; then
+    if [ -z "$repo" ]; then
+      repo="$url_repo"
+    elif [ "$(repo_arg_identity "$repo")" != "$(repo_arg_identity "$url_repo")" ]; then
+      deny "gh pr merge names a PR of ${url_repo} by URL and --repo ${repo}: two repositories, so the policy that governs it is unknown" \
+        "use one of them: gh pr merge <number> --repo <owner>/<name>"
+    fi
+  fi
   target="$(merge_target "$repo")" || rc=$?
   case "$rc" in
     0) ;;
@@ -752,7 +970,7 @@ check_pr_merge() {
       ;;
     *)
       deny "gh pr merge$([ -n "$repo" ] && printf " --repo %s" "$repo"): cannot tell which repository this PR belongs to, so the policy that governs it is unknown" \
-        "name it explicitly, without moving the shell first: gh pr merge <n> --repo <owner>/<name>"
+        "name it explicitly, without moving the shell first: gh pr merge <n> --repo <owner>/<name>. ${MERGE_MENTION_HINT}"
       ;;
   esac
 
@@ -768,7 +986,7 @@ check_pr_merge() {
     # on the integration branch used to be denied with "base is main", which
     # sends the reader to look at the wrong thing.
     deny "gh pr merge could not resolve PR '${pr}'$([ -n "$repo" ] && printf " in %s" "$repo"), so the base branch is unknown" \
-      "pass the PR's repository explicitly (gh pr merge <n> --repo <owner>/<name>) and check the number exists"
+      "pass the PR's repository explicitly (gh pr merge <n> --repo <owner>/<name>) and check the number exists. ${MERGE_MENTION_HINT}"
   fi
   if [ "$base" = "$PROTECTED_BRANCH" ]; then
     deny_human_merge "gh pr merge would merge a PR whose base is ${PROTECTED_BRANCH} (protected)"
@@ -779,52 +997,206 @@ check_pr_merge() {
   fi
   return 0
 }
-check_gh() {
-  # Locate the first two subcommands, skipping global flags. Also capture the
-  # first positional after `pr merge` (the PR number/URL/branch), for the
-  # base-branch check.
-  local i=1 sub1="" sub2="" a merge_arg="" repo_arg=""
-  while [ "$i" -lt "${#tok[@]}" ]; do
-    a="${tok[i]}"
-    case "$a" in
-      -R | --repo)
-        # Captured, not just skipped: pr_base_branch needs it to look the PR up
-        # in the RIGHT repo. See the note there.
-        repo_arg="${tok[i + 1]:-}"
-        i=$((i + 2))
+# The words of a `gh` segment as the SHELL splits them — quotes honoured, through egress_words —
+# starting after the command word. The prefixes check_segment skips (assignments, env and its
+# options, sudo/command/exec/nohup/time and shell keywords) are skipped the same way, so both
+# readings agree on which word is `gh`. GHW holds each word's text; GHX is 1 for a word the shell
+# fills in (a `$` or backtick it would expand, quoted or not), whose value the guard cannot read.
+#
+# Why not the whitespace tokens every other rule reads: `gh pr merge --subject "docs: a b" 7`
+# makes `a` the PR for them, and `--subject 5 7` makes it 5 — a different PR than the one gh
+# merges, possibly with another base. The PR a merge names is the one thing this rule must read
+# right.
+GHW=()
+GHX=()
+GH_OPAQUE=0
+gh_words() {
+  local w k=0 n
+  GHW=()
+  GHX=()
+  egress_words "$1"
+  n=${#EGRESS_WORDS[@]}
+  while [ "$k" -lt "$n" ]; do
+    w="${EGRESS_WORDS[k]//$'\x1e'/}"
+    if [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      k=$((k + 1))
+      continue
+    fi
+    case "$w" in
+      env)
+        k=$((k + 1))
+        while [ "$k" -lt "$n" ]; do
+          case "${EGRESS_WORDS[k]//$'\x1e'/}" in
+            -u | -C | --unset | --chdir) k=$((k + 2)) ;;
+            -*) k=$((k + 1)) ;;
+            *) break ;;
+          esac
+        done
         continue
         ;;
-      -R=* | --repo=*)
-        repo_arg="${a#*=}"
-        i=$((i + 1))
-        continue
-        ;;
-      --hostname)
-        i=$((i + 2))
-        continue
-        ;;
-      -*)
-        i=$((i + 1))
+      sudo | command | exec | nohup | time | do | then | else | elif | if | while | until | '{' | '!' | coproc)
+        k=$((k + 1))
         continue
         ;;
     esac
+    break
+  done
+  # Both readings must land on the same word. If this one does not see `gh` where check_segment
+  # did, it cannot say which words are gh's: GH_OPAQUE tells check_gh to fail closed.
+  GH_OPAQUE=0
+  w="${EGRESS_WORDS[k]:-}"
+  w="${w//$'\x1e'/}"
+  [ "${w##*/}" = "gh" ] || GH_OPAQUE=1
+  for ((k = k + 1; k < n; k++)); do
+    w="${EGRESS_WORDS[k]}"
+    if [[ "$w" == *'$'* || "$w" == *'`'* ]]; then GHX+=(1); else GHX+=(0); fi
+    w="${w//$'\x1e'/}"
+    GHW+=("${w//$'\x1f'/\$}")
+  done
+  return 0
+}
+
+# gh options that take their value in the NEXT word: the global ones, then those of the two
+# subcommands this guard reads. A value is never the PR, never a subcommand and never a flag.
+GH_VALUE_GLOBAL=" -R --repo --hostname "
+GH_VALUE_PR_MERGE=" -b --body -F --body-file -t --subject -A --author-email --match-head-commit "
+GH_VALUE_PR_CREATE=" -a --assignee -B --base -b --body -F --body-file -H --head -l --label -m --milestone -p --project -r --reviewer -T --template -t --title --recover "
+
+# A word of short options, as gh's flag parser (pflag) reads it: its letters in order, until one
+# takes a value (listed in $2, the " -x " set in force) or is followed by `=`. That letter goes in
+# SC_LETTER; its value is the rest of the word (one leading `=` dropped) in SC_VALUE, or, when
+# nothing is left, the NEXT word, and then SC_NEXT is 1. No such letter: SC_LETTER is empty.
+SC_LETTER=""
+SC_VALUE=""
+SC_NEXT=0
+short_cluster() {
+  local w="${1#-}" values="$2" k c
+  SC_LETTER=""
+  SC_VALUE=""
+  SC_NEXT=0
+  for ((k = 0; k < ${#w}; k++)); do
+    c="${w:k:1}"
+    if [[ "$values" == *" -$c "* ]] || [ "${w:k+1:1}" = "=" ]; then
+      SC_LETTER="$c"
+      SC_VALUE="${w:k+1}"
+      [ -n "$SC_VALUE" ] || SC_NEXT=1
+      SC_VALUE="${SC_VALUE#=}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# The repository a PR URL names (https://<host>/<owner>/<name>/pull/<n>[/…]), or nothing.
+pr_url_repo() {
+  local u="$1"
+  case "$u" in
+    http://*/pull/* | https://*/pull/*) ;;
+    *) return 0 ;;
+  esac
+  u="${u#*://}"
+  u="${u#*/}"
+  u="${u%%/pull/*}"
+  case "$u" in */*) printf '%s' "$u" ;; esac
+}
+
+check_gh() {
+  # The first two positionals are the subcommands; for `pr merge` the next one is the PR
+  # (number, URL or branch). Global options, and the options of `pr merge` / `pr create` that
+  # take a value, are skipped with their value. The scan does NOT stop at the PR: `--repo`
+  # usually comes AFTER it (`gh pr merge 123 --repo owner/name --squash`).
+  local i=0 n w sub1="" sub2="" merge_arg="" merge_set=0 repo_arg="" repo_exp=0 pr_exp=0
+  local has_label=0 opts_done=0 opaque=0 values="$GH_VALUE_GLOBAL" a
+  gh_words "$seg"
+  opaque="$GH_OPAQUE"
+  n=${#GHW[@]}
+  while [ "$i" -lt "$n" ]; do
+    w="${GHW[i]}"
+    if [ "$opts_done" -eq 0 ]; then
+      case "$w" in
+        --)
+          opts_done=1
+          i=$((i + 1))
+          continue
+          ;;
+        -R | --repo)
+          # Captured, not just skipped: pr_refs needs it to look the PR up in the RIGHT
+          # repository, and merge_target to know whose policy decides.
+          repo_arg="${GHW[i + 1]:-}"
+          repo_exp="${GHX[i + 1]:-0}"
+          i=$((i + 2))
+          continue
+          ;;
+        -R=* | --repo=*)
+          repo_arg="${w#*=}"
+          repo_exp="${GHX[i]}"
+          i=$((i + 1))
+          continue
+          ;;
+        --label | -l | --label=* | -l?*)
+          has_label=1
+          ;;
+      esac
+      case "$w" in
+        --*=*)
+          i=$((i + 1))
+          continue
+          ;;
+        --?*)
+          # An option the shell fills in may turn into any option at all (`--repo x`).
+          [ "${GHX[i]}" = 1 ] && opaque=1
+          if [[ "$values" == *" $w "* ]]; then i=$((i + 2)); else i=$((i + 1)); fi
+          continue
+          ;;
+        -?*)
+          [ "${GHX[i]}" = 1 ] && opaque=1
+          # A cluster of short options (`-sd`, `-st <subject>`, `-sRowner/name`), read the way
+          # gh's flag parser reads it: see short_cluster. Taken for one unknown option, `gh pr
+          # merge -st 123 456` made 123 the PR while gh merged 456, and `-Rowner/name` left the
+          # repository to an earlier --repo while gh used the last one (found 2026-09-30).
+          short_cluster "$w" "$values"
+          case "$SC_LETTER" in
+            R)
+              if [ "$SC_NEXT" -eq 1 ]; then
+                repo_arg="${GHW[i + 1]:-}"
+                repo_exp="${GHX[i + 1]:-0}"
+              else
+                repo_arg="$SC_VALUE"
+                repo_exp="${GHX[i]}"
+              fi
+              ;;
+            l) has_label=1 ;;
+          esac
+          if [ "$SC_NEXT" -eq 1 ]; then i=$((i + 2)); else i=$((i + 1)); fi
+          continue
+          ;;
+      esac
+    fi
     if [ -z "$sub1" ]; then
-      sub1="$a"
+      sub1="$w"
     elif [ -z "$sub2" ]; then
-      sub2="$a"
-    elif [ -z "$merge_arg" ]; then
-      # Do NOT stop here: `--repo` usually comes AFTER the PR number
-      # (`gh pr merge 123 --repo owner/name --squash`), so a scan that stops at
-      # the first positional never reads it and the destination stays unknown.
-      # Keep scanning to the end; only the FIRST positional after `pr merge` is
-      # the PR.
-      merge_arg="$a"
+      sub2="$w"
+      case "$sub1 $sub2" in
+        "pr merge") values+="${GH_VALUE_PR_MERGE# }" ;;
+        "pr create") values+="${GH_VALUE_PR_CREATE# }" ;;
+      esac
+    elif [ "$sub1 $sub2" = "pr merge" ] && [ "$merge_set" -eq 0 ]; then
+      merge_arg="$w"
+      pr_exp="${GHX[i]}"
+      merge_set=1
+    elif [ "${GHX[i]}" = 1 ]; then
+      # A positional gh would reject, unless the shell turns it into options (`--repo x`).
+      opaque=1
     fi
     i=$((i + 1))
   done
 
-  if [ "$sub1" = "pr" ] && [ "$sub2" = "merge" ]; then
-    check_pr_merge "$merge_arg" "$repo_arg"
+  # Half a command (see PARTIAL in check_segment) is not judged by the two rules that need the
+  # WHOLE one: which PR, in which repository, and whether a label is there. Its masked twin, the
+  # same command read whole, is.
+  if [ "$sub1" = "pr" ] && [ "$sub2" = "merge" ] && [ "$PARTIAL" -eq 0 ]; then
+    [ "$opaque" -eq 1 ] && pr_exp=1
+    check_pr_merge "$merge_arg" "$repo_arg" "$pr_exp" "$repo_exp"
   fi
 
   # `gh pr create` without a label. The label is what the release gate reads, and putting it in a
@@ -836,18 +1208,14 @@ check_gh() {
   # (gh accepts a non-existent one, warns on stdout and still exits 0) and re-reads the PR
   # afterwards to prove it stuck.
   #
-  # A repository whose releases do not read PR labels (release-please from the commits, say)
-  # can waive it with `require_pr_label: false` — for its own PRs only; see pr_label_waived.
-  if [ "$sub1" = "pr" ] && [ "$sub2" = "create" ]; then
-    local has_label=0
-    for a in "${tok[@]:1}"; do
-      case "$a" in
-        --label | --label=* | -l) has_label=1 ;;
-      esac
-    done
-    if [ "$has_label" -eq 0 ] && ! pr_label_waived "$repo_arg"; then
-      deny "gh pr create without --label leaves the release gate's label to a second command, which is how it gets forgotten" \
-        "pass it here (gh pr create --label semver:<x> ...) or use core-dev's pr-create.sh, which also verifies the label actually landed"
+  # A repository whose releases do not read PR labels (release-please from the commits, say, or a
+  # version bump in a manifest) waives it with `require_pr_label: false` — for PRs that land in
+  # it, wherever the session runs; see pr_label_waived.
+  if [ "$sub1" = "pr" ] && [ "$sub2" = "create" ] && [ "$PARTIAL" -eq 0 ]; then
+    [ "$repo_exp" = 1 ] && opaque=1
+    if [ "$has_label" -eq 0 ] && ! pr_label_waived "$repo_arg" "$opaque"; then
+      deny "gh pr create without --label: the release gate reads a semver label from the PR, and a label left to a second command is how it gets forgotten" \
+        "re-run the same command with it: --label semver:patch (fix), semver:minor (feat), semver:major (breaking) or semver:none (docs/chore/ci/test); core-dev's pr-create.sh also checks that the label exists and landed. A repository whose releases do not read labels says so in its guard.policy.json (require_pr_label: false), and then no label is needed"
     fi
   fi
 
@@ -875,7 +1243,7 @@ check_env_dump() {
   for a in "${tok[@]:1}"; do
     if is_env_file "$a"; then
       deny "dumping the contents of '${a}' would expose credentials in the transcript" \
-        "use .env.example as a template or ask the user for the specific value"
+        "read its template instead (.env.example, or .env.<name>.example / .sample / .template) or ask the user for the specific value"
     fi
   done
   return 0
@@ -1039,17 +1407,25 @@ EGRESS_WGET_FROM_FILE_LONG=" --input-file --input-metalink --config "
 EGRESS_WGET_FROM_FILE_SHORT="i"
 EGRESS_WGET_DEST_SHORT="eB"
 
+# What every egress deny says about READING the web. Most of these denies are an agent reading
+# a public page or doc, and WebFetch is the tool for that: measured over the 30 days to
+# 2026-09-30, of 202 egress denies 85 went on to WebFetch/WebSearch within five tool calls, but
+# 24 were followed by ANOTHER curl/wget deny and 23 by a detour through ssh or another HTTP
+# client — the same egress by another door. A message that names the right tool saves the
+# turns; one that only says "no" teaches the detour.
+EGRESS_READ_HINT="to READ a public page, doc or API answer, use the WebFetch tool instead of curl/wget"
+
 deny_egress_nonliteral() {
   local shown="${1//$'\x1e'/}"
   shown="${shown//$'\x1f'/\$}"
   shown="${shown//\$__GUARD_SUBST__/\$(…)}"
   deny "curl/wget toward a destination that is not written literally ('${shown}'): network egress is restricted to the allow-list, and it can only judge a host written in the command" \
-    "write the URL with its scheme and host literally, quoted (the path may keep variables inside the quotes), or ask the user to fetch the resource"
+    "write the URL with its scheme and host literally, quoted, one command per URL (the path may keep variables inside the quotes); ${EGRESS_READ_HINT}; or ask the user to fetch the resource"
 }
 
 deny_egress_from_file() {
   deny "$1: a file can name URLs, and the egress allow-list can only judge a host written in the command" \
-    "write the URL literally in the command (headers can come from a file or stdin with -H @file / -H @-), or ask the user to fetch the resource"
+    "write the URL literally in the command (headers can come from a file or stdin with -H @file / -H @-); ${EGRESS_READ_HINT}; or ask the user to fetch the resource"
 }
 
 # Judge one destination word: no unquoted expansion anywhere, and none in its scheme and host.
@@ -1165,8 +1541,8 @@ check_egress() {
         if [ "$host" = "$h" ]; then allowed=1; break; fi
       done
       if [ "$allowed" -eq 0 ]; then
-        deny "curl/wget toward '${host}': network egress is restricted to the allow-list" \
-          "point it at localhost/127.0.0.1/[::1] or ask the user to fetch the resource"
+        deny "curl/wget toward '${host}': network egress is restricted to the allow-list (${EGRESS_ALLOW[*]})" \
+          "${EGRESS_READ_HINT}; a local service is reachable on the allowed hosts; if this repository needs a host routinely, ask the user to add it to egress_allow in its guard.policy.json (the owner's decision: never edit the policy to get past this deny); to download or install anything else, ask the user. Sending it through ssh, python or another client is the same egress, not a way around this rule"
       fi
     fi
   done
@@ -1175,10 +1551,42 @@ check_egress() {
 
 # --- Segment analysis -------------------------------------------------------
 
+# Does this text end inside a word the shell has not finished? A whitespace token can: `X="a b"`
+# arrives as `X="a` and `b"`, and `X=a\ b` as `X=a\` and `b` (the blank was escaped).
+quote_open() {
+  local s="$1" q="" c k LC_ALL=C
+  for ((k = 0; k < ${#s}; k++)); do
+    c="${s:k:1}"
+    if [ "$q" = "'" ]; then
+      [ "$c" = "'" ] && q=""
+      continue
+    fi
+    if [ "$c" = '\' ]; then
+      # A backslash that ends the token escaped the blank that ended it.
+      [ $((k + 1)) -lt ${#s} ] || return 0
+      k=$((k + 1))
+      continue
+    fi
+    if [ "$q" = '"' ]; then
+      [ "$c" = '"' ] && q=""
+      continue
+    fi
+    case "$c" in "'" | '"') q="$c" ;; esac
+  done
+  [ -n "$q" ]
+}
+
 check_segment() {
-  local seg="$1"
+  local seg="$1" PARTIAL=0
   local -a raw=() tok=()
-  local t
+  local t acc
+  # Half a command, cut at a substitution (see splitSegments): marked with a leading TAB.
+  case "$seg" in
+    $'\t'*)
+      PARTIAL=1
+      seg="${seg#$'\t'}"
+      ;;
+  esac
 
   # Simple whitespace tokenization: quotes are NOT interpreted (tripwire); they
   # are only stripped from the ends of each token.
@@ -1196,12 +1604,22 @@ check_segment() {
   GIT_GLOBALS=()
 
   # Skip inert prefixes: env assignments, wrappers and shell keywords (do/then/…
-  # appear as segment heads when loops/conditionals are split by ';').
+  # appear as segment heads when loops/conditionals are split by ';'). A group `{ … }`, a
+  # negation `!` and `coproc` too: until 2026-09-30 `{ git push origin main; }` and
+  # `! git push origin main` made `{` / `!` the command word, which no rule looked at.
   local start=0
   while [ "$start" -lt "${#tok[@]}" ]; do
     t="${tok[start]}"
     if [[ "$t" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      # A quoted value with blanks spans several tokens: all of them are the assignment. Taking
+      # the second half for the command word made `X="a b" git push origin main` a command
+      # named `b"`, which no rule looked at (found 2026-09-30).
+      acc="${raw[start]}"
       start=$((start + 1))
+      while quote_open "$acc" && [ "$start" -lt "${#tok[@]}" ]; do
+        acc+=" ${raw[start]}"
+        start=$((start + 1))
+      done
       continue
     fi
     case "$t" in
@@ -1219,7 +1637,7 @@ check_segment() {
         done
         continue
         ;;
-      sudo | command | exec | nohup | time | do | then | else | elif | if | while | until)
+      sudo | command | exec | nohup | time | do | then | else | elif | if | while | until | '{' | '!' | coproc)
         start=$((start + 1))
         continue
         ;;
@@ -1791,15 +2209,50 @@ function analyzableTexts(src, depth) {
 // does get executed — while `gh pr create --title "chore(x): y" --label z` keeps its
 // label in the same segment as `pr create`. Nothing that was detected before stops being
 // detected; what stops is cutting a command in half at a quoted parenthesis.
-function splitSegments(str) {
+//
+// A substitution still cuts, and that leaves HALF a command on each side of it: in
+//   gh pr create --title "t" --body "$(cat b.md)" --label semver:patch
+// the words before `$(` are one segment and the rest another, so a rule that needs the WHOLE
+// command (is the label there? which PR, in which repository?) reads a half and gets it wrong.
+// Measured over the 30 days to 2026-09-30: that shape, label present, was denied for lacking it.
+// So at the TOP level, a segment cut at a substitution boundary — before one opens, or after one
+// closes — is emitted with a leading TAB (PARTIAL). Every rule still reads it; the few that need
+// the whole command skip it and read the masked twin instead (see maskSubstitutions below): the
+// same command with the substitution replaced by a placeholder, which the caller always emits
+// when there is a substitution. A quoted span re-split below has no masked twin of its own, so
+// its segments are never marked and every rule reads them as before.
+//
+// The twin masks only the OUTERMOST substitutions (`spans`, from substSpans), so a half that lies
+// INSIDE one is not in the twin at all: in
+//   out=$(gh pr merge 456 --squash --subject "$(git log -1 --format=%s)")
+// the twin is `out=$__GUARD_SUBST__`, and skipping the half `gh pr merge 456 --squash --subject "`
+// left that merge judged by nobody (found 2026-09-30, verifying this change: a PR whose base is
+// the protected branch merged by the agent). So a half is marked only when no substitution span
+// overlaps it; one inside a substitution is read by every rule, as before this mark existed.
+function splitSegments(str, top = true, spans = []) {
   const out = [];
   const inner = [];
   let cur = "";
   let buf = "";     // text inside the current quoted span
   let q = null;     // null | "'" | '"'
-  const push = () => { const t = cur.trim(); if (t) out.push(t); cur = ""; };
+  let cutLeft = false;   // this segment starts right after a substitution closed
+  const frames = [];     // unquoted "$(" and "(" still open, to tell which one a ")" closes
+  let tick = false;      // inside a backtick substitution
+  let i = 0;             // the scan position (hoisted: push reads it)
+  let from = 0;          // where the current segment starts in str
+  const insideSubst = (a, b) => spans.some(([s, e]) => a < e && s < b);
+  const push = (cutRight = false) => {
+    const t = cur.trim();
+    if (t) out.push(top && (cutLeft || cutRight) && !insideSubst(from, i) ? "\t" + t : t);
+    cur = "";
+    cutLeft = false;
+    from = i + 1;
+  };
+  const openSubst = () => { push(true); };
+  const closeSubst = () => { push(); cutLeft = true; };
+  const backtick = () => { tick = !tick; if (tick) openSubst(); else closeSubst(); };
   const closeQuote = () => { const t = buf.trim(); if (t) inner.push(t); buf = ""; q = null; };
-  for (let i = 0; i < str.length; i++) {
+  for (; i < str.length; i++) {
     const c = str[i];
     const next = str[i + 1];
     // The quote characters themselves stay in the segment: downstream rules match on
@@ -1811,8 +2264,8 @@ function splitSegments(str) {
       if (c === "\\" && next === "\n") { cur += " "; buf += " "; i++; continue; }
       if (c === "\\" && next) { cur += c + next; buf += c + next; i++; continue; }
       if (c === '"') { cur += c; closeQuote(); continue; }
-      if (c === "$" && next === "(") { push(); i++; continue; }
-      if (c === "`") { push(); continue; }
+      if (c === "$" && next === "(") { openSubst(); i++; continue; }
+      if (c === "`") { backtick(); continue; }
       cur += c; buf += c;
       continue;
     }
@@ -1824,14 +2277,16 @@ function splitSegments(str) {
     if (c === "\\" && next === "\n") { cur += " "; i++; continue; }
     if (c === "\\" && next) { cur += c + next; i++; continue; }
     if (c === "'" || c === '"') { q = c; cur += c; buf = ""; continue; }
-    if (c === "$" && next === "(") { push(); i++; continue; }
-    if (c === "`") { push(); continue; }
+    if (c === "$" && next === "(") { frames.push("$"); openSubst(); i++; continue; }
+    if (c === "`") { backtick(); continue; }
     if (c === "|" || c === "&") {
       if (next === c) i++; // || and && are one operator, not two
       push();
       continue;
     }
-    if (c === ";" || c === "\n" || c === "(" || c === ")") { push(); continue; }
+    if (c === "(") { frames.push("("); push(); continue; }
+    if (c === ")") { if (frames.pop() === "$") closeSubst(); else push(); continue; }
+    if (c === ";" || c === "\n") { push(); continue; }
     cur += c;
   }
   push();
@@ -1841,7 +2296,7 @@ function splitSegments(str) {
   // command still separates the commands it joins.
   for (const t of inner) {
     if (t === str.trim()) continue; // no progress: would recurse forever
-    for (const s of splitSegments(t)) out.push(s);
+    for (const s of splitSegments(t, false)) out.push(s);
   }
   return out;
 }
@@ -1855,7 +2310,10 @@ function splitSegments(str) {
 // Coverage is additive, the same contract as the quoted spans above: the original segments,
 // the substitution bodies included, are still emitted; the masked ones are extra.
 const SUBST_PLACEHOLDER = "$__GUARD_SUBST__";
-function maskSubstitutions(text) {
+// The outermost substitutions of a text as [start, end) spans, as lex sees them. One reader serves
+// the twin (maskSubstitutions) and the PARTIAL marks (splitSegments), so the two cannot disagree on
+// where a substitution is.
+function substSpans(text) {
   const starts = new Set();
   const spans = [];
   let open = 0, from = -1;
@@ -1864,6 +2322,9 @@ function maskSubstitutions(text) {
     if (tok === ")" && starts.has(frameStart)) { open--; if (open === 0) spans.push([from, j + 1]); }
   });
   if (open > 0 && from >= 0) spans.push([from, text.length]); // unterminated: masked to the end
+  return spans;
+}
+function maskSubstitutions(text, spans = substSpans(text)) {
   if (!spans.length) return text;
   let out = "", k = 0;
   for (const [a, b] of spans) { out += text.slice(k, a) + SUBST_PLACEHOLDER; k = b; }
@@ -1871,12 +2332,20 @@ function maskSubstitutions(text) {
 }
 
 for (const text of analyzableTexts(cmd, 0)) {
-  const segs = splitSegments(text);
-  const masked = maskSubstitutions(text);
-  if (masked !== text) {
-    const have = new Set(segs);
-    for (const s of splitSegments(masked)) if (!have.has(s)) { have.add(s); segs.push(s); }
+  const spans = substSpans(text);
+  let segs = splitSegments(text, true, spans);
+  const masked = maskSubstitutions(text, spans);
+  let twin = masked !== text ? splitSegments(masked) : [];
+  // A half may be skipped only if the twin reads every command WHOLE. No twin (nothing to mask)
+  // cannot; nor can a twin that is itself cut at a substitution lex did not see as one (an
+  // unquoted `${X:-$(…)}`, which lex skips): its half of the command would be skipped twice and
+  // judged never. Then nothing is a half, and every rule reads every segment, as before.
+  if (!twin.length || twin.some((s) => s[0] === "\t")) {
+    segs = segs.map((s) => s.replace(/^\t/, ""));
+    twin = twin.map((s) => s.replace(/^\t/, ""));
   }
+  const have = new Set(segs);
+  for (const s of twin) if (!have.has(s)) { have.add(s); segs.push(s); }
   for (const seg of segs) {
     // One segment, one line. The shell reads this back with `while read -r`, so a segment
     // carrying a literal newline (only possible from inside a quoted span) would arrive as two
@@ -1893,6 +2362,8 @@ if [ -z "$SEGMENTS" ]; then
   # Fail-open: no extractable command means nothing to evaluate (see header).
   exit 0
 fi
+
+load_policy
 
 while IFS= read -r SEGMENT; do
   check_segment "$SEGMENT"

