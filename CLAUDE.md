@@ -17,10 +17,12 @@ Reusable **composite GitHub Actions** for the maintainer's CI, one directory per
   label every PR needs. `main` moves only through the promotion PR `develop` → `main`, which the
   maintainer merges with a merge commit and where the release tag is cut; nothing automatic, and
   no agent, ever merges into `main`.
-- **Server-side (public repos only, D-20):** `develop` and `main` are protected — a pull request
-  and a green `validate actions` are required, for admins too; no force-push, no deletion. On top,
-  the vendored guard in-session and the `.githooks/` hooks per clone. Run `./bootstrap.sh` after
-  cloning.
+- **Server-side, once the maintainer applies it** (public repos only; check with
+  `gh api repos/<owner>/<repo>/branches/<branch>/protection`, 404 = not yet): `develop` and `main`
+  need a pull request and a green `validate actions`, for admins too; no force-push, no deletion;
+  only the maintainer pushes or merges into `main`. Until then CI reports and does not block. On
+  top, the vendored guard in-session and the `.githooks/` hooks per clone. Run `./bootstrap.sh`
+  after cloning.
 - The company-wide rules come from the `studio-policy` plugin; this file keeps only what is
   specific to this repo. Path rules load on demand: `.claude/rules/actions.md` (the actions and
   their tests) and `.claude/rules/guard.md` (`scripts/hooks/`, `.githooks/`, `bootstrap.sh`).

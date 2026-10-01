@@ -19,8 +19,8 @@ name: Require semver label
 # Toda PR a `develop` o a `main` debe llevar al menos una etiqueta semver:* — la más alta
 # (major>minor>patch>none) decide el salto de versión del siguiente release.
 #
-# Esto es un AVISO, no una barrera: el check obligatorio de la protección de rama es `validate
-# actions`, no este, así que un rojo aquí no impide mergear. El respaldo real es el fallo EN DURO de
+# Esto es un AVISO, no una barrera: con la protección de rama aplicada, el check obligatorio es
+# `validate actions`, no este, así que un rojo aquí no impide mergear. El respaldo real es el fallo EN DURO de
 # `compute-release-version`, que se niega a cortar un release si alguna PR del rango no lleva
 # etiqueta. Este workflow existe para que eso se sepa al abrir la PR y no meses después, cuando
 # el release se muere y hay que retroetiquetar a mano — que es exactamente lo que hubo que hacer
