@@ -5,9 +5,9 @@
     1  bounded behaviour (small code change, edited tests)            Sonnet-high review
     2  agent or consumer behaviour (contracts, prompts, configs,
        dependency manifests, big code changes)                        Opus-high owner-decision lens
-    3  the owner's hard core (guard, hooks, CI, the merge gate,
-       security, Renovate config, anything with a failed important
-       check)                                                         owner (revision-humana)
+    3  the owner's hard core (guard, hooks and the scripts they run,
+       CI, the merge gate, security, Renovate config, anything with a
+       failed important check)                                        owner (revision-humana)
     4  money, irreversible or release (promotion, data model,
        credentials, IaC, a human semver:major)                        owner, never automatic
 
@@ -180,10 +180,29 @@ def package_json_problems(base_text, head_text):
                          if k not in DEP_KEYS + ("packageManager",) and base.get(k) != head.get(k))
         out.append("package.json changes more than dependency versions (%s)" % ", ".join(changed))
     for k in DEP_KEYS:
-        for name, ver in (head.get(k) or {}).items():
-            if (base.get(k) or {}).get(name) != ver and not _version_like(ver):
+        b, h = base.get(k) or {}, head.get(k) or {}
+        if not isinstance(b, dict) or not isinstance(h, dict):
+            out.append("package.json %s is not an object" % k)
+            continue
+        added, removed = sorted(set(h) - set(b)), sorted(set(b) - set(h))
+        if added or removed:
+            # a version bump keeps the names; a new name is a new package from the registry
+            out.append("package.json %s adds or removes packages (%s)"
+                       % (k, ", ".join(["+" + n for n in added] + ["-" + n for n in removed])[:200]))
+        for name, ver in h.items():
+            if b.get(name) != ver and not _version_like(ver):
                 out.append("package.json %s.%s is not a plain version (%s)" % (k, name, ver))
+            elif b.get(name) != ver and _alias_target(b.get(name)) != _alias_target(ver):
+                # "npm:a@1" -> "npm:b@1" keeps the name and looks like a version: another package
+                out.append("package.json %s.%s now resolves to another package (%s)" % (k, name, ver))
     return out
+
+
+def _alias_target(v):
+    """The package an `npm:` alias points to (None for a plain version)."""
+    if isinstance(v, str) and v.strip().startswith("npm:"):
+        return v.strip()[4:].rsplit("@", 1)[0]
+    return None
 
 
 def package_json_dangerous(base_text, head_text):
@@ -226,21 +245,65 @@ def pin_only(patch):
     return bool(changed) and all(PIN_LINE.match(ln) for ln in changed)
 
 
+HOOK_EXT = (".sh", ".bash", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".zsh")
+PROJECT_DIR_PREFIX = re.compile(r"^(?:\$\{?CLAUDE_PROJECT_DIR\}?|\.)/")
+
+
+def hook_paths(settings_text):
+    """Repo files that `.claude/settings.json` runs on its own: the commands of every hook and of
+    the status line. A deny hook can live anywhere (`scripts/deny-x.sh`), and editing it weakens
+    the floor exactly like editing `scripts/hooks/`, so those paths are class 3 too. Only relative
+    paths inside the repo count; an unreadable file yields nothing (the settings file itself is
+    class 3 already)."""
+    try:
+        data = json.loads(settings_text) if settings_text else {}
+    except ValueError:
+        return []
+    commands = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "command" and isinstance(v, str):
+                    commands.append(v)
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+    if isinstance(data, dict):
+        walk(data.get("hooks"))
+        walk(data.get("statusLine"))
+    out = []
+    for cmd in commands:
+        for tok in re.split(r"[\s;|&()<>]+", cmd):
+            tok = tok.strip("'\"")
+            tok = PROJECT_DIR_PREFIX.sub("", tok.replace('"', "").replace("'", ""))
+            if not tok or tok.startswith(("/", "~", "$", "-")) or ".." in tok.split("/"):
+                continue
+            if tok.lower().endswith(HOOK_EXT) and re.fullmatch(r"[\w.@+/-]+", tok) and tok not in out:
+                out.append(tok)
+    return out[:50]
+
+
 def bot_check(facts, cfg):
-    """(is_bot_pr, problems). A bot PR keeps its exemption only if every commit is the bot's."""
+    """(is_bot_pr, problems). A bot PR keeps its exemption only if every commit is the bot's AND
+    carries a verified signature: the bot's name on a commit is just an e-mail address that anybody
+    with push access can write; the signature (GitHub's web-flow key, or the bot's own) is not."""
     bots = set(cfg.get("bot_authors") or [])
     author = facts.get("author") or ""
     if author not in bots:
         return False, []
     problems = []
     commits = facts.get("commits")
-    if commits is None:
+    if not commits:
         problems.append("commits not read")
     else:
         for c in commits:
             a, cm, ver = c.get("author"), c.get("committer"), c.get("verified")
-            if a not in bots or not (cm in bots or (cm == "web-flow" and ver)):
-                problems.append("a commit by %s/%s is not the bot's" % (a or "?", cm or "?"))
+            if a not in bots or cm not in bots | {"web-flow"} or ver is not True:
+                problems.append("a commit by %s/%s%s is not the bot's" % (a or "?", cm or "?",
+                                                                      "" if ver is True else ", unsigned"))
                 break
     return True, problems
 
@@ -295,6 +358,8 @@ def classify(facts, policy, cfg):
     for e in policy.get("reserved_paths") or []:
         if isinstance(e, dict) and e.get("glob"):
             extra.append((2, "reserved", e["glob"], e.get("why") or "declared by this repo"))
+    for p in facts.get("hook_paths") or []:
+        extra.append((3, "hook-script", p, "a script the agent's hooks run (.claude/settings.json)"))
 
     code_lines = 0
     bot_dep_files = []
@@ -319,7 +384,7 @@ def classify(facts, policy, cfg):
                         break
                     if rule == "toolchain" and _basename(name) == "package.json":
                         blob = blobs.get(f.get("filename"))
-                        if blob is None and status != "removed":
+                        if status != "removed" and (blob is None or blob.get("head") is None):
                             danger = ["(not inspected)"]
                         else:
                             danger = package_json_dangerous((blob or {}).get("base"), (blob or {}).get("head"))
@@ -340,8 +405,14 @@ def classify(facts, policy, cfg):
                         bot_dep_files.append(f)
                         c = -1
                     else:
-                        hit(2, "lockfile", "a lockfile edited by a person (the lockfile-injection vector)", name)
-                        c = 2
+                        hosts = lockfile_foreign_hosts(patch)
+                        if hosts:
+                            hit(3, "lockfile-sources", "a lockfile that adds sources outside the registry (%s)"
+                                % ", ".join(hosts[:3]), name)
+                            c = 3
+                        else:
+                            hit(2, "lockfile", "a lockfile edited by a person (the lockfile-injection vector)", name)
+                            c = 2
                 elif mwg.any_glob(name, TEMPLATE_GLOBS):
                     hit(0, "template", "a template or ignore file", name)
                     c = 0
@@ -385,8 +456,11 @@ def classify(facts, policy, cfg):
                     if hosts:
                         refusal.append("%s adds sources outside the registry (%s)" % (name, ", ".join(hosts)))
         if refusal:
+            # A bot PR that does what a bot should not is never LOWER than a clean one: at least 3,
+            # and at least whatever this repo routes clean dependency updates to.
+            rcls = max(3, int(cfg.get("renovate_minor_class", 3)))
             for f in bot_dep_files:
-                hit(2, "bot-refused", "bot exemption refused: %s" % "; ".join(sorted(set(refusal))[:3]),
+                hit(rcls, "bot-refused", "bot exemption refused: %s" % "; ".join(sorted(set(refusal))[:3]),
                     f.get("filename"))
         else:
             cls = int(cfg.get("renovate_minor_class", 3))
@@ -394,7 +468,8 @@ def classify(facts, policy, cfg):
             for f in bot_dep_files:
                 hit(cls, "bot-dependencies", why, f.get("filename"))
     elif is_bot and bot_problems:
-        hit(2, "bot-refused", "bot exemption refused: %s" % "; ".join(bot_problems))
+        hit(max(3, int(cfg.get("renovate_minor_class", 3))), "bot-refused",
+            "bot exemption refused: %s" % "; ".join(bot_problems))
 
     if code_lines > CODE_LINES:
         hit(2, "big-change", "%d changed lines of code (> %d)" % (code_lines, CODE_LINES))
@@ -427,8 +502,9 @@ def classify(facts, policy, cfg):
 
 
 # ── collectors ───────────────────────────────────────────────────────────────────────────────────
-def collect_api(gh, repo, pr, policy=None, cfg=None, pull=None):
-    """Facts for one PR. `pull` may come from a list call already made (saves one request)."""
+def collect_api(gh, repo, pr, policy=None, cfg=None, pull=None, hooks=None):
+    """Facts for one PR. `pull` may come from a list call already made (saves one request);
+    `hooks` are the hook_paths() of the default branch's .claude/settings.json."""
     if pull is None:
         pull = gh.get("repos/%s/pulls/%d" % (repo, pr))
     if not isinstance(pull, dict) or "base" not in pull:
@@ -449,6 +525,7 @@ def collect_api(gh, repo, pr, policy=None, cfg=None, pull=None):
         "files": [{k: f.get(k) for k in ("status", "filename", "previous_filename", "additions",
                                            "deletions", "patch")} for f in files],
         "blobs": {},
+        "hook_paths": list(hooks or []),
     }
     bots = set((cfg or {}).get("bot_authors") or mwg.CONFIG_DEFAULTS["bot_authors"])
     if facts["author"] in bots:
@@ -469,16 +546,19 @@ def collect_api(gh, repo, pr, policy=None, cfg=None, pull=None):
 
 
 def _blob(gh, repo, path, ref):
-    data = gh.get_or_none("repos/%s/contents/%s?ref=%s" % (repo, path, ref))
-    if not data or "content" not in data:
+    data = gh.get_or_none(mwg.contents_path(repo, path, ref))
+    if not isinstance(data, dict) or "content" not in data:
         return None
     return base64.b64decode(data["content"]).decode("utf-8", "replace")
 
 
 def collect_git(repo_dir, base, head, labels, author, base_ref, head_ref):
+    # core.quotePath=false + -z: a path with non-ASCII bytes or a tab comes out as itself, never as
+    # a C-quoted string that matches no glob ("a\303\261o.yml" would read as plain code);
+    # --literal-pathspecs: a file named like a pathspec magic (":(top)x") is just a file
     def git(*args):
-        return subprocess.run(["git", "-C", repo_dir] + list(args), capture_output=True, text=True,
-                              check=True).stdout
+        return subprocess.run(["git", "-C", repo_dir, "-c", "core.quotePath=false", "--literal-pathspecs"]
+                              + list(args), capture_output=True, text=True, check=True).stdout
 
     def show(ref, path):
         try:
@@ -488,27 +568,32 @@ def collect_git(repo_dir, base, head, labels, author, base_ref, head_ref):
 
     mb = git("merge-base", base, head).strip()
     files, blobs = [], {}
-    for ln in git("diff", "-M", "--name-status", mb, head).splitlines():
-        parts = ln.split("\t")
-        st = parts[0]
-        if st.startswith("R"):
-            prev, name, status = parts[1], parts[2], "renamed"
+    tokens = git("diff", "-M", "-z", "--name-status", mb, head).split("\0")
+    entries, i = [], 0
+    while i < len(tokens) and tokens[i]:
+        st = tokens[i]
+        if st[:1] == "R":  # R<score> NUL old NUL new (-M; copies are not detected)
+            entries.append(("renamed", tokens[i + 1], tokens[i + 2]))
+            i += 3
         else:
-            prev, name = None, parts[1]
-            status = {"A": "added", "D": "removed"}.get(st[0], "modified")
+            entries.append(({"A": "added", "D": "removed"}.get(st[:1], "modified"), None, tokens[i + 1]))
+            i += 2
+    for status, prev, name in entries:
         paths = [p for p in (prev, name) if p]
         adds = dels = 0
-        for row in git("diff", "-M", "--numstat", mb, head, "--", *paths).splitlines():
+        for row in git("diff", "-M", "-z", "--numstat", mb, head, "--", *paths).split("\0"):
             cols = row.split("\t")
-            adds += int(cols[0]) if cols[0].isdigit() else 0
-            dels += int(cols[1]) if cols[1].isdigit() else 0
+            if len(cols) >= 2 and re.fullmatch(r"\d+|-", cols[0]) and re.fullmatch(r"\d+|-", cols[1]):
+                adds += int(cols[0]) if cols[0].isdigit() else 0
+                dels += int(cols[1]) if cols[1].isdigit() else 0
         patch = git("diff", "-M", mb, head, "--", *paths)
         files.append({"status": status, "filename": name, "previous_filename": prev,
                       "additions": adds, "deletions": dels, "patch": patch})
         if _basename(name) == "package.json" and status != "removed":
             blobs[name] = {"base": show(mb, prev or name), "head": show(head, name)}
     return {"base_ref": base_ref, "head_ref": head_ref, "author": author, "labels": labels,
-            "files": files, "blobs": blobs, "body": ""}
+            "files": files, "blobs": blobs, "body": "",
+            "hook_paths": hook_paths(show(mb, ".claude/settings.json"))}
 
 
 def render(out):
@@ -577,7 +662,8 @@ def main(argv):
                     cfg, problems = mwg.validate_config(mwg.load_json_text(raw, "config"))
                     if problems:
                         raise mwg.UsageError("config: " + "; ".join(problems))
-            facts, _ = collect_api(gh, repo, pr, policy, cfg, pull=pull)
+            hooks = hook_paths(files.read(".claude/settings.json"))
+            facts, _ = collect_api(gh, repo, pr, policy, cfg, pull=pull, hooks=hooks)
         if a["min"] is not None:
             if not re.fullmatch(r"[0-4]", a["min"]):
                 raise mwg.UsageError("--min must be 0..4")

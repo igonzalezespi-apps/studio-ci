@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+from urllib.parse import quote
 
 DEFAULT_IMPORTANT = (
     "secur|vulnerab|audit|gitleaks|secret|codeql|private-ref|install-vector|self-?hosted|guard|"
@@ -251,6 +252,13 @@ class GH:
 
 
 # ── repo files: guard policy, merge-when-green config, workflows ─────────────────────────────────
+def contents_path(repo, path, ref):
+    """The contents API path for one file. The path and the ref are percent-encoded: `gh` cuts a
+    raw `#` (and `?`) out of the URL, so `pkg/a#1/package.json` would ask for `pkg/a` instead and
+    the caller would see "no such file" for a file that exists."""
+    return "repos/%s/contents/%s?ref=%s" % (repo, quote(path, safe="/"), quote(ref, safe=""))
+
+
 class RepoFiles:
     """Reads files of the integration branch: from a local sparse checkout (the reusable workflow
     makes one, at no API cost) or from the contents API (sessions, tests)."""
@@ -265,7 +273,7 @@ class RepoFiles:
                 return None
             with open(full, encoding="utf-8") as fh:
                 return fh.read()
-        data = self.gh.get_or_none("repos/%s/contents/%s?ref=%s" % (self.repo, path, self.ref))
+        data = self.gh.get_or_none(contents_path(self.repo, path, self.ref))
         if data is None:
             return None
         if not isinstance(data, dict) or "content" not in data:
@@ -278,7 +286,7 @@ class RepoFiles:
             if not os.path.isdir(full):
                 return []
             return sorted(os.path.join(path, n) for n in os.listdir(full))
-        data = self.gh.get_or_none("repos/%s/contents/%s?ref=%s" % (self.repo, path, self.ref))
+        data = self.gh.get_or_none(contents_path(self.repo, path, self.ref))
         if not data:
             return []
         return sorted(e["path"] for e in data if e.get("type") == "file")

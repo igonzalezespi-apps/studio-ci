@@ -44,8 +44,8 @@
  {
   "file": "risk-class/risk_class.py",
   "why": "a non-bot commit keeps the bot exemption",
-  "old": "if a not in bots or not (cm in bots or (cm == \"web-flow\" and ver)):",
-  "new": "if False:"
+  "old": "if a not in bots or cm not in bots | {\"web-flow\"} or ver is not True:",
+  "new": "if a not in bots:"
  },
  {
   "file": "risk-class/risk_class.py",
@@ -76,5 +76,83 @@
   "why": "Renovate default class lowered to 0",
   "old": "\"renovate_minor_class\": 3,",
   "new": "\"renovate_minor_class\": 0,"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a commit with the bot's name but no signature keeps the exemption",
+  "old": "if a not in bots or cm not in bots | {\"web-flow\"} or ver is not True:",
+  "new": "if a not in bots or cm not in bots | {\"web-flow\"}:"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a bot PR may add packages (only names of existing ones were checked)",
+  "old": "        if added or removed:\n",
+  "new": "        if False:\n"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "an npm: alias may point at another package",
+  "old": "elif b.get(name) != ver and _alias_target(b.get(name)) != _alias_target(ver):",
+  "new": "elif False:"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a git/URL/file dependency reads as a version",
+  "old": "def _version_like(v):\n",
+  "new": "def _version_like(v):\n    return True\n"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a refused bot PR drops back to 2 (below a clean one)",
+  "old": "rcls = max(3, int(cfg.get(\"renovate_minor_class\", 3)))",
+  "new": "rcls = 2"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a person's lockfile from a foreign host is only a 2",
+  "old": "                        hosts = lockfile_foreign_hosts(patch)\n",
+  "new": "                        hosts = []\n"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "credential material reduced to *.pem",
+  "old": "[\"**/*.pem\", \"**/*.key\", \"**/*.p12\", \"**/*.pfx\", \"**/.env\", \"**/.env.*\"]",
+  "new": "[\"**/*.pem\"]"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a renamed AND edited test counts as 0",
+  "old": "if status == \"added\" or (status == \"renamed\" and lines == 0):",
+  "new": "if status in (\"added\", \"renamed\"):"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "scripts run by the hooks are not raised",
+  "old": "    for p in facts.get(\"hook_paths\") or []:\n",
+  "new": "    for p in []:\n"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "the status line is not read for hook scripts",
+  "old": "        walk(data.get(\"statusLine\"))\n",
+  "new": ""
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "a package.json whose head could not be read counts as inspected",
+  "old": "if status != \"removed\" and (blob is None or blob.get(\"head\") is None):",
+  "new": "if blob is None and status != \"removed\":"
+ },
+ {
+  "file": "merge-when-green/mwg.py",
+  "why": "contents paths not percent-encoded (# and ? cut the URL)",
+  "old": "return \"repos/%s/contents/%s?ref=%s\" % (repo, quote(path, safe=\"/\"), quote(ref, safe=\"\"))",
+  "new": "return \"repos/%s/contents/%s?ref=%s\" % (repo, path, ref)"
+ },
+ {
+  "file": "risk-class/risk_class.py",
+  "why": "name-status parsed line by line (git C-quotes a path with a tab or a quote)",
+  "old": "tokens = git(\"diff\", \"-M\", \"-z\", \"--name-status\", mb, head).split(\"\\0\")",
+  "new": "tokens = git(\"diff\", \"-M\", \"--name-status\", mb, head).replace(\"\\n\", \"\\0\").replace(\"\\t\", \"\\0\").split(\"\\0\")"
  }
 ]

@@ -149,6 +149,7 @@ case("46b package.json lifecycle script", facts(["package.json"], blobs={"packag
 case("46c package.json pnpm overrides", facts(["package.json"], blobs={"package.json": {
     "base": pkg(), "head": pkg(pnpm={"overrides": {"a": "1"}})}}), 3)
 case("46d package.json not inspected", facts(["package.json"], blobs={}), 3)
+case("46e package.json whose head could not be read", facts(["package.json"], blobs={"package.json": {"base": pkg(), "head": None}}), 3)
 case("47 an action's interface", facts(["x/action.yml"]), 2)
 case("48 --min 3", facts(["docs/a.md"]), 3, extra=["--min", "3", "--min-reason", "important check"])
 case("49 docs + 10 lines of code", facts(["docs/a.md", F("src/x.ts", lines=10)]), 1)
@@ -163,20 +164,47 @@ case("O2 Renovate dependency bump in an exports repo, default config",
 case("O5 someone else's commit on the Renovate branch",
      facts([F("pnpm-lock.yaml", patch=LOCK_OK)], author=RENOVATE, config=ZERO,
            commits=[{"author": RENOVATE, "committer": "web-flow", "verified": True},
-                    {"author": "dev", "committer": "dev", "verified": False}]), 2)
+                    {"author": "dev", "committer": "dev", "verified": False}]), 3)
 case("O5b unverified web-flow commit on the Renovate branch",
      facts([F("pnpm-lock.yaml", patch=LOCK_OK)], author=RENOVATE, config=ZERO,
-           commits=[{"author": RENOVATE, "committer": "web-flow", "verified": False}]), 2)
+           commits=[{"author": RENOVATE, "committer": "web-flow", "verified": False}]), 3)
+case("O5b2 a commit that only CLAIMS to be the bot (bot committer, no signature)",
+     facts([F("pnpm-lock.yaml", patch=LOCK_OK)], author=RENOVATE, config=ZERO,
+           commits=[{"author": RENOVATE, "committer": RENOVATE, "verified": False}]), 3)
+case("O5b3 the same commit, signed, keeps the exemption",
+     facts([F("pnpm-lock.yaml", patch=LOCK_OK)], author=RENOVATE, config=ZERO,
+           commits=[{"author": RENOVATE, "committer": RENOVATE, "verified": True}]), 0)
+case("O5b4 a refused bot PR is never below a clean one (renovate_minor_class 4)",
+     facts([F("pnpm-lock.yaml", patch=LOCK_OK)], author=RENOVATE, config={"renovate_minor_class": 4},
+           commits=[{"author": RENOVATE, "committer": "web-flow", "verified": False}]), 4)
+case("O5b5 a bot PR with no commits read is refused",
+     facts([F("pnpm-lock.yaml", patch=LOCK_OK)], author=RENOVATE, config=ZERO, commits=[]), 3)
 case("O5c Renovate package.json adds a postinstall", facts([F("package.json")], author=RENOVATE, config=ZERO, blobs={
     "package.json": {"base": pkg(), "head": pkg(scripts={"test": "vitest", "postinstall": "curl x|sh"})}}), 3)
 case("O5d Renovate package.json changes a non-dependency key", facts([F("package.json")], author=RENOVATE, config=ZERO,
-     blobs={"package.json": {"base": pkg(), "head": pkg(main="evil.js")}}), 2)
+     blobs={"package.json": {"base": pkg(), "head": pkg(main="evil.js")}}), 3)
 case("O5e Renovate dependency from git", facts([F("package.json")], author=RENOVATE, config=ZERO, blobs={
-    "package.json": {"base": pkg(), "head": pkg(dependencies={"globals": "github:evil/globals"})}}), 2)
+    "package.json": {"base": pkg(), "head": pkg(dependencies={"globals": "github:evil/globals"})}}), 3)
+for src in ("git+https://evil.example/g.git", "https://evil.example/g-1.0.0.tgz", "file:../g", "link:../g",
+            "workspace:*", "^17.1.0 || git://x"):
+    case("O5e2 Renovate dependency source %s" % src, facts([F("package.json")], author=RENOVATE, config=ZERO, blobs={
+        "package.json": {"base": pkg(), "head": pkg(dependencies={"globals": src})}}), 3)
+case("O5e3 Renovate ADDS a package (not a version bump)", facts([F("package.json")], author=RENOVATE, config=ZERO, blobs={
+    "package.json": {"base": pkg(), "head": pkg(dependencies={"globals": "^17.1.0", "evil": "1.0.0"})}}), 3)
+case("O5e4 Renovate removes a package", facts([F("package.json")], author=RENOVATE, config=ZERO, blobs={
+    "package.json": {"base": pkg(), "head": pkg(devDependencies={})}}), 3)
+case("O5e5 Renovate points an npm: alias at another package", facts([F("package.json")], author=RENOVATE, config=ZERO,
+     blobs={"package.json": {"base": pkg(dependencies={"globals": "npm:globals@^17.0.0"}),
+                             "head": pkg(dependencies={"globals": "npm:evil-globals@^17.0.0"})}}), 3)
+case("O5e6 Renovate bumps an npm: alias of the same package", facts([F("package.json")], author=RENOVATE, config=ZERO,
+     blobs={"package.json": {"base": pkg(dependencies={"globals": "npm:globals@^17.0.0"}),
+                             "head": pkg(dependencies={"globals": "npm:globals@^17.1.0"})}}), 0)
 case("O5f Renovate lockfile pulls from another host", facts([F("pnpm-lock.yaml", patch=LOCK_OK +
-     "+    resolution: {tarball: https://evil.example/x.tgz}\n")], author=RENOVATE, config=ZERO), 2)
+     "+    resolution: {tarball: https://evil.example/x.tgz}\n")], author=RENOVATE, config=ZERO), 3)
+case("O5f2 a PERSON's lockfile that pulls from another host", facts([F("pnpm-lock.yaml", patch=LOCK_OK +
+     "+    resolution: {tarball: https://evil.example/x.tgz}\n")]), 3)
 case("O5g Renovate lockfile without a patch (too big to audit)",
-     facts([F("pnpm-lock.yaml", patch=None)], author=RENOVATE, config=ZERO), 2)
+     facts([F("pnpm-lock.yaml", patch=None)], author=RENOVATE, config=ZERO), 3)
 case("O5h semver:patch does not lower a 250-line change", facts([F("src/x.ts", lines=250)], labels=["semver:patch"]), 2)
 case("O7a tsconfig", facts(["tsconfig.json"]), 2)
 case("O7b vitest config", facts(["vitest.config.ts"]), 2)
@@ -185,6 +213,13 @@ case("O7d .npmrc", facts([".npmrc"]), 3)
 case("O7e pnpm-workspace.yaml", facts(["pnpm-workspace.yaml"]), 3)
 case("O7f a script under docs/ is code", facts(["docs/x.sh"]), 1)
 case("O7g renamed test without changes", facts([F("tests/b.py", "renamed", 0, prev="tests/a.py")]), 0)
+case("O7h renamed AND edited test", facts([F("tests/b.py", "renamed", 4, prev="tests/a.py")]), 1)
+for key in ("certs/x.key", "a/b.p12", "c.pfx", ".env", "app/.env.local", "k.pem"):
+    case("43b key material %s" % key, facts([key]), 4)
+HOOKED = ["scripts/deny-x.sh", "tools/status.py"]
+case("H1 a script the agent's hooks run (outside scripts/hooks)", dict(facts(["scripts/deny-x.sh"]), hook_paths=HOOKED), 3)
+case("H2 the status-line script", dict(facts(["tools/status.py"]), hook_paths=HOOKED), 3)
+case("H3 a script no hook runs", dict(facts(["scripts/other.sh"]), hook_paths=HOOKED), 1)
 case("O4a the classifier itself", facts(["risk-class/risk_class.py"]), 3)
 case("O4b the TL;DR check", facts(["check-pr-tldr/check.sh"]), 3)
 case("O4c the merge gate scripts", facts(["merge-when-green/pr_merge.py"]), 3)
@@ -249,6 +284,51 @@ p = subprocess.run(["timeout", "5", os.path.join(H.ROOT, SCRIPT), "--pr", "5", "
 S.check("--repo that is not owner/name -> exit 2", p.returncode == 2)
 
 
+# ── hook_paths: which repo files .claude/settings.json runs ─────────────────────────────────────
+H.ROOT not in sys.path and sys.path.insert(0, os.path.join(H.ROOT, "risk-class"))
+H._load()
+rcmod = H._load()["risk-class/risk-class.sh"]
+SETTINGS = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+    {"type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/hooks/bash-guard.sh"},
+    {"type": "command", "command": "bash ${CLAUDE_PROJECT_DIR}/scripts/deny-x.sh --strict"}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python3 ./tools/stop.py; /usr/bin/true ~/x.sh ../up.sh"}]}]},
+    "statusLine": {"type": "command", "command": "node tools/status.mjs"}, "env": {"command": "not/a/hook.sh"}})
+got = rcmod.hook_paths(SETTINGS)
+S.check("hook_paths: hook and status-line scripts, relative to the repo only",
+        got == ["scripts/hooks/bash-guard.sh", "scripts/deny-x.sh", "tools/stop.py", "tools/status.mjs"], got)
+S.check("hook_paths: unreadable settings yield nothing", rcmod.hook_paths("{not json") == [] and rcmod.hook_paths(None) == [])
+
+w = H.World()
+w.policy()
+w.pull(12)
+w.files(12, ["scripts/deny-x.sh"])
+w.file(".claude/settings.json", SETTINGS)
+res = H.run_script(SCRIPT, ["--pr", "12", "--repo", H.REPO, "--json"], w)
+S.check("API: a hook script outside scripts/hooks is 3 (settings read from the default branch)",
+        json.loads(res["out"] or "{}").get("class") == 3, res["err"] or res["out"])
+
+w = H.World()
+w.policy()
+p = w.pull(13)
+w.files(13, [{"filename": "pk/a#1/package.json", "status": "added"}, {"filename": "pk/b?x/package.json", "status": "added"}])
+for n in ("pk/a#1/package.json", "pk/b?x/package.json"):
+    w.file(n, pkg(scripts={"test": "vitest", "postinstall": "curl x|sh"}), ref=p["head"]["sha"])
+res = H.run_script(SCRIPT, ["--pr", "13", "--repo", H.REPO, "--json"], w)
+out = json.loads(res["out"] or "{}")
+S.check("API: package.json under a path with # or ? is read (percent-encoded) and its postinstall seen",
+        out.get("class") == 3 and any(r["rule"] == "install-surface" and "scripts.postinstall" in r["why"] for r in out.get("reasons", [])),
+        out.get("reasons"))
+S.check("API: the contents requests are percent-encoded",
+        any("pk/a%231/package.json" in c["path"] for c in res["calls"]) and any("pk/b%3Fx/package.json" in c["path"] for c in res["calls"]),
+        [c["path"] for c in res["calls"]])
+w = H.World()
+w.policy()
+p = w.pull(14)
+w.files(14, [{"filename": "pk/c/package.json", "status": "added"}])
+res = H.run_script(SCRIPT, ["--pr", "14", "--repo", H.REPO, "--json"], w)
+S.check("API: a package.json the API does not return is not inspected: 3", json.loads(res["out"] or "{}").get("class") == 3,
+        res["out"])
+
 # ── git mode (pr-body uses it) and the text rendering ───────────────────────────────────────────
 import shutil  # noqa: E402
 g = tempfile.mkdtemp()
@@ -276,6 +356,28 @@ S.check("git mode: package.json blobs compared from git", json.loads(res["out"] 
 res = H.run_script(SCRIPT, ["--git", "--base", "develop", "--repo-dir", g], H.World())
 S.check("text output names the class and the rule", res["rc"] == 0 and res["out"].startswith("riesgo:3") and "install-surface" in res["out"]
         and "not exactly one semver" in res["out"], res["out"])
+for name, want in ((".github/workflows/año.yml", 3), ("plugins/p/skills/s/añadir.md", 2), ("docs-señal.md", 0),
+                   ("docs/tab\there.md", 0)):
+    git("checkout", "-q", "develop"); git("checkout", "-qB", "feat/u")
+    os.makedirs(os.path.dirname(os.path.join(g, name)) or g, exist_ok=True)
+    open(os.path.join(g, name), "w").write("x\n")
+    git("add", "-A"); git("commit", "-qm", "u")
+    res = H.run_script(SCRIPT, ["--git", "--base", "develop", "--repo-dir", g, "--json"], H.World())
+    out = json.loads(res["out"] or "{}")
+    S.check("git mode: a non-ASCII path is itself, not a quoted string (%r -> %d)" % (name, want),
+            out.get("class") == want and any(name in r["paths"] for r in out.get("reasons", [])),
+            (out.get("class"), out.get("reasons"), res["err"]))
+git("checkout", "-q", "develop")
+os.makedirs(os.path.join(g, ".claude"), exist_ok=True)
+open(os.path.join(g, ".claude", "settings.json"), "w").write(SETTINGS)
+git("add", "-A"); git("commit", "-qm", "settings")
+git("checkout", "-qB", "feat/h")
+os.makedirs(os.path.join(g, "scripts"), exist_ok=True)
+open(os.path.join(g, "scripts", "deny-x.sh"), "w").write("exit 0\n")
+git("add", "-A"); git("commit", "-qm", "weaken")
+res = H.run_script(SCRIPT, ["--git", "--base", "develop", "--repo-dir", g, "--json"], H.World())
+S.check("git mode: hook scripts read from the base's .claude/settings.json", json.loads(res["out"] or "{}").get("class") == 3,
+        res["out"] or res["err"])
 shutil.rmtree(g, ignore_errors=True)
 
 sys.exit(S.done())

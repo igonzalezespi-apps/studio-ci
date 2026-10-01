@@ -2,6 +2,7 @@
 # action.test.sh — runs the body of risk-class/action.yml (extracted, not copied) with the exact
 # shell of GitHub (`bash --noprofile --norc -e -o pipefail`) against a fake `gh`, so the step is
 # proven to report its output and to fail closed, not just to parse.
+# shellcheck disable=SC2034 # `rc` is read inside the strings that check() evals
 set -uo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
