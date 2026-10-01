@@ -16,7 +16,7 @@
 #      is the only one that proves the guard FIRES, closing the fail-open blind
 #      spot the plugin cannot otherwise detect.
 #
-# Plus, ONLY when the repo has adopted the D8 phase gate (a vendored sdd-gate.sh
+# Plus, ONLY when the repo has adopted the SDD phase gate (a vendored sdd-gate.sh
 # is present), a 4th check: sdd-gate PARITY + WIRING (its behaviour is covered by
 # the vendored sdd-gate.test.sh). Repos without the gate skip it silently.
 #
@@ -97,7 +97,7 @@ if [ -f "$VENDORED" ]; then
   fi
 fi
 
-# --- 4. D8 phase-gate: parity + wiring (only if the repo adopted it) --------
+# --- 4. SDD phase-gate: parity + wiring (only if the repo adopted it) -------
 # sdd-gate.sh is the portable half of the phase gate — it reads only branch+phase
 # from the state file, so it travels byte-for-byte like bash-guard. A repo that
 # vendored it must keep it identical to the core AND cabled, or the gate silently
