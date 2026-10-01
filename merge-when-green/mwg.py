@@ -1,7 +1,8 @@
 """Shared helpers for risk-class, merge-when-green, develop-health and revert-merge.
 
 Standard library only: these scripts run on a bare GitHub-hosted runner (or in a session) with
-`python3` and the GitHub CLI, nothing else.
+`python3` and the GitHub CLI, nothing else. A private repo runs them on its own runners, whose `gh`
+can be as old as 2.45.0 (the Ubuntu 24.04 package): no flag newer than that.
 
 Every GitHub call goes through `GH`, which shells out to `gh api` (the binary is `$GH`, `gh` by
 default, so the test suites put a fake one first in PATH). Untrusted strings — titles, branch
@@ -120,6 +121,19 @@ def _status_from_stderr(err):
     return int(m.group(1)) if m else 0
 
 
+def json_values(text):
+    """Every JSON value in `text`, in order: what `gh api --paginate` prints without `--slurp`."""
+    dec = json.JSONDecoder()
+    out, i, n = [], 0, len(text)
+    while True:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            return out
+        value, i = dec.raw_decode(text, i)
+        out.append(value)
+
+
 class GH:
     """`gh api` with a call counter, a quota check and no shell."""
 
@@ -206,11 +220,14 @@ class GH:
                 if len(chunk) < per_page:
                     break
             return items
-        p = self._run(["--paginate", "--slurp", path])
+        # No `--slurp`: it arrived in gh 2.48.0, and on gh 2.45.0 it is "unknown flag", so every list
+        # call failed there. Without it `gh --paginate` writes one JSON value per page, back to
+        # back (pages of an array endpoint come already merged into one array).
+        p = self._run(["--paginate", path])
         if p.returncode != 0:
             raise ApiError(_status_from_stderr(p.stderr), (p.stderr or "").strip()[:200], path)
         try:
-            pages = json.loads(p.stdout or "[]")
+            pages = json_values(p.stdout or "")
         except ValueError:
             raise ApiError(200, "not JSON", path)
         items = []

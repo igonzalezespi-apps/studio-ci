@@ -76,5 +76,17 @@
   "why": "important ignores timed_out",
   "old": "if j.get(\"conclusion\") not in (\"failure\", \"timed_out\"):",
   "new": "if j.get(\"conclusion\") not in (\"failure\",):"
+ },
+ {
+  "file": "merge-when-green/mwg.py",
+  "why": "--slurp again (gh 2.45.0, on a private repo's own runners, does not know it)",
+  "old": "p = self._run([\"--paginate\", path])",
+  "new": "p = self._run([\"--paginate\", \"--slurp\", path])"
+ },
+ {
+  "file": "merge-when-green/mwg.py",
+  "why": "the paginated output read as one JSON document (object pages come back to back)",
+  "old": "pages = json_values(p.stdout or \"\")",
+  "new": "pages = [json.loads(p.stdout or \"[]\")]"
  }
 ]
