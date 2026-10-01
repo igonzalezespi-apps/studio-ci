@@ -15,17 +15,23 @@ It always judges the CURRENT head of the integration branch with the push checks
                         * L...F is exactly one commit, F, with one parent (a squash);
                         * F is the merge commit of a PR merged BY THE MERGE APP;
                         * F's message carries `Risk-class: riesgo:0..2` (the commit, not a label
-                          anybody can change afterwards);
+                          anybody can change afterwards: the last such line, followed by the
+                          gate's `Merge-gate:` line);
                         * F is not itself a revert;
                         * fewer than `max_reverts_per_day` reverts in the last 24 h;
                         * no revert of that PR exists yet.
                       Otherwise it escalates: the freeze issue gets revision-humana and a TL;DR.
                       A person's merge is never reverted automatically.
+                      While the revert is open it is re-judged on every run with merge-when-green's
+                      own rules: closed without merging, invalid (anything pushed on top of it),
+                      red, in conflict, or open for more than REVERT_STALE_MINUTES → escalate.
+  green after a freeze  lift it, and close the App's reverts still open (a fix went in first).
 
     develop-health.sh --repo R --mode dry|live --plan F [--repo-dir D] [--run-url U]
 
-In dry mode it only writes the job summary and one comment on the culprit PR. Exit 0 whenever it
-measured (a red develop is a finding, not a failure of this job) · 2 could not measure.
+In dry mode it only writes the job summary and one comment on the culprit PR; with
+--selftest-config (this repository's own CI) it writes nothing at all. Exit 0 whenever it measured
+(a red develop is a finding, not a failure of this job) · 2 could not measure.
 """
 import json
 import os
@@ -44,6 +50,7 @@ FREEZE_MARK = "<!-- develop-health v1 freeze -->"
 CULPRIT_MARK = "<!-- develop-health v1 culprit"
 MAX_PUSHES = 20
 STALL_MINUTES = 60
+REVERT_STALE_MINUTES = 120
 
 
 def push_history(gh, repo, branch):
@@ -72,7 +79,8 @@ def judge(gh, repo, runs, required):
         latest = {}
         for j in r["_jobs"]:
             k = (wf, j.get("name"))
-            if k in req and (k not in latest or int(j.get("run_attempt") or 1) >= int(latest[k].get("run_attempt") or 1)):
+            if k in req and (k not in latest or ci_verdict.attempt_rank(j, int(j.get("run_attempt") or 1)) >=
+                             ci_verdict.attempt_rank(latest[k], int(latest[k].get("run_attempt") or 1))):
                 latest[k] = j
         for k, j in latest.items():
             if ci_verdict._job_state(j)[0] == "bad":
@@ -143,10 +151,10 @@ def attribute(gh, repo, ctx, order, by_sha, head_sha):
     if not app or (pr.get("merged_by") or {}).get("login") != app:
         return None, ["#%d was merged by %s, not by the merge App: a person's merge is never reverted "
                       "automatically" % (pr["number"], (pr.get("merged_by") or {}).get("login") or "?")], info
-    t = pr_merge.TRAILER_RX.search(msg)
-    if not t or int(t.group(1)) > 2:
+    t = pr_merge.trailer_class(msg)
+    if t is None or t > 2:
         return None, ["%s carries no Risk-class riesgo:0..2 trailer" % first_red[:7]], info
-    info["class"] = int(t.group(1))
+    info["class"] = t
     labels = [lb["name"] for lb in pr.get("labels") or []]
     if pr_merge.REVERT_LABEL in labels or (pr.get("title") or "").lower().startswith("revert") or \
             pr_merge.REVERT_MARK_RX.search(pr.get("body") or ""):
@@ -154,16 +162,42 @@ def attribute(gh, repo, ctx, order, by_sha, head_sha):
     reverts = recent_reverts(gh, repo, app)
     mine = [r for r in reverts if r["of"] == pr["number"]]
     if mine:
+        merged = [r for r in mine if r["merged_at"]]
+        if merged:
+            return None, ["#%d was already reverted (#%d) and %s is still red"
+                          % (pr["number"], merged[0]["number"], ctx.integration)], info
         r = mine[0]
-        if r["merged_at"]:
-            return None, ["#%d was already reverted (#%d) and %s is still red" % (pr["number"], r["number"], ctx.integration)], info
+        if r["state"] != "open":
+            return None, ["the revert of #%d (#%d) was closed without merging and %s is still red"
+                          % (pr["number"], r["number"], ctx.integration)], info
         info["existing_revert"] = r["number"]
+        info["existing_revert_created"] = r["created_at"]
         return info, [], info
     day_ago = mwg.now().timestamp() - 86400
     n24 = sum(1 for r in reverts if (mwg.parse_time(r["created_at"]) or mwg.now()).timestamp() >= day_ago)
     if n24 >= int(ctx.cfg.get("max_reverts_per_day", 1)):
         return None, ["%d automatic revert(s) in the last 24 h (max %d)" % (n24, ctx.cfg.get("max_reverts_per_day", 1))], info
     return info, [], info
+
+
+def judge_revert(gh, ctx, info, head_sha, v, issue):
+    """The App's open revert, judged with merge-when-green's own rules. (wait-note | None,
+    reasons-to-escalate)."""
+    rev = gh.get("repos/%s/pulls/%d" % (ctx.repo, info["existing_revert"]))
+    tag = "revert #%d of #%d" % (info["existing_revert"], info["pr"])
+    if rev.get("state") != "open":
+        return None, ["%s is %s without merging and %s is still red" % (tag, rev.get("state"), ctx.integration)]
+    ctx.develop = {"sha": head_sha, "verdict": "red", "red": v["red"], "missing": v["missing"]}
+    ctx.freeze = [issue["number"]] if issue else []
+    d = pr_merge.decide_pr(ctx, rev)
+    if d["decision"] not in ("merge", "wait"):
+        return None, ["%s cannot be merged automatically: %s" % (tag, "; ".join(d["reasons"]))]
+    created = mwg.parse_time(rev.get("created_at"))
+    age = (mwg.now() - created).total_seconds() / 60 if created else 0
+    if age > REVERT_STALE_MINUTES:
+        return None, ["%s has been open for %d minutes (> %d): %s" % (tag, age, REVERT_STALE_MINUTES,
+                                                                     "; ".join(d["reasons"]))]
+    return "%s is open (%s: %s)" % (tag, d["decision"], "; ".join(d["reasons"])), []
 
 
 def tldr_escalation(repo, integration, head_sha, red, reasons, info, run_url):
@@ -190,7 +224,7 @@ def freeze_body(integration, head_sha, red, run_url, note):
                                                 note, run_url or "(local)"))
 
 
-def assess(gh, ctx, mode, run_url):
+def assess(gh, ctx, mode, run_url, write=True):
     repo = ctx.repo
     plan = {"repo": repo, "mode": mode, "action": "none", "notes": [], "revert_pr": "", "revert_sha": ""}
     if not ctx.config_present or ctx.cfg.get("required_push_checks") in (None, []):
@@ -226,6 +260,15 @@ def assess(gh, ctx, mode, run_url):
                     gh.write("PATCH", "repos/%s/issues/%d" % (repo, issue["number"]), {"state": "closed"})
                 else:
                     plan["notes"].append("freeze #%d stays open: escalated to the owner" % issue["number"])
+                # a revert still open is no longer needed: the branch is green without it
+                app = pr_merge.bot_login(ctx.cfg.get("app_slug"))
+                for r in (recent_reverts(gh, repo, app) if app else []):
+                    if r["state"] == "open" and not r["merged_at"]:
+                        gh.write("POST", "repos/%s/issues/%d/comments" % (repo, r["number"]),
+                                 {"body": "%s ya está en verde en `%s` sin esta reversión: se cierra sin mergear."
+                                          % (ctx.integration, head_sha[:7])})
+                        gh.write("PATCH", "repos/%s/pulls/%d" % (repo, r["number"]), {"state": "closed"})
+                        plan["notes"].append("closed revert #%d: no longer needed" % r["number"])
         return plan
     if v["health"] != "red":
         plan["action"] = "wait"
@@ -251,9 +294,12 @@ def assess(gh, ctx, mode, run_url):
     info, reasons, culprit = attribute(gh, repo, ctx, order, by_sha, head_sha)
     plan["attribution"] = culprit
     if info and info.get("existing_revert"):
-        plan["action"] = "wait"
-        plan["notes"].append("revert #%d of #%d is already open" % (info["existing_revert"], info["pr"]))
-        return plan
+        note, reasons = judge_revert(gh, ctx, info, head_sha, v, issue)
+        if note:
+            plan["action"] = "wait"
+            plan["notes"].append(note)
+            return plan
+        info = None
     if info:
         plan["action"] = "revert"
         plan["revert_pr"], plan["revert_sha"] = str(info["pr"]), info["first_red"]
@@ -261,7 +307,7 @@ def assess(gh, ctx, mode, run_url):
         plan["action"] = "escalate"
         plan["notes"] += reasons
     if mode != "live":
-        if culprit.get("pr"):
+        if culprit.get("pr") and write:
             note = ("SECO: develop-health habría congelado el merge automático y %s."
                     % ("abierto la reversión de esta PR" if plan["action"] == "revert" else
                        "escalado al dueño (%s)" % "; ".join(reasons)))
@@ -271,6 +317,9 @@ def assess(gh, ctx, mode, run_url):
             if plan["action"] == "revert" else "Escalado: %s." % "; ".join(reasons))
     if plan["action"] == "escalate":
         body = tldr_escalation(repo, ctx.integration, head_sha, v["red"], reasons, culprit, run_url)
+        if issue and pr_merge.ESCALATION_LABEL in [lb["name"] for lb in issue.get("labels") or []]:
+            plan["notes"].append("freeze #%d is already with the owner" % issue["number"])
+            return plan
         if issue:
             gh.write("PATCH", "repos/%s/issues/%d" % (repo, issue["number"]), {"body": body})
             gh.write("POST", "repos/%s/issues/%d/labels" % (repo, issue["number"]), {"labels": [pr_merge.ESCALATION_LABEL]})
@@ -327,6 +376,8 @@ def main(argv):
         repo = mwg.repo_arg(a["repo"])
         if a["mode"] not in ("dry", "live"):
             raise mwg.UsageError("--mode must be dry or live")
+        if a["selftest_config"] and a["mode"] != "dry":
+            raise mwg.UsageError("--selftest-config is dry and writes nothing: --mode dry")
         gh = mwg.GH(os.environ.get("MWG_READ_TOKEN") or None)
         try:
             gh.check_quota()
@@ -335,7 +386,9 @@ def main(argv):
                     "revert_pr": "", "revert_sha": ""}
         else:
             ctx = pr_merge.Context(gh, repo, a["repo_dir"], a["config"], a["selftest_config"])
-            plan = assess(gh, ctx, a["mode"], a["run_url"])
+            plan = assess(gh, ctx, a["mode"], a["run_url"], write=not a["selftest_config"])
+            if a["selftest_config"]:
+                plan["notes"].append("self-test: nothing written")
         plan["api_calls"] = gh.calls
         if a["plan"]:
             mwg.write_json(a["plan"], plan)

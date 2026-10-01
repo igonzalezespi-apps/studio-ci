@@ -61,11 +61,10 @@ def main(argv):
         if len(commit.get("parents") or []) != 1:
             print("revert-merge: %s is not a single-parent squash" % sha[:7], file=sys.stderr)
             return 1
-        t = pr_merge.TRAILER_RX.search((commit.get("commit") or {}).get("message") or "")
-        if not t or int(t.group(1)) > 2:
+        cls = pr_merge.trailer_class((commit.get("commit") or {}).get("message") or "")
+        if cls is None or cls > 2:
             print("revert-merge: %s has no Risk-class riesgo:0..2 trailer" % sha[:7], file=sys.stderr)
             return 1
-        cls = int(t.group(1))
         pulls = gh.list("repos/%s/pulls?state=all&sort=created&direction=desc" % repo, max_pages=1, per_page=50)
         for p in pulls:
             m = pr_merge.REVERT_MARK_RX.search(p.get("body") or "")

@@ -15,11 +15,13 @@ APP_ENV = {"GITHUB_ACTIONS": "true", "MWG_WRITE_TOKEN_KIND": "app", "MWG_WRITE_T
            "MWG_READ_TOKEN": "ghs_readtoken"}
 
 
-def world(merged_by=APP_BOT, sha=F, parents=1, trailer=0, existing=()):
+def world(merged_by=APP_BOT, sha=F, parents=1, trailer=0, existing=(), msg=None):
     w = H.World()
     w.pull(4, title="docs: x (#4)", state="closed", merged_at="2026-10-01T10:00:00Z", merge_commit_sha=sha,
            merged_by=merged_by)
-    msg = "docs: x (#4)\n\nRisk-class: riesgo:%d\n" % trailer if trailer is not None else "docs: x (#4)"
+    if msg is None:
+        msg = ("docs: x (#4)\n\nRisk-class: riesgo:%d\nMerge-gate: merge-when-green https://x/run/0\n" % trailer
+               if trailer is not None else "docs: x (#4)")
     w.r("GET", "repos/%s/commits/%s" % (R, F), {"sha": F, "parents": [{"sha": "p"}] * parents, "commit": {"message": msg}})
     w.r("GET", "repos/%s/pulls?state=all&sort=created&direction=desc&per_page=50&page=1" % R, list(existing))
     w.r("GET", "installation/repositories", {"total_count": 1, "repositories": [{"full_name": R}]})
@@ -49,7 +51,10 @@ for label, kw, rc in (("not merged as that commit", {"sha": H.sha(5)}, 1),
                       ("merged by a person", {"merged_by": "igonzalezespi"}, 1),
                       ("a merge commit", {"parents": 2}, 1),
                       ("riesgo-3 trailer", {"trailer": 3}, 1),
-                      ("no trailer", {"trailer": None}, 1)):
+                      ("no trailer", {"trailer": None}, 1),
+                      ("a Risk-class line without the gate's Merge-gate line", {"msg": "docs: x (#4)\n\nRisk-class: riesgo:0\n"}, 1),
+                      ("the author's riesgo:0 line before the gate's riesgo:3 trailer",
+                       {"msg": "docs: x (#4)\n\nRisk-class: riesgo:0\n\nRisk-class: riesgo:3\nMerge-gate: merge-when-green u\n"}, 1)):
     res = revert(world(**kw))
     S.check("refuses: %s" % label, res["rc"] == rc and not any(c["path"] == "graphql" for c in res["calls"]), (res["rc"], res["err"]))
 ex = {"number": 30, "user": {"login": APP_BOT}, "body": "<!-- revert-of: #4 sha: %s -->" % F}
