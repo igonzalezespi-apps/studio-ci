@@ -2,7 +2,8 @@
 # ============================================================================
 # bash-guard.sh — PreToolUse guard (matcher: Bash) for Claude Code
 # ============================================================================
-# Canonical source: igonzalezespi-apps/claude-plugins, plugins/core-dev/scripts/hooks/bash-guard.sh.
+# Canonical source: plugins/core-dev/scripts/hooks/bash-guard.sh of the core-dev plugin; in
+# a vendored copy, the .vendor.lock next to this file names the repository and commit.
 # This file is VENDORED (committed) into each consuming repo and cabled from its
 # settings.json — it is NOT a plugin hook, because ${CLAUDE_PLUGIN_ROOT} does
 # not exist inside a git hook and a repo must keep enforcing without the plugin.
@@ -65,7 +66,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Which repository, and which copy of its policy --------------------------
 # VENDORED (no arguments; every consumer). The protected repository is the one
 # that holds this file, and its policy is guard.policy.json next to it: $HERE is
-# <repo>/scripts/hooks, the path the rest of the studio reads the policy from
+# <repo>/scripts/hooks, the path the rest of the tooling reads the policy from
 # ($CLAUDE_PROJECT_DIR/scripts/hooks/guard.policy.json) whenever the hook runs
 # as wired. $CLAUDE_PROJECT_DIR is NOT consulted: it names the session, and a
 # session in one repository running another repository's vendored guard must
@@ -710,8 +711,8 @@ pr_refs() {
   # The `--repo` of the original command MUST be forwarded. The hook runs in
   # whatever directory the session's shell is in (or in $CLAUDE_PROJECT_DIR, when
   # a repo wires it with a `cd`), and neither is the PR's repository, so without
-  # it `gh pr view` resolves the number against the wrong repo. Measured from the
-  # studio repo against a product PR: "Could not resolve to a PullRequest with the
+  # it `gh pr view` resolves the number against the wrong repo. Measured from one
+  # repo against a PR of another: "Could not resolve to a PullRequest with the
   # number of 439", which the fail-closed branch below turns into the protected
   # branch — so every cross-repo merge was denied no matter what the policy said.
   if [ -n "$repo" ]; then

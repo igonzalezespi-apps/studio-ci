@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/igonzalezespi-apps/claude-plugins/core-dev/guard.policy.schema.json",
+  "$id": "urn:core-dev:guard.policy.schema.json",
   "title": "bash-guard policy",
   "description": "Repo-specific parameters for the vendored bash-guard.sh. Everything here is per-repo; the guard core is identical across repos. Strict defaults apply when a key (or the whole file) is absent: an absent policy never weakens the guard.",
   "type": "object",
@@ -14,7 +14,7 @@
     "require_pr_label": {
       "type": "boolean",
       "default": true,
-      "description": "Whether `gh pr create` must carry --label: the release gate of the studio products reads a semver label from the PR. false only in a repository whose releases do not read PR labels (e.g. release-please from the commits, or a version bump in a manifest). The waiver covers PRs that LAND in this repository, from any session: a `gh pr create --repo <this repo>` run elsewhere reads this value from this repository's origin, as a cross-repository merge does. A PR toward another repository follows that repository's own value, and one whose target or policy the guard cannot read still needs the label."
+      "description": "Whether `gh pr create` must carry --label: the release gate of a product repository reads a semver label from the PR. false only in a repository whose releases do not read PR labels (e.g. release-please from the commits, or a version bump in a manifest). The waiver covers PRs that LAND in this repository, from any session: a `gh pr create --repo <this repo>` run elsewhere reads this value from this repository's origin, as a cross-repository merge does. A PR toward another repository follows that repository's own value, and one whose target or policy the guard cannot read still needs the label."
     },
     "protected_branch": {
       "type": "string",

