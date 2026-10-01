@@ -1,0 +1,230 @@
+# REUSABLE workflow (`on: workflow_call`): watches the integration branch and undoes an automatic
+# merge that turned it red (revert-on-red). Without it, merge-when-green merges nothing: an
+# automatic merge is only acceptable if a red it causes is undone without waiting for a person.
+#
+#   jobs:
+#     develop-health:
+#       uses: igonzalezespi-apps/studio-ci/.github/workflows/develop-health.yml@<sha> # vX.Y.Z
+#
+# The logic is develop-health/develop_health.py (what counts as infrastructure, the single re-run,
+# the attribution to ONE commit merged by the App, the reasons it escalates instead). This file only
+# wires tokens:
+#   assess  GITHUB_TOKEN: reads the push runs, re-runs failed jobs once (actions: write), opens or
+#           lifts the merge-freeze issue and comments on the culprit (issues/pull-requests: write).
+#   revert  the merge App's token, in a job that declares `environment:` (key restricted to the
+#           default branch, as in merge-when-green.yml), only in live mode and only when assess
+#           named a PR to revert. A revert opened with GITHUB_TOKEN would never run its CI.
+#
+# Dry by default: in dry mode it writes the job summary and one comment on the culprit PR, nothing
+# else. It exits 0 when it measured, also on a red branch: the red is the finding, not a failure.
+name: develop-health
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "`dry` (default) or `live` (re-run, freeze, revert)."
+        type: string
+        required: false
+        default: dry
+      config-path:
+        type: string
+        required: false
+        default: .github/merge-when-green.json
+      app-client-id:
+        type: string
+        required: false
+        default: ""
+      environment:
+        type: string
+        required: false
+        default: merge-app
+      runs-on:
+        description: "Runner in a PRIVATE repo (a label or a JSON list). Public repos always use ubuntu-latest."
+        type: string
+        required: false
+        default: ubuntu-latest
+      selftest:
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      action:
+        description: "none | wait | infra | rerun | recover | revert | escalate | skip"
+        value: ${{ jobs.assess.outputs.action }}
+
+jobs:
+  assess:
+    name: assess
+    runs-on: ${{ github.event.repository.private && (startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on) || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    concurrency:
+      group: studio-develop-health-${{ github.repository }}${{ inputs.selftest && format('-selftest-{0}', github.run_id) || '' }}
+      cancel-in-progress: false
+    outputs:
+      action: ${{ steps.assess.outputs.action }}
+      revert_pr: ${{ steps.assess.outputs.revert_pr }}
+      revert_sha: ${{ steps.assess.outputs.revert_sha }}
+      live: ${{ steps.gate.outputs.live }}
+    steps:
+      - name: Event, code pin and mode
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODE: ${{ inputs.mode }}
+          SELFTEST: ${{ inputs.selftest }}
+          PRIVATE: ${{ github.event.repository.private }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WF_SHA: ${{ job.workflow_sha }}
+          WF_REPO: ${{ job.workflow_repository }}
+        run: |
+          set -uo pipefail
+          die() { echo "::error::develop-health: $*"; exit 1; }
+          case "$EVENT_NAME" in
+            pull_request_target) die "never on pull_request_target" ;;
+            pull_request) [ "$SELFTEST" = true ] && [ "$MODE" = dry ] || die "pull_request only as a dry self-test" ;;
+            workflow_run) [ "$RUN_HEAD_REPO" = "$REPO" ] || die "the triggering run comes from another repository ($RUN_HEAD_REPO)" ;;
+            workflow_dispatch | schedule) ;;
+            *) die "unsupported event $EVENT_NAME" ;;
+          esac
+          [ -n "$WF_SHA" ] && [ -n "$WF_REPO" ] || die "job.workflow_sha/job.workflow_repository are empty: cannot pin the code"
+          case "$MODE" in dry | live) ;; *) die "mode must be dry or live, got '$MODE'" ;; esac
+          live=false
+          if [ "$MODE" = live ] && [ "$SELFTEST" != true ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then live=true; fi
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          echo "mode=$([ "$live" = true ] && echo live || echo dry)" >> "$GITHUB_OUTPUT"
+
+      - name: This repository's code at the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .studio-ci
+          persist-credentials: false
+          sparse-checkout: |
+            risk-class
+            merge-when-green
+            develop-health
+
+      - name: The caller's default branch, as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .consumer
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/
+            /scripts/hooks/guard.policy.json
+
+      - name: Assess the integration branch
+        id: assess
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MWG_READ_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MODE: ${{ steps.gate.outputs.mode }}
+          CONFIG_PATH: ${{ inputs.config-path }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SELFTEST: ${{ inputs.selftest }}
+        run: |
+          set -uo pipefail
+          args=(--repo "$REPO" --mode "$MODE" --plan "$RUNNER_TEMP/health.json" --repo-dir .consumer
+                --config "$CONFIG_PATH" --run-url "$RUN_URL")
+          if [ "$SELFTEST" = true ]; then
+            args+=(--selftest-config .studio-ci/merge-when-green/selftest.json)
+          fi
+          bash .studio-ci/develop-health/develop-health.sh "${args[@]}"
+
+  revert:
+    name: revert
+    needs: assess
+    if: needs.assess.outputs.live == 'true' && needs.assess.outputs.action == 'revert' && needs.assess.outputs.revert_pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    concurrency:
+      group: studio-develop-health-revert-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Only the default branch, only public, only with the key
+        id: gate
+        env:
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PRIVATE: ${{ github.event.repository.private }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPO: ${{ github.repository }}
+          HAS_KEY: ${{ secrets.MERGE_APP_PRIVATE_KEY != '' }}
+        run: |
+          set -uo pipefail
+          ok=true
+          [ "$PRIVATE" = false ] || { echo "::warning::private repo: no Environment, no revert"; ok=false; }
+          [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ] || { echo "::warning::ref $REF is not the default branch"; ok=false; }
+          case "$WORKFLOW_REF" in
+            "$REPO/.github/workflows/"*"@refs/heads/$DEFAULT_BRANCH") ;;
+            *) echo "::warning::the calling workflow ($WORKFLOW_REF) is not a workflow of the default branch"; ok=false ;;
+          esac
+          [ "$HAS_KEY" = true ] || { echo "::warning::no MERGE_APP_PRIVATE_KEY in the Environment: not reverted"; ok=false; }
+          name="${REPO#*/}"
+          [ -n "$name" ] && [ "$name" != "$REPO" ] || { echo "::error::cannot compute the repository name"; exit 1; }
+          echo "repo_name=$name" >> "$GITHUB_OUTPUT"
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
+      - name: This repository's code at the pinned commit
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .studio-ci
+          persist-credentials: false
+          sparse-checkout: |
+            risk-class
+            merge-when-green
+            revert-merge
+
+      - name: Mint the App token (this repository only)
+        id: app_token
+        if: steps.gate.outputs.ok == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.app-client-id || vars.MERGE_APP_CLIENT_ID }}
+          private-key: ${{ !steps.app_token.outcome && secrets.MERGE_APP_PRIVATE_KEY || '' }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.gate.outputs.repo_name }}
+          permission-contents: write
+          permission-pull-requests: write
+          skip-token-revoke: 'true'
+
+      - name: Open the revert
+        if: steps.app_token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MWG_READ_TOKEN: ${{ github.token }}
+          MWG_WRITE_TOKEN: ${{ steps.app_token.outputs.token }}
+          MWG_WRITE_TOKEN_KIND: app
+          APP_SLUG: ${{ steps.app_token.outputs.app-slug }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.assess.outputs.revert_pr }}
+          SHA: ${{ needs.assess.outputs.revert_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          revoke() { GH_TOKEN="$MWG_WRITE_TOKEN" gh api --method DELETE /installation/token --silent || echo "::warning::could not revoke the App token"; }
+          trap revoke EXIT
+          bash .studio-ci/revert-merge/revert-merge.sh --repo "$REPO" --pr "$PR" --sha "$SHA" --app-slug "$APP_SLUG" --run-url "$RUN_URL"

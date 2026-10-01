@@ -17,6 +17,12 @@ on:
       - .github/workflows/security.yml
       - .github/workflows/renovate-heartbeat.yml
       - .github/workflows/reusables-selftest.yml
+      - .github/workflows/merge-when-green.yml
+      - .github/workflows/develop-health.yml
+      - risk-class/**
+      - merge-when-green/**
+      - develop-health/**
+      - revert-merge/**
 
 permissions:
   contents: read
@@ -32,3 +38,36 @@ jobs:
     uses: ./.github/workflows/renovate-heartbeat.yml
     with:
       ping: false
+
+  # Autonomous merging, DRY and with no write at all (`selftest: true`): proves in GitHub what the
+  # local suites cannot — the code checked out at `job.workflow_sha`, the sparse read of this repo's
+  # default branch, the real API answers for this very PR and for `develop`. The calling jobs grant
+  # write scopes only because a called job may not ask for more than its caller; in self-test
+  # nothing is written (no comment, no label, no merge job: `live` is never true on a PR).
+  merge-when-green:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+      checks: read
+      statuses: read
+    uses: ./.github/workflows/merge-when-green.yml
+    with:
+      selftest: true
+      mode: dry
+      pr: "${{ github.event.pull_request.number }}"
+      comment: false
+
+  develop-health:
+    permissions:
+      contents: read
+      actions: write
+      issues: write
+      pull-requests: write
+      checks: read
+      statuses: read
+    uses: ./.github/workflows/develop-health.yml
+    with:
+      selftest: true
+      mode: dry
