@@ -36,6 +36,7 @@ corre() {
   rm -rf "$TMP/act"; mkdir -p "$TMP/act"
   cat > "$TMP/act/check.sh" <<FAKE
 #!/usr/bin/env bash
+printf '%s\n' "\$*" > "$TMP/args"
 echo "FAIL  1. falta la seccion '## TL;DR' (de mentira)"
 echo "acme/proyecto#42 marcada, ${viol} violacion(es)."
 exit ${code}
@@ -45,6 +46,7 @@ FAKE
 
   got=0
   out=$(GITHUB_ACTION_PATH="$TMP/act" PR_NUMBER=42 PR_REPO="acme/proyecto" FLAG_LABEL="revision-humana" \
+        PROMOTION="${PROMO:-false}" PROTECTED_BRANCH=main INTEGRATION_BRANCH=develop \
         GITHUB_OUTPUT="$TMP/salida" GITHUB_STEP_SUMMARY="$TMP/resumen" \
         bash --noprofile --norc -e -o pipefail "$TMP/paso.sh" 2>&1) || got=$?
 
@@ -71,6 +73,12 @@ echo "== el envoltorio propaga el exit Y EL MOTIVO, con el shell real de GitHub 
 corre 0 'PR limpia (o sin la marca)'                 0 0 'marcada, 0 violacion(es)'
 corre 1 'UNA VIOLACION: el caso que importa'         1 1 "falta la seccion '## TL;DR'"
 corre 2 'no se pudo medir (API caida)'               2 0 "falta la seccion '## TL;DR'"
+
+echo "== promotion: opt-in, aditivo =="
+corre 0 'sin promotion no se pasa --promotion' 0 0 'marcada, 0 violacion(es)'
+if grep -q -- "--promotion" "$TMP/args"; then FAIL=$((FAIL + 1)); echo "  FAIL --promotion pasado sin pedirlo"; else PASS=$((PASS + 1)); echo "  ok   por defecto no cambia nada"; fi
+PROMO=true corre 0 'con promotion: true' 0 0 'marcada, 0 violacion(es)'
+if grep -q -- "--promotion --protected-branch main --integration-branch develop" "$TMP/args"; then PASS=$((PASS + 1)); echo "  ok   promotion: true pasa --promotion y las ramas"; else FAIL=$((FAIL + 1)); echo "  FAIL promotion: true no llega a check.sh ($(cat "$TMP/args"))"; fi
 
 echo "----------------------------------------"
 [ "$FAIL" -eq 0 ] && { echo "OK: $PASS/$((PASS + FAIL)) casos pasan"; exit 0; }
