@@ -1,0 +1,62 @@
+[
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "the latest run wins for every workflow (a flaky red hides)",
+  "old": "latest_wins = key[0] in state_wf",
+  "new": "latest_wins = True"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "a skipped required job counts as green",
+  "old": "    if c == \"skipped\":\n        return \"skipped\", c",
+  "new": "    if c == \"skipped\":\n        return \"good\", c"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "jobs inferred from a successful run's conclusion",
+  "old": "    for r in runs:\n        r[\"_jobs\"] = gh.list(",
+  "new": "    for r in runs:\n        if r.get(\"conclusion\") == \"success\":\n            r[\"_jobs\"] = [{\"name\": \"test\", \"status\": \"completed\", \"conclusion\": \"success\", \"steps\": []}]\n            continue\n        r[\"_jobs\"] = gh.list("
+ },
+ {
+  "file": "merge-when-green/mwg.py",
+  "why": "no pagination (first page only)",
+  "old": "        for page in pages:\n            chunk",
+  "new": "        for page in pages[:1]:\n            chunk"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "a failed step inside a successful job is ignored",
+  "old": "        if failed:\n",
+  "new": "        if False:\n"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "blacklist instead of whitelist (an unknown conclusion passes)",
+  "old": "    return \"bad\", c\n",
+  "new": "    return (\"bad\" if c in (\"failure\", \"cancelled\", \"timed_out\", \"startup_failure\", \"action_required\") else \"good\"), c\n"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "no settle time",
+  "old": "elif age is None or age < settle:",
+  "new": "elif age is None:"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "important ignores when the PR was opened (old branch-name runs count)",
+  "old": "if since_t and created and created < since_t:",
+  "new": "if False:"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "grouped by job name only, latest wins (the old checks-estrictos)",
+  "old": "            key = (wf, j.get(\"name\") or \"\")",
+  "new": "            key = (\"ci.yml\" if j.get(\"name\") == \"test\" else wf, j.get(\"name\") or \"\")\n            state_wf = set(state_wf) | {\"ci.yml\"}"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "other Apps' failures ignored",
+  "old": "            st = \"red\"\n",
+  "new": "            st = \"green\"\n"
+ }
+]
