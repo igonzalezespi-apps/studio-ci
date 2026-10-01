@@ -113,6 +113,73 @@ if [ "$rc" -eq 2 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL
 bash "$CHECK" --pr 42 >/dev/null 2>&1; [ $? -eq 2 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL  sin --repo debe ser exit 2"; }
 bash "$CHECK" --repo acme/proyecto >/dev/null 2>&1; [ $? -eq 2 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL  sin --pr debe ser exit 2"; }
 
+
+# --- modo promocion (--promotion): las reglas del resumen de release, una sola implementacion ---
+promo() { cat <<'MD'
+## TL;DR
+
+**Qué notarán los usuarios:** llegan las acciones para mergear solo lo que no necesita revisión, en seco por defecto; quien no las adopte no nota nada.
+
+**Qué puede salir mal y cómo se deshace:** un repositorio que las adopte podría ver comentarios de más en sus PRs; se apaga desactivando su workflow.
+
+**Decisiones tuyas que van dentro:** ninguna nueva.
+
+**Qué NO se ha comprobado:** el modo real, que necesita la App de merge.
+
+```bash
+gh pr merge 42 --repo acme/proyecto --merge
+```
+
+## PRs de esta promoción
+
+- #12 feat: algo (`x.sh`)
+MD
+}
+pcaso() { # pcaso <esperado> <etiqueta> <sed|""> [base] [head] [flags] [labels]
+  local want="$1" label="$2" expr="$3" base="${4:-main}" head="${5:-develop}" flags="${6:---promotion}" labels="${7:-}" out rc
+  if [ -n "$expr" ]; then promo | sed -E "$expr" > "$TMP/p.md"; else promo > "$TMP/p.md"; fi
+  # shellcheck disable=SC2086
+  out="$(bash "$CHECK" --body "$TMP/p.md" --pr 42 --repo acme/proyecto --labels "$labels" --base-ref "$base" --head-ref "$head" $flags 2>&1)"; rc=$?
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1)); printf 'FAIL  promocion: %s (esperaba exit %s, salio %s)\n%s\n' "$label" "$want" "$rc" "$out"
+}
+pcaso 0 "promocion completa, sin marca: se juzga y pasa" ""
+pcaso 0 "sin --promotion, una promocion sin marca no se juzga (como hasta hoy)" 's/^\*\*Qué NO se ha comprobado.*//' main develop " "
+pcaso 0 "con --promotion, una PR que no es promocion y sin marca no se juzga" 's/^\*\*Qué NO se ha comprobado.*//' develop feat/x
+pcaso 1 "falta un campo" '/^\*\*Qué NO se ha comprobado/d'
+pcaso 1 "campo con el texto de la plantilla" 's/^(\*\*Decisiones tuyas que van dentro:\*\*).*/\1 <qué decides>/'
+pcaso 1 "codigo en linea en el TL;DR" 's/ninguna nueva\./ninguna nueva salvo `mode: live`./'
+pcaso 1 "una ruta en el TL;DR" 's/ninguna nueva\./ninguna nueva salvo lo de scripts\/x.sh./'
+pcaso 1 "una promocion por squash" 's/--merge$/--squash/'
+pcaso 1 "el comando de otra PR" 's/gh pr merge 42/gh pr merge 43/'
+pcaso 1 "sin comando en un bloque bash" 's/^```bash$/```text/'
+pcaso 1 "el TL;DR no va primero" '1i ## Contexto\n\nAntes.\n'
+pcaso 0 "codigo y rutas FUERA del TL;DR no cuentan" ""
+# una PR marcada que no es promocion se sigue juzgando con las seis clases y nada mas: el codigo en
+# linea en su TL;DR sigue permitido (el desacuerdo entre los dos linters se resuelve por modo)
+bueno | sed -E 's/no se pierde trabajo/no se pierde trabajo (`x`)/' > "$TMP/nm.md"
+bash "$CHECK" --body "$TMP/nm.md" --pr 42 --repo acme/proyecto --labels revision-humana --base-ref develop --head-ref feat/x --promotion >/dev/null 2>&1
+[ $? -eq 0 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL  una PR marcada que no es promocion no debe heredar las reglas de release"; }
+msg="$(promo | sed -E 's/--merge$/--squash/' > "$TMP/sq.md"; bash "$CHECK" --body "$TMP/sq.md" --pr 42 --repo acme/proyecto --labels "" --base-ref main --head-ref develop --promotion 2>&1)"
+case "$msg" in *"exactamente 'gh pr merge <n> --repo <owner>/<name> --merge'"*) pass=$((pass + 1)) ;; *) fail=$((fail + 1)); echo "FAIL  squash: el motivo no lo explica";; esac
+bash "$CHECK" --body "$TMP/p.md" --pr 42 --repo acme/proyecto --labels >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL  --labels sin valor debe ser exit 2 (y no colgarse), salio $rc"; }
+# camino de red: base/head leidos de la API
+cat > "$TMP/bin/gh-promo" <<'STUB'
+#!/usr/bin/env bash
+python3 - "$@" <<'PY'
+import json, os
+body = open(os.environ["BODY_FIXTURE"], encoding="utf-8").read()
+print(json.dumps({"body": body, "labels": [], "base": {"ref": "main"}, "head": {"ref": "develop"}}))
+PY
+STUB
+chmod +x "$TMP/bin/gh-promo"
+promo | sed -E 's/--merge$/--squash/' > "$TMP/net.md"
+BODY_FIXTURE="$TMP/net.md" GH_API="$TMP/bin/gh-promo" bash "$CHECK" --repo acme/proyecto --pr 42 --promotion >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 1 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL  red: promocion leida de la API debe juzgarse (exit 1), salio $rc"; }
+BODY_FIXTURE="$TMP/net.md" GH_API="$TMP/bin/gh-promo" bash "$CHECK" --repo acme/proyecto --pr 42 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL  red: sin --promotion no cambia nada, salio $rc"; }
+
 echo "----------------------------------------"
 [ "$fail" -eq 0 ] && { echo "OK: $pass/$((pass + fail)) casos pasan"; exit 0; }
 echo "FALLOS: $fail/$((pass + fail))"; exit 1

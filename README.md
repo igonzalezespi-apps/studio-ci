@@ -165,6 +165,30 @@ jobs:
 No checkout needed: it reads the PR through the API. `label` changes the flag; `pr-number`/`repo`
 default to the event's.
 
+**Promotion mode** (opt-in, `promotion: "true"`): a PR from `integration-branch` (default `develop`)
+into `protected-branch` (default `main`) is a release that a person always reads, flagged or not. It
+is judged with the six classes **plus** the release-summary rules: the four fields (**Qué notarán
+los usuarios:**, **Qué puede salir mal y cómo se deshace:**, **Decisiones tuyas que van dentro:**,
+**Qué NO se ha comprobado:**) filled in, no inline code or file paths in the TL;DR prose (say it by
+its effect), and exactly `gh pr merge <n> --repo <owner>/<name> --merge` in a bash block. A flagged
+PR that is not a promotion is judged exactly as before. Locally:
+`check.sh --body F --pr N --repo R --labels "" --promotion --base-ref main --head-ref develop`.
+
+### `pr-body`
+
+A deterministic PR body from git and three short texts, so bodies stop being written by hand.
+Not an action: a script the session runs (`pr-body/pr-body.sh --help`).
+
+| mode | for | sections |
+|---|---|---|
+| `work` | the normal PR an agent integrates | no TL;DR (only where a person decides) · Qué y por qué (≤ 600 characters) · Verificación (required) · Riesgo (`riesgo:N`, from `risk-class` when present) · Commits · Ficheros (diff --stat, ≤ 40 lines) · Merge method: Squash |
+| `human` | `revision-humana` | `## TL;DR` first (your text + `gh pr merge N --repo R --squash`), then the `work` sections |
+| `promotion` | `develop` → `main` | `## TL;DR` with the four release fields + `gh pr merge N --repo R --merge`, the PRs of the range (`git log --first-parent`), Merge method: merge commit |
+
+Two phases: render, create the PR, render again with `--repo R --pr N` and `gh pr edit` (that fires
+`edited`, which the TL;DR check listens to). With `--pr`, the `human` and `promotion` bodies are run
+through `check-pr-tldr` before they are printed: exit 1 if the body the script wrote would fail it.
+
 ### `risk-class`
 
 Classifies a pull request into **riesgo-0…riesgo-4** (label `riesgo:N`) — the class decides who has
