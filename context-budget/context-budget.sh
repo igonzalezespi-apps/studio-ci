@@ -238,8 +238,9 @@ class TreeSource:
 
 class IndexSource:
     """El indice de git (`--staged`): solo las entradas en la etapa 0 y sin submodulos; cada
-    blob se lee por su SHA. Un enlace simbolico se sigue dentro del indice; si su destino no
-    esta en el, se lee del disco, como haria Claude Code al cargarlo."""
+    blob se lee por su SHA. Los enlaces simbolicos (de un fichero o de un directorio de la ruta)
+    se siguen DENTRO del indice; si llevan fuera de el, lo que apuntan no existe, como en el
+    checkout de CI."""
     where = "en el indice"
 
     def __init__(self):
@@ -273,52 +274,49 @@ class IndexSource:
                 die("--staged: no se pudo leer el blob %s del indice (%s)" % (sha, exc))
         return self._blobs[sha]
 
-    def _resolve(self, rel):
-        """(sha, None) de la entrada, siguiendo enlaces dentro del indice; (None, ruta) si hay
-        que leer del disco; (None, None) si no existe."""
-        if os.path.isabs(rel):
-            return (None, rel) if os.path.isfile(rel) else (None, None)
+    def _real(self, rel):
+        """La ruta del indice tras seguir los enlaces simbolicos de cualquier tramo de `rel`;
+        None si sale del repo o hay un ciclo."""
         rel = self._norm(rel)
-        for _ in range(8):
-            ent = self.entries.get(rel)
-            if ent is None:
-                return None, None
-            mode, sha = ent
-            if mode != "120000":
-                return sha, None
-            target = self._blob(sha).decode("utf-8", "replace")
-            nxt = self._norm(os.path.join(os.path.dirname(rel), target)) if not os.path.isabs(target) else target
-            if os.path.isabs(nxt) or nxt.startswith("../") or nxt not in self.entries:
-                disk = nxt if os.path.isabs(nxt) else os.path.join(ROOT, nxt)
-                return (None, disk) if os.path.isfile(disk) else (None, None)
-            rel = nxt
-        return None, None
+        for _ in range(16):
+            if os.path.isabs(rel) or rel == ".." or rel.startswith("../"):
+                return None
+            parts = rel.split("/") if rel else []
+            for k in range(1, len(parts) + 1):
+                head = "/".join(parts[:k])
+                ent = self.entries.get(head)
+                if ent is not None and ent[0] == "120000":
+                    target = self._blob(ent[1]).decode("utf-8", "replace")
+                    if os.path.isabs(target):
+                        return None
+                    rel = self._norm(os.path.join(os.path.dirname(head), target, *parts[k:]))
+                    break
+            else:
+                return rel
+        return None
 
     def isfile(self, rel):
-        return self._resolve(rel) != (None, None)
+        return self._real(rel) in self.entries
+
+    def _prefix(self, rel):
+        real = self._real(rel)
+        return None if real is None else (real + "/" if real else "")
 
     def isdir(self, rel):
-        if os.path.isabs(rel):
-            return os.path.isdir(rel)
-        rel = self._norm(rel)
-        prefix = rel + "/" if rel else ""
-        return any(p.startswith(prefix) for p in self.entries)
+        prefix = self._prefix(rel)
+        return prefix is not None and any(p.startswith(prefix) for p in self.entries)
 
     def listdir(self, rel):
-        if os.path.isabs(rel):
-            return TreeSource().listdir(rel)
-        rel = self._norm(rel)
-        prefix = rel + "/" if rel else ""
+        prefix = self._prefix(rel)
+        if prefix is None:
+            return []
         return sorted({p[len(prefix):].split("/", 1)[0] for p in self.entries if p.startswith(prefix)})
 
     def read_bytes(self, rel):
-        sha, disk = self._resolve(rel)
-        if sha is not None:
-            return self._blob(sha)
-        if disk is not None:
-            with open(disk, "rb") as fh:
-                return fh.read()
-        raise FileNotFoundError(rel)
+        real = self._real(rel)
+        if real not in self.entries:
+            raise FileNotFoundError(rel)
+        return self._blob(self.entries[real][1])
 
 
 if opt["staged"]:

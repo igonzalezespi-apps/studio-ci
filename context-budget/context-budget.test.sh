@@ -355,6 +355,13 @@ caso 1 "--staged: un CLAUDE.md enlace simbolico mide el destino del indice" "FAI
   'mkdir -p docs && grande docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && grande docs/raiz.md 2000' --staged
 caso 0 "sin --staged, el mismo enlace mide el destino en disco" "$LIMPIO" \
   'mkdir -p docs && grande docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && grande docs/raiz.md 2000'
+caso 1 "--staged: un enlace a algo que no esta en el indice no existe (como en CI)" "no hay CLAUDE.md con la linea del pacto" \
+  'mkdir -p docs && grande docs/raiz.md 2000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && echo docs/ > .gitignore && indexa' --staged
+caso 0 "sin --staged, el mismo enlace se sigue en disco" "$LIMPIO" \
+  'mkdir -p docs && grande docs/raiz.md 2000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && echo docs/ > .gitignore && indexa'
+# el estilo se llama por su `name:` (corto), no por el fichero: hace falta LEERLO a traves del enlace
+caso 0 "--staged: un directorio de estilos enlazado se sigue dentro del indice" "corto (.claude/output-styles)" \
+  'mv .claude/output-styles estilos && printf -- "---\nname: corto\n---\nx\n" > estilos/largo.md && ln -s ../estilos .claude/output-styles && jqset .claude/settings.json "d[\"outputStyle\"]=\"corto\"" && indexa' --staged
 caso 2 "--staged fuera de un repo git: no se puede medir" "--staged necesita que --root" ":" --staged
 caso 2 "--staged en un subdirectorio del repo: no se puede medir" "--staged necesita que --root" \
   'indexa && mkdir -p sub && touch sub/x && git add sub/x' --staged --root "$R/sub"
