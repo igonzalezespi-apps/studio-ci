@@ -20,6 +20,21 @@ inputs:
   github-token:
     description: "Token con `pull-requests: read` sobre este repo."
     required: true
+  promotion:
+    description: >-
+      'true' para juzgar tambien, lleven o no la marca, las PRs de promocion (integration-branch ->
+      protected-branch) con las reglas del resumen de release: los cuatro campos, sin codigo en
+      linea ni rutas, y `gh pr merge <n> --repo <o/n> --merge` de esa PR. Opt-in; por defecto, nada cambia.
+    required: false
+    default: "false"
+  protected-branch:
+    description: "Rama protegida (destino de una promocion)."
+    required: false
+    default: "main"
+  integration-branch:
+    description: "Rama de integracion (origen de una promocion)."
+    required: false
+    default: "develop"
 
 outputs:
   violations:
@@ -38,6 +53,9 @@ runs:
         PR_NUMBER: ${{ inputs.pr-number }}
         PR_REPO: ${{ inputs.repo }}
         FLAG_LABEL: ${{ inputs.label }}
+        PROMOTION: ${{ inputs.promotion }}
+        PROTECTED_BRANCH: ${{ inputs.protected-branch }}
+        INTEGRATION_BRANCH: ${{ inputs.integration-branch }}
       run: |
         set -uo pipefail
         # `$GITHUB_ACTION_PATH` es la raiz de ESTA action, no la del consumidor: sin el, el script
@@ -48,8 +66,12 @@ runs:
         # de arriba no lo quita, asi que una asignacion cuyo comando sale distinto de 0 aborta el
         # paso ahi mismo — antes de imprimir el hallazgo. Le paso ya a `check-action-pins`: la
         # action no podia informar de una violacion, que es el unico caso para el que existe.
+        args=(--repo "$PR_REPO" --pr "$PR_NUMBER" --label "$FLAG_LABEL")
+        if [ "${PROMOTION:-false}" = true ]; then
+          args+=(--promotion --protected-branch "${PROTECTED_BRANCH:-main}" --integration-branch "${INTEGRATION_BRANCH:-develop}")
+        fi
         rc=0
-        out=$(bash "$GITHUB_ACTION_PATH/check.sh" --repo "$PR_REPO" --pr "$PR_NUMBER" --label "$FLAG_LABEL" 2>&1) || rc=$?
+        out=$(bash "$GITHUB_ACTION_PATH/check.sh" "${args[@]}" 2>&1) || rc=$?
         printf '%s\n' "$out"
         n=$(printf '%s' "$out" | sed -nE 's/.*, ([0-9]+) violacion\(es\).*/\1/p' | tail -1)
         echo "violations=${n:-0}" >> "$GITHUB_OUTPUT"

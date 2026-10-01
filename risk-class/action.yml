@@ -1,0 +1,79 @@
+name: risk-class
+description: >-
+  Classifies a pull request into riesgo-0..riesgo-4 from its paths (old and new names), labels,
+  branches and the repo's guard policy and .github/merge-when-green.json (read from the default
+  branch). Read-only unless apply-label is true. Stack-agnostic: python3 + gh.
+
+inputs:
+  github-token:
+    description: "Token with pull-requests: read (and write, for apply-label)."
+    required: true
+  pr-number:
+    description: "PR number. Default: the event's."
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  repo:
+    description: "owner/name. Default: the event's repository."
+    required: false
+    default: ${{ github.repository }}
+  config-path:
+    description: "merge-when-green config on the default branch (risk_paths, bot settings)."
+    required: false
+    default: .github/merge-when-green.json
+  apply-label:
+    description: "'true' to set riesgo:N on the PR and remove any other riesgo:* label."
+    required: false
+    default: "false"
+
+outputs:
+  class:
+    description: "0..4"
+    value: ${{ steps.classify.outputs.class }}
+  label:
+    description: "riesgo:N"
+    value: ${{ steps.classify.outputs.label }}
+  json:
+    description: "The full classification (reasons, files, lines of code) as one-line JSON."
+    value: ${{ steps.classify.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - id: classify
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PR_REPO: ${{ inputs.repo }}
+        CONFIG_PATH: ${{ inputs.config-path }}
+        APPLY: ${{ inputs.apply-label }}
+      run: |
+        set -uo pipefail
+        # `|| rc=$?`: the run shell brings -e from outside; a bare assignment would abort before
+        # reporting why it could not measure.
+        rc=0
+        out=$(python3 "$GITHUB_ACTION_PATH/risk_class.py" --pr "$PR_NUMBER" --repo "$PR_REPO" --config "$CONFIG_PATH" --json) || rc=$?
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::risk-class could not measure ${PR_REPO}#${PR_NUMBER} (exit $rc): never treat that as riesgo-0"
+          exit "$rc"
+        fi
+        label=$(printf '%s' "$out" | jq -r .label)
+        class=$(printf '%s' "$out" | jq -r .class)
+        { echo "class=$class"; echo "label=$label"; echo "json=$out"; } >> "$GITHUB_OUTPUT"
+        {
+          echo "### risk-class: $label"
+          printf '%s' "$out" | jq -r '.reasons[] | "- \(.class) · \(.why)\(if (.paths|length) > 0 then ": " + (.paths[:5] | join(", ")) else "" end)"'
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "${PR_REPO}#${PR_NUMBER}: $label"
+        if [ "$APPLY" = true ]; then
+          have=$(gh api "repos/$PR_REPO/issues/$PR_NUMBER/labels" --jq '.[].name' 2>/dev/null) || have=""
+          while IFS= read -r l; do
+            case "$l" in
+              riesgo:*) [ "$l" = "$label" ] || gh api --method DELETE "repos/$PR_REPO/issues/$PR_NUMBER/labels/${l/:/%3A}" --silent || true ;;
+            esac
+          done <<< "$have"
+          if ! grep -qx -- "$label" <<< "$have"; then
+            gh api --method POST "repos/$PR_REPO/issues/$PR_NUMBER/labels" -f "labels[]=$label" --silent \
+              || echo "::warning::could not set $label (a read-only token, e.g. a pull request from a fork)"
+          fi
+        fi

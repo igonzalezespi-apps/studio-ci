@@ -1,0 +1,134 @@
+[
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "reverts with two commits in the range",
+  "old": "    if cmp.get(\"behind_by\") or len(commits) != 1 or commits[0][\"sha\"] != first_red:",
+  "new": "    if False:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "reverts a revert",
+  "old": "    if pr_merge.REVERT_LABEL in labels or (pr.get(\"title\") or \"\").lower().startswith(\"revert\") or \\",
+  "new": "    if False and \\"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "reverts an infrastructure red",
+  "old": "    infra = bool(bad_jobs) and all(",
+  "new": "    infra = False and all("
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "reverts a person's merge",
+  "old": "    if not app or (pr.get(\"merged_by\") or {}).get(\"login\") != app:",
+  "new": "    if not app:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "skips the re-run",
+  "old": "    if attempts < 2:",
+  "new": "    if False:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "blames the head instead of the first red push",
+  "old": "    first_red = reds[-1]",
+  "new": "    first_red = reds[0]"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "no Risk-class trailer check",
+  "old": "    if t is None or t > 2:\n",
+  "new": "    if False:\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "no 24 h cap",
+  "old": "    if n24 >= int(ctx.cfg.get(\"max_reverts_per_day\", 1)):",
+  "new": "    if False:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "closes an escalated freeze before the owner sees it",
+  "old": "                if pr_merge.ESCALATION_LABEL not in labels:",
+  "new": "                if True:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "acts on someone else's freeze issue",
+  "old": "        if (i.get(\"user\") or {}).get(\"login\") == pr_merge.ACTIONS_BOT and FREEZE_MARK in (i.get(\"body\") or \"\"):",
+  "new": "        if True:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "writes in dry mode",
+  "old": "    if mode != \"live\":\n        if culprit.get(\"pr\") and write:",
+  "new": "    if False:\n        if culprit.get(\"pr\") and write:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "an open revert is never re-judged (wait forever)",
+  "old": "        note, reasons = judge_revert(gh, ctx, info, head_sha, v, issue)\n",
+  "new": "        note, reasons = \"open\", []\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "a revert closed without merging is ignored",
+  "old": "        if r[\"state\"] != \"open\":\n",
+  "new": "        if False:\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "a stale revert is never escalated",
+  "old": "    if age > REVERT_STALE_MINUTES:\n",
+  "new": "    if False:\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "an invalid or red revert waits instead of escalating",
+  "old": "    if d[\"decision\"] not in (\"merge\", \"wait\"):\n",
+  "new": "    if False:\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "recover leaves the App's open revert behind",
+  "old": "                    if r[\"state\"] == \"open\" and not r[\"merged_at\"]:\n",
+  "new": "                    if False:\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "the self-test writes the culprit comment",
+  "old": "            plan = assess(gh, ctx, a[\"mode\"], a[\"run_url\"], write=not a[\"selftest_config\"])",
+  "new": "            plan = assess(gh, ctx, a[\"mode\"], a[\"run_url\"])"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "the self-test may run live",
+  "old": "        if a[\"selftest_config\"] and a[\"mode\"] != \"dry\":\n",
+  "new": "        if False:\n"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "behind_by not checked (the red is not a descendant of the green)",
+  "old": "if cmp.get(\"behind_by\") or len(commits) != 1",
+  "new": "if len(commits) != 1"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "one infrastructure job makes the whole red infrastructure (any instead of all)",
+  "old": "infra = bool(bad_jobs) and all(ci_verdict.infra_failure(j) for _, j in bad_jobs)",
+  "new": "infra = bool(bad_jobs) and any(ci_verdict.infra_failure(j) for _, j in bad_jobs)"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "reverts from a fork count as the App's",
+  "old": "if m and (p.get(\"head\", {}).get(\"repo\") or {}).get(\"full_name\") == repo:",
+  "new": "if m:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "an escalated freeze is rewritten on every run",
+  "old": "        if issue and pr_merge.ESCALATION_LABEL in [lb[\"name\"] for lb in issue.get(\"labels\") or []]:\n",
+  "new": "        if False:\n"
+ }
+]
