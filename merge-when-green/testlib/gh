@@ -19,7 +19,7 @@ def main(argv):
         print("fake gh: only `gh api` is supported (%s)" % " ".join(argv), file=sys.stderr)
         return 1
     args = argv[1:]
-    method, include, paginate, slurp, inp, path = "GET", False, False, False, None, None
+    method, include, paginate, inp, path = "GET", False, False, None, None
     i = 0
     while i < len(args):
         a = args[i]
@@ -30,7 +30,10 @@ def main(argv):
         if a == "--paginate":
             paginate = True; i += 1; continue
         if a == "--slurp":
-            slurp = True; i += 1; continue
+            # Answered like the oldest gh the scripts must run with, 2.45.0 (Ubuntu 24.04's
+            # package, on a private repo's own runners), which does not know this flag.
+            print("unknown flag: --slurp", file=sys.stderr)
+            return 1
         if a == "--input":
             inp = args[i + 1]; i += 2; continue
         if a in ("-H", "--header", "-f", "-F", "--jq", "-q"):
@@ -75,8 +78,12 @@ def main(argv):
         if status >= 400:
             print("gh: %s (HTTP %d)" % ((spec.get("body") or {}).get("message", "error"), status), file=sys.stderr)
             return 1
-        out = pages if slurp else pages[0]
-        sys.stdout.write(json.dumps(out))
+        # As the real gh prints it without --slurp: the pages of an array endpoint merged into one
+        # array, object pages one after another with nothing in between.
+        if all(isinstance(p, list) for p in pages):
+            sys.stdout.write(json.dumps([x for p in pages for x in p]))
+        else:
+            sys.stdout.write("".join(json.dumps(p) for p in pages))
         return 0
     text = json.dumps(spec.get("body")) if spec.get("body") is not None else ""
     if include:
