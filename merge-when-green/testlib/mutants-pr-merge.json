@@ -1,0 +1,134 @@
+[
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "the merge PUT without the evaluated sha",
+  "old": "{\"merge_method\": \"squash\", \"sha\": sha, ",
+  "new": "{\"merge_method\": \"squash\", "
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "no protected-branch check",
+  "old": "    if ctx.protected and base == ctx.protected:",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "no long-lived head check",
+  "old": "    if pull[\"head\"][\"ref\"] in ctx.long_lived:",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "no fork check",
+  "old": "    if head_repo != (pull[\"base\"].get(\"repo\") or {}).get(\"full_name\"):",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "revision-humana no longer holds a PR",
+  "old": "HUMAN_LABELS = (\"revision-humana\", ",
+  "new": "HUMAN_LABELS = ("
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "<= instead of < on max_auto_class",
+  "old": "    if cls <= 2 and cls > max_auto:",
+  "new": "    if cls <= 2 and cls > max_auto + 1:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "develop red does not hold merges",
+  "old": "    elif ctx.waits and not d.get(\"revert\"):",
+  "new": "    elif False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a freeze issue does not hold merges",
+  "old": "        if self.freeze:\n",
+  "new": "        if False:\n"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "any author's verdict is accepted",
+  "old": "        if (c.get(\"user\") or {}).get(\"login\") not in authors:\n            continue",
+  "new": "        pass"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "an edited verdict is accepted",
+  "old": "        if c.get(\"updated_at\") != c.get(\"created_at\"):\n            continue",
+  "new": "        pass"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a personal token passes the App check",
+  "old": "if not tok.startswith(\"ghs_\") or ",
+  "new": "if "
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "the App token scope is not checked",
+  "old": "    if (data or {}).get(\"total_count\") != 1 or names != [repo]:",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "merge outside GitHub Actions",
+  "old": "    if os.environ.get(\"GITHUB_ACTIONS\") != \"true\":",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "[skip ci] survives the squash",
+  "old": "    text = SKIP_CI.sub(",
+  "new": "    text = (lambda *a: a[1])(\"\", text or \"\") if True else SKIP_CI.sub("
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a forged comment marker is edited",
+  "old": "    mine = [c for c in comments if (c.get(\"user\") or {}).get(\"login\") == ACTIONS_BOT\n            and",
+  "new": "    mine = [c for c in comments if True\n            and"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "bot PRs are escalated to the owner",
+  "old": "        if is_bot:\n            return result(pull, \"skip\", [\"riesgo:%d on a bot PR",
+  "new": "        if False:\n            return result(pull, \"skip\", [\"riesgo:%d on a bot PR"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a revert with other files is accepted",
+  "old": "    if mine != theirs:",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "the revert class comes from anywhere but the trailer",
+  "old": "    if ocls > 2:\n        return False, ocls,",
+  "new": "    if ocls > 9:\n        return False, ocls,"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "continue-on-error not checked",
+  "old": "        if coe:\n",
+  "new": "        if False:\n"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a missing semver label is not a stop",
+  "old": "    if rc[\"missing_semver\"]:",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a class-3 PR merges like a 0",
+  "old": "    if cls >= 3:\n        top",
+  "new": "    if cls >= 9:\n        top"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "any App may merge (develop-health would not recognise its merges)",
+  "old": "    if not slug or slug != ctx.cfg.get(\"app_slug\"):",
+  "new": "    if False:"
+ }
+]
