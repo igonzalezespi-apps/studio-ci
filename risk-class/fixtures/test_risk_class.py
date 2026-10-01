@@ -120,6 +120,9 @@ case("25 Renovate workflow with another line",
 case("26 person semver:major", facts(["src/x.ts"], labels=["semver:major"]), 4)
 case("27 promotion develop->main", facts(["src/x.ts"], base="main", head="develop"), 4)
 case("28 head main into develop", facts(["src/x.ts"], base="develop", head="main"), 3)
+case("27b trunk repo: a PR into main is ordinary work, not a promotion",
+     facts(["docs/a.md"], base="main", head="fix/x", policy={"protected_branch": "main", "integration_branch": ""}), 0)
+case("27c a feature branch straight into main (repo with develop) is still a release", facts(["docs/a.md"], base="main", head="fix/x"), 4)
 case("29 migration", facts(["migrations/001.sql"]), 4)
 case("30 prisma schema", facts(["prisma/schema.prisma"]), 4)
 case("31 guard policy", facts(["scripts/hooks/guard.policy.json"]), 3)

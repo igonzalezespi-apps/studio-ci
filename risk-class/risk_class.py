@@ -266,7 +266,10 @@ def classify(facts, policy, cfg):
     bot_clean = is_bot and not bot_problems
 
     # branches
-    if policy.get("protected_branch") and base == policy["protected_branch"]:
+    # A PR into the protected branch is a release only where there IS an integration branch: in a
+    # trunk repo (no integration branch, or the same one) a PR into main is the ordinary flow.
+    integ = policy.get("integration_branch") or ""
+    if policy.get("protected_branch") and base == policy["protected_branch"] and integ and integ != base:
         hit(4, "promotion", "a promotion into the protected branch: a release")
     if head in mwg.long_lived(policy):
         hit(3, "long-lived-head", "the head is a long-lived branch (%s)" % head)
