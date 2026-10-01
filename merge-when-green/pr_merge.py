@@ -203,7 +203,7 @@ def static_skip(ctx, pull):
     if pull["head"]["ref"] in ctx.long_lived:
         return "head %s is a long-lived branch" % pull["head"]["ref"]
     held = sorted(labels & set(HUMAN_LABELS))
-    if held:
+    if held and not getattr(ctx, "ignore_holds", False):
         return "labelled %s: with a person" % ", ".join(held)
     author = (pull.get("user") or {}).get("login") or ""
     app = bot_login(ctx.cfg.get("app_slug"))
@@ -570,6 +570,13 @@ def cmd_sweep(a):
         plan["waits"].append("the triggering run carries no pull request: nothing to evaluate")
         return finish()
     ctx = Context(gh, repo, a["repo_dir"], a["config"], a["selftest_config"])
+    if a["selftest_config"]:
+        # The self-test of this repo's CI: dry and without writes no matter what was asked, and it
+        # looks past the hold labels so the whole decision path runs against a real PR in GitHub.
+        if mode != "dry" or comment or label:
+            raise mwg.UsageError("--selftest-config is dry and read-only: --mode dry --comment false --labels false")
+        ctx.ignore_holds = True
+        plan["note"] = "self-test: hold labels ignored, nothing written"
     plan["integration"] = ctx.integration
     plan["preconditions"] = list(ctx.blockers)
     if ctx.hard_blockers:

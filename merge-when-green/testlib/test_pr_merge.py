@@ -465,6 +465,17 @@ w = merge_world(labels=("semver:patch", "revision-humana"))
 res = H.run_script(PM, ["escalate", "--repo", R, "--pr", "5"], w, APP_ENV)
 S.check("escalate: already labelled -> nothing", res["rc"] == 0 and not H.writes(res))
 
+
+w = world(); add_pr(w, 5, labels=("semver:patch", "revision-humana"))
+sc = os.path.join(H.ROOT, "merge-when-green", "selftest.json")
+res = sweep(w, extra=["--pr", "5", "--comment", "false", "--labels", "false", "--selftest-config", sc])
+S.check("self-test: looks past the hold label and runs the whole decision, writing nothing",
+        res["outputs"].get("merge_pr") == "5" and not H.writes(res), (res["plan"].get("decisions"), H.writes(res)))
+res = sweep(w, extra=["--pr", "5", "--selftest-config", sc])
+S.check("self-test refuses to write", res["rc"] == 2 and not H.writes(res), res["err"])
+res = sweep(w, "live", extra=["--pr", "5", "--comment", "false", "--labels", "false", "--selftest-config", sc])
+S.check("self-test refuses live", res["rc"] == 2)
+
 # ── usage ────────────────────────────────────────────────────────────────────────────────────────
 for label, args in (("decide --repo without value", ["decide", "--pr", "5", "--repo"]),
                     ("sweep bad mode", ["sweep", "--repo", R, "--mode", "yes"]),

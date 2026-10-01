@@ -130,5 +130,11 @@
   "why": "any App may merge (develop-health would not recognise its merges)",
   "old": "    if not slug or slug != ctx.cfg.get(\"app_slug\"):",
   "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "the self-test may write",
+  "old": "        if mode != \"dry\" or comment or label:",
+  "new": "        if False:"
  }
 ]
