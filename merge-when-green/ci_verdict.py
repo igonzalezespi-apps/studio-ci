@@ -63,6 +63,13 @@ def _job_state(job):
     return "bad", c
 
 
+def attempt_rank(job, attempt, started=""):
+    """Which attempt of a job decides its run: the latest one that did not skip. A re-run in which
+    the job came out `skipped` (an `if:` that reads the re-run's context) does not clear the failure
+    of an earlier attempt: a failure followed by SKIPPED is red."""
+    return (_job_state(job)[0] != "skipped", attempt, started or "")
+
+
 def infra_failure(job):
     """A red the code did not cause: the job never really ran."""
     c = job.get("conclusion")
@@ -109,11 +116,12 @@ def verdict(runs, required, checks=(), statuses=(), state_workflows=(), settle=1
                 last_completed = t
     keys = []
     for key, ents in sorted(entries.items()):
-        # the latest attempt of each run decides that run
+        # the latest attempt of each run that did not skip decides that run
         per_run = {}
         for e in ents:
             cur = per_run.get(e["run_id"])
-            if cur is None or (e["attempt"], e["started"]) > (cur["attempt"], cur["started"]):
+            if cur is None or attempt_rank(e["job"], e["attempt"], e["started"]) > \
+                    attempt_rank(cur["job"], cur["attempt"], cur["started"]):
                 per_run[e["run_id"]] = e
         ordered = sorted(per_run.values(), key=lambda e: (e["created"], e["run_id"]))
         states = [(e,) + _job_state(e["job"]) for e in ordered]

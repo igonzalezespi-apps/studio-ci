@@ -44,6 +44,18 @@ verdict("failure, then success on a re-run of the SAME run, is green",
         [run(1, "ci.yml", PR, B, SHA, [job("test", "failure", attempt=1), job("test", "success", attempt=2,
                                                                                  started="2026-10-01T11:10:00Z")])],
         "green")
+verdict("failure, then SKIPPED on a re-run of the same run (an optional job), is red",
+        [run(1, "ci.yml", PR, B, SHA, [job("test"), job("lint", "failure", attempt=1),
+                                       job("lint", "skipped", attempt=2, steps=[], started="2026-10-01T11:10:00Z")])],
+        "red")
+verdict("failure, then SKIPPED on a re-run of the same run (the required job), is red",
+        [run(1, "ci.yml", PR, B, SHA, [job("test", "failure", attempt=1),
+                                       job("test", "skipped", attempt=2, steps=[], started="2026-10-01T11:10:00Z")])],
+        "red")
+verdict("success, then SKIPPED on a re-run, stays green",
+        [run(1, "ci.yml", PR, B, SHA, [job("test", attempt=1),
+                                       job("test", "skipped", attempt=2, steps=[], started="2026-10-01T11:10:00Z")])],
+        "green")
 verdict("failure in one run, success in ANOTHER run of the same workflow, stays red",
         [run(1, "ci.yml", PR, B, SHA, [job("test", "failure")], created="2026-10-01T10:00:00Z"),
          run(2, "ci.yml", PR, B, SHA, [job("test")], created="2026-10-01T10:10:00Z")], "red")
@@ -121,6 +133,14 @@ S.check("important: the earlier security failure is reported", out and len(out["
         out and out["important"])
 S.check("important: a failure from an older PR on the same branch name is ignored",
         out and all(x["run_id"] not in (40, 41) for x in out["important"]), out and out["important"])
+S.check("important: a red that a re-run turned green (the run now says success) is still reported",
+        out and any(x["run_id"] == 51 for x in out["important"]), out and out["important"])
+w = H.World()
+w.branch_history(B, [run(52, "security.yml", PR, B, H.sha(2), [job("gitleaks", "timed_out")],
+                         created="2026-10-01T10:30:00Z", prs=[7])])
+out = verdict("important: a timed-out security job", [run(1, "ci.yml", PR, B, SHA, [job("test")])], "green", world=w,
+              extra=["--important", "gitleaks|secur", "--head-branch", B, "--pr", "7", "--since", "2026-10-01T10:00:00Z"])
+S.check("important: a timed-out security job counts as failed", out and len(out["important"]) == 1, out and out["important"])
 
 # usage
 for label, args in (("--repo without value", ["--sha", SHA, "--repo"]),

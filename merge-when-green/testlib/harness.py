@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import tempfile
+from urllib.parse import quote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("SUT_ROOT") or os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -48,9 +49,15 @@ class World:
 
     # repo files (contents API)
     def file(self, path, text, ref=None):
+        """A file of the repo, served by the contents API (percent-encoded like mwg.contents_path).
+        `text=None` registers nothing (the path 404s)."""
+        import hashlib
         ref = ref or self.default
-        self.r("GET", "repos/%s/contents/%s?ref=%s" % (self.repo, path, ref),
-               {"type": "file", "path": path, "content": base64.b64encode(text.encode()).decode()})
+        if text is None:
+            return
+        self.r("GET", "repos/%s/contents/%s?ref=%s" % (self.repo, quote(path, safe="/"), quote(ref, safe="")),
+               {"type": "file", "path": path, "sha": hashlib.sha1(text.encode()).hexdigest(),
+                "content": base64.b64encode(text.encode()).decode()})
 
     def workflows(self, files, ref=None):
         ref = ref or self.default
@@ -173,7 +180,13 @@ class World:
         self.branch_history(p["head"]["ref"], [])
         self.comments(n)
         self.commits(n)
+        self.events(n)
         return p
+
+    def events(self, n, labelled=()):
+        """The issue events of #n: one `labeled` event per name in `labelled`."""
+        self.pages("repos/%s/issues/%d/events?per_page=100" % (self.repo, n),
+                   [[{"event": "labeled", "label": {"name": x}} for x in labelled]])
 
     def save(self, path):
         with open(path, "w", encoding="utf-8") as fh:
@@ -201,10 +214,13 @@ def job(name, conclusion="success", status="completed", attempt=1, steps=None, s
 
 
 def run(rid, wf, event, branch, head_sha, jobs, attempt=None, created=None, name=None, prs=None):
+    # like GitHub: the run's status and conclusion are those of its LATEST attempt
+    last = max([j["run_attempt"] for j in jobs] or [1])
+    latest = [j for j in jobs if j["run_attempt"] == last]
     conclusion = "success"
-    if any(j["status"] != "completed" for j in jobs):
+    if any(j["status"] != "completed" for j in latest):
         conclusion = None
-    elif any(j["conclusion"] not in ("success", "skipped", "neutral") for j in jobs):
+    elif any(j["conclusion"] not in ("success", "skipped", "neutral") for j in latest):
         conclusion = "failure"
     return {"id": rid, "name": name or wf.split(".")[0], "path": ".github/workflows/%s" % wf, "event": event,
             "head_branch": branch, "head_sha": head_sha, "status": "completed" if conclusion else "in_progress",

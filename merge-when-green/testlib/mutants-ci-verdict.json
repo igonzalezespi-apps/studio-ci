@@ -58,5 +58,23 @@
   "why": "other Apps' failures ignored",
   "old": "            st = \"red\"\n",
   "new": "            st = \"green\"\n"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "the latest attempt wins even when it skipped (failure then SKIPPED is green)",
+  "old": "return (_job_state(job)[0] != \"skipped\", attempt, started or \"\")",
+  "new": "return (True, attempt, started or \"\")"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "important skips every successful run (a red a re-run turned green is lost)",
+  "old": "if r.get(\"conclusion\") == \"success\" and int(r.get(\"run_attempt\") or 1) == 1:",
+  "new": "if r.get(\"conclusion\") == \"success\":"
+ },
+ {
+  "file": "merge-when-green/ci_verdict.py",
+  "why": "important ignores timed_out",
+  "old": "if j.get(\"conclusion\") not in (\"failure\", \"timed_out\"):",
+  "new": "if j.get(\"conclusion\") not in (\"failure\",):"
  }
 ]
