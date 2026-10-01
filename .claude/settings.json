@@ -20,8 +20,10 @@
     "ivan": {
       "source": {
         "source": "github",
-        "repo": "igonzalezespi-apps/claude-plugins"
-      }
+        "repo": "igonzalezespi-apps/claude-plugins",
+        "ref": "main"
+      },
+      "autoUpdate": true
     }
   },
   "outputStyle": "core-dev:owner"
