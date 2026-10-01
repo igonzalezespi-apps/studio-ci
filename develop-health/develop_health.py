@@ -513,11 +513,15 @@ def main(argv):
             ctx = pr_merge.Context(gh, repo, a["repo_dir"], a["config"], a["selftest_config"])
             plan = assess(gh, ctx, a["mode"], a["run_url"], write=not a["selftest_config"])
             # The owner's queue is not the branch's health: a failure here is reported, and never
-            # turns a measured branch into "could not measure".
+            # turns a measured branch into "could not measure" — whatever it is. An exception that
+            # escaped to main() would exit 2 before the outputs are set, and the revert job, which
+            # reads them, would not run: an opt-in notice must never cost a revert.
             try:
                 plan["owner_alerts"] = owner_alerts(gh, ctx, mentions, hours, not a["selftest_config"], a["run_url"])
             except mwg.ApiError as e:
                 plan["notes"].append("owner alert: could not read the queue (%s)" % e)
+            except Exception as e:  # noqa: BLE001 — see above
+                plan["notes"].append("owner alert: failed (%s: %s)" % (type(e).__name__, e))
             if a["selftest_config"]:
                 plan["notes"].append("self-test: nothing written")
         plan["api_calls"] = gh.calls

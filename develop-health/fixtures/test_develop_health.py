@@ -390,6 +390,12 @@ res = alert(w)
 S.check("the queue cannot be read: the branch's verdict still stands, and it says so",
         res["rc"] == 0 and res["plan"].get("action") == "none" and "owner alert" in json.dumps(res["plan"]["notes"]),
         (res["rc"], res["plan"].get("notes"), res["err"]))
+# Not only an API error: anything the alert trips on (here a date GitHub would never send) is a note.
+# A run that died instead would set no outputs, and the revert job reads them.
+res = alert(alert_world([dict(FLAG3, n=11, flagged="2026-09-30T10:00:00Z", created="not-a-date")]))
+S.check("the alert trips on something unexpected: the branch's verdict still stands, and it says so",
+        res["rc"] == 0 and res["plan"].get("action") == "none" and "owner alert: failed" in json.dumps(res["plan"]["notes"]),
+        (res["rc"], res["plan"].get("notes"), res["err"]))
 
 # ── self-test: this repository's own CI reads a real repo and writes nothing at all ─────────────────
 SC = os.path.join(H.ROOT, "merge-when-green", "selftest.json")

@@ -184,5 +184,11 @@
   "why": "owner alert classifies without a cap",
   "old": "            if classified >= OWNER_ALERT_CLASSIFY_MAX:",
   "new": "            if False:"
+ },
+ {
+  "file": "develop-health/develop_health.py",
+  "why": "owner alert: only an API error is contained (anything else kills the run and its outputs)",
+  "old": "            except Exception as e:  # noqa: BLE001 — see above\n                plan[\"notes\"].append(\"owner alert: failed (%s: %s)\" % (type(e).__name__, e))",
+  "new": ""
  }
 ]
