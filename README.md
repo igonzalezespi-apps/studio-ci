@@ -660,6 +660,19 @@ re-judges it on every run with those same rules and escalates if it was closed w
 cannot merge (red, in conflict, altered) or has been open for more than two hours. If the branch
 turns green first (a fix went in), it lifts the freeze and closes the revert unmerged.
 
+**The owner's queue (opt-in, `owner-alert: <login>[,<login>]`).** On the same runs — no run of its
+own, so no extra minutes — develop-health looks at the PRs waiting on the owner: open, ready, and
+labelled `revision-humana`, or a promotion into the protected branch. One that is **riesgo-4** (the
+`riesgo:N` label merge-when-green puts; a promotion is 4 by definition; a flagged PR without the
+label is classified here with the same classifier and labelled, five per run) gets one comment that
+@mentions those accounts **at once**; one that is **riesgo-3**, after **24 h** (`owner-alert-hours`,
+default `4=0,3=24`). The mention is GitHub's own notification — the mobile app's push, or mail —
+written with GITHUB_TOKEN: no credential. Waiting starts at the latest of opened, marked ready and
+labelled `revision-humana`; one comment per class per waiting spell, five per run at most. Lower
+classes are not mentioned: they wait in the owner's list (`gh search issues --owner <org> --label
+revision-humana --state open --include-prs`). Written in dry mode too (it is a notice, not an action
+on the code); never in the self-test.
+
 ### Adopting it
 
 1. `.github/merge-when-green.json` on the integration branch (it is riesgo-3 itself, and it is
@@ -733,6 +746,7 @@ turns green first (a fix went in), it lifts the freeze and closes the revert unm
        uses: igonzalezespi-apps/studio-ci/.github/workflows/develop-health.yml@<sha> # vX.Y.Z
        with:
          mode: ${{ vars.MERGE_WHEN_GREEN_MODE || 'dry' }}
+         owner-alert: "<the owner's login>"   # optional: the riesgo-3/4 push, see develop-health.yml
    ```
 
    The push CI of the integration branch must never cancel or replace a run: every pushed commit
