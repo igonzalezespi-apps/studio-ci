@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+
+# Claude Code: track .claude/settings.json only; keep per-machine / transient state out
+# (per-task git worktrees and the live session board).
+.claude/settings.local.json
+.claude/worktrees/
+.claude/tablero/
