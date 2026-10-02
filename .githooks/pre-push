@@ -11,12 +11,13 @@
 # scanned messages on the way out.
 #
 # Scans two surfaces of the outgoing commits: the files they change, and their messages.
-# The denylist is private (studio repo only); this is a no-op off-studio, e.g. on a fork.
+# The denylist is private (studio repo only; $STUDIO_ROOT, by default ~/projects/studio);
+# this is a no-op off-studio, e.g. on a fork.
 #
 # Enable per clone via bootstrap.sh (git config core.hooksPath .githooks).
 set -eu
 
-GUARD="${STUDIO_ROOT:-$HOME/work}/security/check-private-refs.sh"
+GUARD="${STUDIO_ROOT:-$HOME/projects/studio}/security/check-private-refs.sh"
 [ -x "$GUARD" ] || exit 0
 
 git fetch origin main --quiet 2>/dev/null || true
