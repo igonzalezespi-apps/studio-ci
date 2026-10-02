@@ -27,6 +27,6 @@ jobs:
     name: check-pr-tldr
     runs-on: ubuntu-latest
     steps:
-      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@de6c01692b9d225205f771c4a8f95a2e15176cd1 # v0.8.2
+      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@a9e9d92b63ec8353646510a3112e0a03eee72c02 # v0.11.1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
