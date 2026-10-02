@@ -27,7 +27,7 @@ jobs:
     name: check-pr-tldr
     runs-on: ubuntu-latest
     steps:
-      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@a9e9d92b63ec8353646510a3112e0a03eee72c02 # v0.11.1
+      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@0f8ad32bddc3245a0522820c6994834d11dcb122 # v0.11.2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           # Las PROMOCIONES (`develop` -> `main`) se juzgan SIEMPRE, lleven o no la marca: son

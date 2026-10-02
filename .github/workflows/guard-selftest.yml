@@ -34,7 +34,7 @@ jobs:
         # Su contrato de salida distingue las tres respuestas: 0 sanos, 1 al menos una violacion,
         # y 2 NO SE PUDO MEDIR (sin `gh`, API caida, o cero workflows — un glob roto no es un
         # verde). Los tres hacen lo correcto aqui: solo el 0 deja pasar.
-        uses: igonzalezespi-apps/studio-ci/check-action-pins@a9e9d92b63ec8353646510a3112e0a03eee72c02 # v0.11.1
+        uses: igonzalezespi-apps/studio-ci/check-action-pins@0f8ad32bddc3245a0522820c6994834d11dcb122 # v0.11.2
         with:
           github-token: ${{ github.token }}
 
