@@ -50,7 +50,14 @@ concurrency:
   # Y NO se arregla quitando `opened` de los `types`: una PR abierta SIN etiqueta no dispararia
   # nada, el check no existiria y el gate desapareceria en silencio. Un fail-open es peor que un
   # rojo.
-  group: require-semver-label-${{ github.event.pull_request.number }}
+  #
+  # El grupo es por PR Y POR COMMIT (`head.sha`; `github.sha` si el evento no trae PR). Con `false`,
+  # GitHub no mata la run en marcha, pero de las que ESPERAN solo deja la ultima: descarta la otra
+  # sin jobs y sin check. Y las runs no se crean en el orden de sus eventos: con el grupo por PR, un
+  # `labeled` del commit viejo creado tarde descartaba la espera del `synchronize` del nuevo, y ese
+  # commit se quedaba sin este check para siempre. Por commit solo se juntan las runs de un mismo
+  # commit (`opened`/`labeled`/`unlabeled` sin push), y la que queda es siempre de ese commit.
+  group: require-semver-label-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 
 permissions:
