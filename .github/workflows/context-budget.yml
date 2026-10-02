@@ -8,8 +8,12 @@
 # lo que las suites locales no pueden ver. Por eso tampoco lee las etiquetas en vivo, como hacen los
 # consumidores: aqui se prueba el valor por defecto que trae la accion.
 #
-# SOLO AVISO: el modo, con su porque, esta en `.github/context-budget.json` (asi una ejecucion
-# local da lo mismo que la CI). Un rojo permanente aqui enseñaria a ignorarlo.
+# BLOQUEANTE: develop da 0 violaciones y 0 avisos. El modo, con su porque, esta en
+# `.github/context-budget.json` y no aqui, para que una ejecucion local (`context-budget.sh --root .`)
+# de lo mismo que la CI. Los dos ficheros estan en `reserved_paths_hard` del guard: aflojar este
+# control lo decide el mantenedor. Como la etiqueta llega del payload del evento, en el caso raro de
+# que el run de `opened` se cree despues que el de `labeled`, un exceso aprobado puede quedar en
+# rojo: se relanza el job.
 #
 # Escucha `labeled`/`unlabeled` porque la aprobacion de un exceso de presupuesto va por etiqueta
 # (`presupuesto-contexto-aprobado`). Por eso vive en su propio workflow y no en ci.yml: alli una
@@ -27,7 +31,7 @@ permissions:
 
 jobs:
   context-budget:
-    name: context-budget (este repo, solo aviso)
+    name: context-budget (este repo)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

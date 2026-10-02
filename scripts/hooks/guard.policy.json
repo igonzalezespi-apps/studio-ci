@@ -9,5 +9,15 @@
     "::1",
     "www.githubstatus.com"
   ],
-  "owner_lens": true
+  "owner_lens": true,
+  "reserved_paths_hard": [
+    {
+      "glob": ".github/context-budget.json",
+      "why": "la configuracion de context-budget: modo, topes y checks que solo avisan. Aflojarla es decision del mantenedor"
+    },
+    {
+      "glob": ".github/workflows/context-budget.yml",
+      "why": "el workflow que corre context-budget desde su propia ruta: quitarlo o cambiarle el modo afloja el control"
+    }
+  ]
 }

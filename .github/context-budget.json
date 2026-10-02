@@ -1,7 +1,7 @@
 {
-  "_que": "Configuracion de context-budget (studio-ci v0.8.2) en este repo. Cada clave sustituye entera al valor de fabrica; las que no estan aqui son las de fabrica. Las claves con _ son comentarios.",
-  "mode": "warn",
-  "_mode": "Solo aviso hasta que este repo pase su dieta de contexto (plan maestro E5.1b). Hoy sale limpio: 0 violaciones y 0 avisos. Para bloquear, enforce.",
+  "_que": "Configuracion de context-budget en este repo. Cada clave sustituye entera al valor de fabrica; las que no estan aqui son las de fabrica. Las claves con _ son comentarios.",
+  "mode": "enforce",
+  "_mode": "Bloqueante: develop da 0 violaciones y 0 avisos. Un exceso de presupuesto (size, descriptions, dated) lo deja pasar el mantenedor con la etiqueta presupuesto-contexto-aprobado; un error de configuracion no tiene valvula. Este fichero y su workflow estan en reserved_paths_hard: aflojarlos es decision del mantenedor.",
   "output_style_expected": "core-dev:owner",
   "_output_style_expected": "El estilo acordado para todos los repos. Sin una copia del marketplace en la CI, un estilo inexistente de un plugin habilitado (core-dev:lo-que-sea) no se puede ver de otra forma: fijar el acordado hace que cualquier otro valor salga marcado."
 }

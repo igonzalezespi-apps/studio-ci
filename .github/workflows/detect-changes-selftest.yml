@@ -1,0 +1,182 @@
+# Runs ./detect-changes for real in GitHub, over a table of changes staged in the checkout.
+#
+# WHY. `functional` decides whether a consuming repo runs its test suite at all, and which bucket a
+# path falls in is decided by paths-filter's own glob dialect (picomatch, dotfiles included), which
+# the local suite cannot run. `base: HEAD` makes paths-filter diff the working tree against HEAD,
+# so each scenario stages exactly the files it names and reads the real outputs back: the pinned
+# action, the composite wiring, and both calls (the buckets and the catch-all count).
+# detect-changes/action.test.sh covers the arithmetic of the last step and its mutants.
+#
+# Only on the pull requests that touch detect-changes; each scenario is its own job, so one red
+# names the scenario that broke.
+name: detect-changes-selftest
+
+on:
+  pull_request:
+    paths:
+      - detect-changes/**
+      - .github/workflows/detect-changes-selftest.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scenario:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: documentation only
+            add: [README.md, docs/guide/shot.png, openspec/changes/demo/.openspec.yaml, openspec/specs/demo/spec.md,
+                  .claude/rules/demo.md, .claude/skills/demo/SKILL.md, .agents/skills/demo/SKILL.md,
+                  .cursor/rules/demo.mdc, .cursor/rules/team/style.mdc]
+            delete: [LICENSE]
+            filters: ""
+            functional: "false"
+            docs: "true"
+          # docs "false": not one of these files is documentation, whatever folder holds it.
+          - name: agent hooks, settings and scripts
+            add: [.claude/settings.json, .claude/hooks/guard.sh, .claude/skills/demo/scripts/scan.sh,
+                  .agents/skills/demo/run.py, .cursor/mcp.json]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "false"
+          - name: markdown under a test folder
+            add: [test/golden/expected.md]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "true"
+          - name: markdown under a nested tests folder
+            add: [.claude/skills/demo/tests/case.md]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "true"
+          - name: a script outside the code roots
+            add: [scripts/build.sh, README.md]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "true"
+          - name: root tool configuration
+            add: [tsconfig.json, vitest.config.ts, turbo.json, eslint.config.mjs, renovate.json, .gitignore]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "false"
+          - name: end-to-end tests
+            add: [e2e/login.spec.ts]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "false"
+          - name: markdown inside a code root
+            add: [packages/demo/README.md]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "true"
+          - name: a markdown test fixture
+            add: [context-budget/fixtures/limpio/README.md]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "true"
+          - name: OpenSpec configuration
+            add: [openspec/config.yaml]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "false"
+          - name: a deleted script
+            add: []
+            delete: [bootstrap.sh]
+            filters: ""
+            functional: "true"
+            docs: "false"
+          - name: nothing changed
+            add: []
+            delete: []
+            filters: ""
+            functional: "false"
+            docs: "false"
+          - name: override without a docs bucket
+            add: [README.md]
+            delete: []
+            filters: |
+              code:
+                - 'src/**'
+            functional: "true"
+            docs: ""
+          - name: override whose docs bucket covers every change
+            add: [README.md, notes/plan.txt]
+            delete: []
+            filters: |
+              docs:
+                - '**/*.md'
+                - 'notes/**'
+            functional: "false"
+            docs: "true"
+          - name: override with a file outside every bucket
+            add: [README.md, tools/release.sh]
+            delete: []
+            filters: |
+              docs:
+                - '**/*.md'
+              code:
+                - 'src/**'
+            functional: "true"
+            docs: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Stage the scenario's changes
+        env:
+          ADD: ${{ toJSON(matrix.add) }}
+          DELETE: ${{ toJSON(matrix.delete) }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r f; do
+            mkdir -p -- "$(dirname -- "$f")"
+            printf 'detect-changes selftest\n' >> "$f"
+          done < <(jq -r '.[]' <<< "$ADD")
+          while IFS= read -r f; do
+            git rm -q -- "$f"
+          done < <(jq -r '.[]' <<< "$DELETE")
+          git add -A
+          git status --short
+
+      - id: d
+        uses: ./detect-changes
+        with:
+          base: HEAD
+          filters: ${{ matrix.filters }}
+
+      - name: Check the outputs
+        env:
+          WANT_FUNCTIONAL: ${{ matrix.functional }}
+          GOT_FUNCTIONAL: ${{ steps.d.outputs.functional }}
+          WANT_DOCS: ${{ matrix.docs }}
+          GOT_DOCS: ${{ steps.d.outputs.docs }}
+        run: |
+          set -uo pipefail
+          rc=0
+          if [ "$GOT_FUNCTIONAL" != "$WANT_FUNCTIONAL" ]; then
+            echo "::error::functional is '$GOT_FUNCTIONAL', want '$WANT_FUNCTIONAL'"; rc=1
+          fi
+          if [ "$GOT_DOCS" != "$WANT_DOCS" ]; then
+            echo "::error::docs is '$GOT_DOCS', want '$WANT_DOCS'"; rc=1
+          fi
+          echo "functional=$GOT_FUNCTIONAL docs=$GOT_DOCS"
+          exit "$rc"

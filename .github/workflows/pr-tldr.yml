@@ -27,6 +27,14 @@ jobs:
     name: check-pr-tldr
     runs-on: ubuntu-latest
     steps:
-      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@de6c01692b9d225205f771c4a8f95a2e15176cd1 # v0.8.2
+      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@a9e9d92b63ec8353646510a3112e0a03eee72c02 # v0.11.1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Las PROMOCIONES (`develop` -> `main`) se juzgan SIEMPRE, lleven o no la marca: son
+          # releases y las lee el mantenedor. Ademas de las reglas de arriba, se les aplican las del
+          # resumen de release: sus cuatro campos («Qué notarán los usuarios», «Qué puede salir mal y
+          # cómo se deshace», «Decisiones tuyas que van dentro», «Qué NO se ha comprobado») con texto
+          # en la MISMA linea del campo (un campo seguido solo de vinetas cuenta como vacio), nada de
+          # codigo en linea ni rutas en la prosa del TL;DR, y `gh pr merge <n> --repo <o/n> --merge`
+          # de ESA PR en un bloque bash. Necesita studio-ci >= v0.10.0. Las demas PRs no cambian.
+          promotion: "true"

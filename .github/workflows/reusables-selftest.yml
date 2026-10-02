@@ -71,3 +71,41 @@ jobs:
     with:
       selftest: true
       mode: dry
+
+  # The hosted-image test in the `if:` of the plan and assess jobs above only runs in a private
+  # repository, so GitHub never evaluates it here. This job has GitHub's own evaluator compute the
+  # same expression over the runner values that matter (a label, a JSON list, capitals, an own label
+  # that merely contains a hosted prefix). merge-autonomo.test.sh checks that it is the same
+  # expression as in both workflows, with `inputs.runs-on` read from the matrix.
+  hosted-image-expression:
+    name: hosted image? ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: ubuntu-latest, hosted: "true" }
+          - { label: macos-14, hosted: "true" }
+          - { label: windows-2025, hosted: "true" }
+          - { label: Ubuntu-24.04, hosted: "true" }
+          - { label: '["ubuntu-latest"]', hosted: "true" }
+          - { label: '["gpu", "macos-15"]', hosted: "true" }
+          - { label: '["WINDOWS-LATEST"]', hosted: "true" }
+          - { label: studio, hosted: "false" }
+          - { label: '["studio", "gpu"]', hosted: "false" }
+          - { label: gpu-ubuntu-box, hosted: "false" }
+          - { label: '["gpu", "my-macos-box"]', hosted: "false" }
+    steps:
+      - name: Evaluate
+        env:
+          GOT: >-
+            ${{
+            contains(format(',{0}', join(startsWith(matrix.label, '[') && fromJSON(matrix.label) || matrix.label, ',')), ',ubuntu-') ||
+            contains(format(',{0}', join(startsWith(matrix.label, '[') && fromJSON(matrix.label) || matrix.label, ',')), ',windows-') ||
+            contains(format(',{0}', join(startsWith(matrix.label, '[') && fromJSON(matrix.label) || matrix.label, ',')), ',macos-')
+            }}
+          WANT: ${{ matrix.hosted }}
+        run: |
+          echo "hosted: $GOT (want $WANT)"
+          [ "$GOT" = "$WANT" ]
