@@ -68,14 +68,37 @@ jobs:
 > not only at the top level. Symptom when it's missing: `Resource not accessible by integration`.
 
 Buckets: `docs`, `ci`, `deps`, `code`, `e2e_relevant`, `db_migration`, `i18n`, `assets`, plus a
-derived `functional` — true for anything but a **pure docs change**. A `ci` or `deps` change counts
-as functional on purpose (fail-safe: a workflow or lockfile change can break the build, so run the
-full suite). Override the defaults:
+derived `functional` — true for anything but a **pure docs change**. `docs` is an exclusion list:
+a changed file outside it is functional whether or not another bucket names its path (scripts, root
+tool configs, `e2e/`, platform folders…), so a path nobody listed runs the suite instead of skipping
+it. A file that `docs` and another canonical bucket both match is functional too: a README inside
+`packages/`, a Markdown test fixture, a template under `.github/`. A `ci` or `deps` change counts as
+functional on purpose (fail-safe: a workflow or lockfile change can break the build, so run the
+full suite).
+
+The default `docs` is documentation only, never something a build, a test or a script runs or
+reads: Markdown anywhere, `docs/`, the content of OpenSpec (`openspec/changes/`, `openspec/specs/`;
+its config and schemas are functional), Cursor's rule files (`.cursor/rules/**/*.mdc`) and licence
+texts (`LICENSE*`). Agent folders are not documentation as a whole: their hooks, settings and
+scripts are functional, only their Markdown is docs. The default `code` also holds test folders and
+fixtures, whatever their extension (`test/`, `tests/`, `__tests__/`, `integration_test/`, `e2e/`,
+`fixtures/`, `__fixtures__/`, `testdata/`, `__snapshots__/` at any depth), so a Markdown file a test
+reads there is functional.
+
+Override the defaults (the input **replaces** them: restate every bucket you gate on). The same rule
+applies to your buckets: `functional` is false only when every changed file is in your `docs`
+bucket and in none of `code`, `deps`, `ci`, `e2e_relevant`, `db_migration`, `i18n`, `assets`; an
+override without a `docs` bucket makes every change functional. Up to v0.11.1, `functional` only
+looked at the non-docs buckets, so a PR touching only paths that no bucket listed skipped the suite,
+and the default `docs` took the whole `.claude/` folder, hooks and settings included.
 
 ```yaml
       - uses: igonzalezespi-apps/studio-ci/detect-changes@v0.1.2
         with:
           filters: |
+            docs:
+              - '**/*.md'
+              - 'docs/**'
             e2e_relevant:
               - 'apps/web/**'
 ```

@@ -17,7 +17,7 @@ inputs:
 
 outputs:
   docs:
-    description: "Docs / markdown / spec-proposal / agent files only."
+    description: "Documentation: Markdown, docs/, OpenSpec changes and specs, Cursor rules, licence texts."
     value: ${{ steps.filter.outputs.docs }}
   ci:
     description: "Workflows / Dockerfiles / compose."
@@ -26,7 +26,7 @@ outputs:
     description: "Lockfiles / manifests."
     value: ${{ steps.filter.outputs.deps }}
   code:
-    description: "Functional source."
+    description: "Functional source, and test folders and fixtures whatever their extension."
     value: ${{ steps.filter.outputs.code }}
   e2e_relevant:
     description: "User-facing / runtime surfaces (gate e2e)."
@@ -41,7 +41,7 @@ outputs:
     description: "Bundled human-authored assets."
     value: ${{ steps.filter.outputs.assets }}
   functional:
-    description: "true when any non-(docs|ci-only) bucket matched → run the full suite."
+    description: "true unless every changed file is documentation (matched by the docs bucket and by no other canonical bucket) → run the full suite."
     value: ${{ steps.functional.outputs.value }}
 
 runs:
@@ -50,13 +50,24 @@ runs:
     - name: Write default filters
       id: defaults
       shell: bash
+      # `docs` is an EXCLUSION list: whatever it does not match is functional (see the last step),
+      # so a path missing from every bucket runs the suite instead of skipping it. Only
+      # documentation goes here: what people and agents read, and what only documentation tooling
+      # reads with it (images under docs/, OpenSpec's change metadata); nothing a build, a test or
+      # a script runs or reads as input. So no whole agent folder: .claude/, .agents/ and .cursor/
+      # also hold hooks, settings and scripts that CI runs, and only their Markdown and Cursor's
+      # rule files are documentation. A Markdown file under another bucket's path
+      # (packages/x/README.md, a test folder, a fixture) is still functional: that bucket matches
+      # it too.
       run: |
         cat > "$RUNNER_TEMP/detect-filters.yml" <<'YML'
         docs:
           - '**/*.md'
           - 'docs/**'
-          - 'openspec/changes/*/proposal.md'
-          - '.claude/**'
+          - 'openspec/changes/**'
+          - 'openspec/specs/**'
+          - '.cursor/rules/**/*.mdc'
+          - '**/LICENSE*'
         ci:
           - '.github/**'
           - 'Dockerfile*'
@@ -71,6 +82,15 @@ runs:
           - 'packages/**'
           - 'src/**'
           - 'lib/**'
+          - '**/test/**'
+          - '**/tests/**'
+          - '**/__tests__/**'
+          - '**/integration_test/**'
+          - '**/e2e/**'
+          - '**/fixtures/**'
+          - '**/__fixtures__/**'
+          - '**/testdata/**'
+          - '**/__snapshots__/**'
         e2e_relevant:
           - 'apps/**/app/**'
           - 'apps/**/src/**'
@@ -96,23 +116,55 @@ runs:
         # A caller override is passed inline; otherwise the default-filters file.
         filters: ${{ inputs.filters != '' && inputs.filters || steps.defaults.outputs.file }}
 
+    # The same diff again, counted whole. A caller's override may name any buckets, so the changed
+    # files cannot be added up from them; one catch-all filter over the same base sees them all.
+    - name: Count every changed file
+      id: all
+      uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+      with:
+        base: ${{ inputs.base }}
+        filters: |
+          changed:
+            - '**'
+
     - name: Compute "functional"
       id: functional
       shell: bash
+      env:
+        CODE: ${{ steps.filter.outputs.code }}
+        DEPS: ${{ steps.filter.outputs.deps }}
+        CI: ${{ steps.filter.outputs.ci }}
+        E2E_RELEVANT: ${{ steps.filter.outputs.e2e_relevant }}
+        DB_MIGRATION: ${{ steps.filter.outputs.db_migration }}
+        I18N: ${{ steps.filter.outputs.i18n }}
+        ASSETS: ${{ steps.filter.outputs.assets }}
+        DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
+        CHANGED_COUNT: ${{ steps.all.outputs.changed_count }}
       run: |
-        # functional = anything but a pure docs change. A CI/deps change is included on
-        # purpose (fail-safe: it can break the build, so run the full suite).
+        # functional = anything but a pure docs change. Two ways to be functional:
+        #  - a canonical non-docs bucket matched. A CI/deps change counts on purpose (fail-safe: it
+        #    can break the build), and so does a doc file inside one of those paths;
+        #  - a changed file is outside the docs bucket. The buckets are an inclusion list and never
+        #    cover every path (scripts/, root tool configs, e2e/...): before this rule a PR touching
+        #    only such paths skipped the suite. Every docs match is a changed file, so "more
+        #    changed files than docs matches" is exactly "some file is not docs".
         f=false
-        for b in code deps ci e2e_relevant db_migration i18n assets; do
-          case "$b" in
-            code)         v='${{ steps.filter.outputs.code }}' ;;
-            deps)         v='${{ steps.filter.outputs.deps }}' ;;
-            ci)           v='${{ steps.filter.outputs.ci }}' ;;
-            e2e_relevant) v='${{ steps.filter.outputs.e2e_relevant }}' ;;
-            db_migration) v='${{ steps.filter.outputs.db_migration }}' ;;
-            i18n)         v='${{ steps.filter.outputs.i18n }}' ;;
-            assets)       v='${{ steps.filter.outputs.assets }}' ;;
-          esac
-          [ "$v" = "true" ] && f=true
+        for v in "$CODE" "$DEPS" "$CI" "$E2E_RELEVANT" "$DB_MIGRATION" "$I18N" "$ASSETS"; do
+          if [ "$v" = "true" ]; then f=true; fi
         done
+        # No `docs` bucket in an override: nothing is documentation, every change is functional.
+        docs="${DOCS_COUNT:-0}"
+        changed="${CHANGED_COUNT:-}"
+        case "$changed" in
+          '' | *[!0-9]*)
+            echo "::error::detect-changes could not count the changed files ('$changed'): never treat that as a docs-only change"
+            exit 1 ;;
+        esac
+        case "$docs" in
+          *[!0-9]*)
+            echo "::error::detect-changes got a non-numeric docs count ('$docs')"
+            exit 1 ;;
+        esac
+        if [ "$changed" -gt "$docs" ]; then f=true; fi
+        echo "changed files: $changed, documentation: $docs, functional: $f"
         echo "value=$f" >> "$GITHUB_OUTPUT"
