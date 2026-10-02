@@ -285,12 +285,16 @@ def eval_if(expr, private, allow, runs_on):
 
 def hosted_cases(name, job_id, job):
     expr = str(job.get("if") or "")
+    # The own-runner cases use made-up labels that no runner of ours carries. This directory
+    # belongs to a public repo, and a public repo's workflow directory never names a label that
+    # routes a job to a machine of ours, tests and comments included: a fork's pull request runs
+    # its own copy of these files.
     cases = (("public, hosted", False, False, "ubuntu-latest", True),
              ("private, hosted by default: never starts", True, False, "ubuntu-latest", False),
              ("private, another hosted image", True, False, "macos-14", False),
              ("private, opted in", True, True, "ubuntu-latest", True),
-             ("private, own runner label", True, False, "self-hosted", True),
-             ("private, own runner JSON list", True, False, '["self-hosted", "studio"]', True))
+             ("private, own runner label", True, False, "studio", True),
+             ("private, own runner JSON list", True, False, '["studio", "gpu"]', True))
     for label, private, allow, runs_on, want in cases:
         try:
             got = eval_if(expr, private, allow, runs_on)
@@ -381,6 +385,8 @@ mutate "$DH" "the revert job without an Environment" 'text.replace("    environm
 mutate "$DH" "the revert on any ref" 'text.replace("[ \"$REF\" = \"refs/heads/$DEFAULT_BRANCH\" ] || { echo \"::warning::ref $REF is not the default branch\"; ok=false; }", "true", 1)'
 mutate "$MWG" "a private repo runs the plan on a hosted runner" 'text.replace("!github.event.repository.private || inputs.allow-hosted ||", "true ||", 1)'
 mutate "$DH" "a private repo runs assess on a hosted runner" 'text.replace("!github.event.repository.private || inputs.allow-hosted ||", "true ||", 1)'
+mutate "$MWG" "a private repo's own runner never starts the plan" 'text.replace("startsWith(inputs.runs-on, '"'"'macos-'"'"'))", "startsWith(inputs.runs-on, '"'"'macos-'"'"') || startsWith(inputs.runs-on, '"'"''"'"'))", 1)'
+mutate "$DH" "a private repo's own runner never starts assess" 'text.replace("startsWith(inputs.runs-on, '"'"'macos-'"'"'))", "startsWith(inputs.runs-on, '"'"'macos-'"'"') || startsWith(inputs.runs-on, '"'"''"'"'))", 1)'
 mutate "$MWG" "the plan does not read the hook settings" 'text.replace("            /.claude/settings.json\n", "", 1)'
 mutate "$DH" "the assess job reads the key" 'text.replace("          MWG_READ_TOKEN: ${{ github.token }}\n          REPO: ${{ github.repository }}\n          MODE:", "          MWG_READ_TOKEN: ${{ github.token }}\n          K: ${{ secrets.MERGE_APP_PRIVATE_KEY }}\n          REPO: ${{ github.repository }}\n          MODE:", 1)'
 
