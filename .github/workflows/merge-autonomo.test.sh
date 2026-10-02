@@ -271,16 +271,144 @@ def body_cases(name, doc):
             fail("%s assess body: owner-alert not passed through (%s)" % (name, open(log).read()[-200:]))
 
 
+TOK = re.compile(r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>-?\d+(?:\.\d+)?)"
+                 r"|(?P<op>&&|\|\||==|!=|!|\(|\)|,)|(?P<id>[A-Za-z_][A-Za-z0-9_.\-]*))")
+
+
+def gh_str(v):
+    if v is None:
+        return ""
+    if v is True or v is False:
+        return "true" if v else "false"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    if isinstance(v, list):
+        return "Array"
+    if isinstance(v, dict):
+        return "Object"
+    return str(v)
+
+
+def gh_truthy(v):
+    return not (v is None or v is False or v == "" or (isinstance(v, (int, float)) and not isinstance(v, bool) and (v == 0 or v != v)))
+
+
+def gh_eq(a, b):
+    if isinstance(a, str) and isinstance(b, str):
+        return a.lower() == b.lower()
+    return a == b
+
+
+def gh_format(f, *args):
+    out = re.sub(r"\{(\d+)\}", lambda m: gh_str(args[int(m.group(1))]), f.replace("{{", "\0").replace("}}", "\1"))
+    return out.replace("\0", "{").replace("\1", "}")
+
+
+GH_FUNCS = {
+    "startswith": lambda s, p: gh_str(s).lower().startswith(gh_str(p).lower()),
+    "contains": lambda s, i: any(gh_eq(x, i) for x in s) if isinstance(s, list) else gh_str(i).lower() in gh_str(s).lower(),
+    "fromjson": lambda s: json.loads(s),
+    "join": lambda a, sep=",": gh_str(sep).join(gh_str(x) for x in a) if isinstance(a, list) else gh_str(a),
+    "format": gh_format,
+}
+
+
+def gh_eval(expr, ctx):
+    """A GitHub expression evaluated as the runner does it: `&&` and `||` short-circuit and return
+    one of their operands, strings compare without case, and only the functions above and the
+    context paths in `ctx` exist. Anything else raises, so the condition cannot start reading a
+    context this test does not model."""
+    toks, pos, s = [], 0, expr.strip()
+    while pos < len(s):
+        m = TOK.match(s, pos)
+        if not m or m.end() == pos:
+            raise SyntaxError("cannot read %r" % s[pos:])
+        pos = m.end()
+        toks.append(next((k, m.group(k)) for k in ("str", "num", "op", "id") if m.group(k) is not None))
+    i = [0]
+
+    def peek():
+        return toks[i[0]][1] if i[0] < len(toks) else None
+
+    def take(want=None):
+        k, x = toks[i[0]]
+        if want is not None and x != want:
+            raise SyntaxError("expected %r, got %r" % (want, x))
+        i[0] += 1
+        return k, x
+
+    # The parser builds closures, so an operand runs only when its operator asks for it.
+    def p_or():
+        left = p_and()
+        while peek() == "||":
+            take()
+            right = p_and()
+            left = (lambda l, r: lambda: (lambda v: v if gh_truthy(v) else r())(l()))(left, right)
+        return left
+
+    def p_and():
+        left = p_cmp()
+        while peek() == "&&":
+            take()
+            right = p_cmp()
+            left = (lambda l, r: lambda: (lambda v: r() if gh_truthy(v) else v)(l()))(left, right)
+        return left
+
+    def p_cmp():
+        left = p_not()
+        while peek() in ("==", "!="):
+            op = take()[1]
+            right = p_not()
+            left = (lambda l, r, op: lambda: gh_eq(l(), r()) == (op == "=="))(left, right, op)
+        return left
+
+    def p_not():
+        if peek() == "!":
+            take()
+            inner = p_not()
+            return lambda: not gh_truthy(inner())
+        return p_prim()
+
+    def p_prim():
+        k, x = take()
+        if k == "str":
+            v = x[1:-1].replace("''", "'")
+            return lambda: v
+        if k == "num":
+            return lambda: float(x)
+        if x == "(":
+            inner = p_or()
+            take(")")
+            return inner
+        if k == "id" and x in ("true", "false", "null"):
+            return lambda: {"true": True, "false": False, "null": None}[x]
+        if k == "id" and peek() == "(":
+            take("(")
+            args = []
+            if peek() != ")":
+                args.append(p_or())
+                while peek() == ",":
+                    take()
+                    args.append(p_or())
+            take(")")
+            fn = GH_FUNCS[x.lower()]
+            return lambda: fn(*[a() for a in args])
+        if k == "id":
+            if x not in ctx:
+                raise ValueError("unexpected context %r in the hosted-runner condition" % x)
+            return lambda: ctx[x]
+        raise SyntaxError("unexpected %r" % x)
+
+    tree = p_or()
+    if i[0] != len(toks):
+        raise SyntaxError("trailing %r" % toks[i[0]:])
+    return tree()
+
+
 def eval_if(expr, private, allow, runs_on):
-    """The job-level `if:` that keeps a private repo off hosted runners, evaluated for real: the
-    expression is translated to Python (only the operators it uses) and run per scenario."""
-    py = re.sub(r"startsWith\(inputs\.runs-on, '([^']*)'\)", r"runs_on.startswith('\1')", expr)
-    py = py.replace("github.event.repository.private", "private").replace("inputs.allow-hosted", "allow")
-    py = py.replace("||", " or ").replace("&&", " and ")
-    py = re.sub(r"!(?!=)", " not ", py)
-    if re.search(r"[A-Za-z_.-]+\.[A-Za-z_-]+", py.replace("runs_on.startswith", "")):
-        raise ValueError("unexpected context in the hosted-runner condition: %s" % expr)
-    return bool(eval(py, {}, {"private": private, "allow": allow, "runs_on": runs_on}))
+    """The job-level `if:` that keeps a private repo off hosted runners, evaluated for real."""
+    return gh_truthy(gh_eval(expr, {"github.event.repository.private": private,
+                                    "inputs.allow-hosted": allow, "inputs.runs-on": runs_on}))
 
 
 def hosted_cases(name, job_id, job):
@@ -292,9 +420,18 @@ def hosted_cases(name, job_id, job):
     cases = (("public, hosted", False, False, "ubuntu-latest", True),
              ("private, hosted by default: never starts", True, False, "ubuntu-latest", False),
              ("private, another hosted image", True, False, "macos-14", False),
+             ("private, a Windows image", True, False, "windows-2025", False),
+             ("private, a hosted image in capitals", True, False, "Ubuntu-24.04", False),
+             ("private, a hosted image as a JSON list", True, False, '["ubuntu-latest"]', False),
+             ("private, a hosted image second in a JSON list", True, False, '["gpu", "macos-15"]', False),
+             ("private, a hosted image in a JSON list, in capitals", True, False, '["WINDOWS-LATEST"]', False),
              ("private, opted in", True, True, "ubuntu-latest", True),
+             ("private, opted in with a JSON list", True, True, '["ubuntu-latest"]', True),
              ("private, own runner label", True, False, "studio", True),
-             ("private, own runner JSON list", True, False, '["studio", "gpu"]', True))
+             ("private, own runner JSON list", True, False, '["studio", "gpu"]', True),
+             ("private, own label that contains a hosted prefix", True, False, "gpu-ubuntu-box", True),
+             ("private, own JSON list whose label contains a hosted prefix", True, False, '["gpu", "my-macos-box"]', True),
+             ("public, a JSON list is never parsed", False, False, '["ubuntu-latest"', True))
     for label, private, allow, runs_on, want in cases:
         try:
             got = eval_if(expr, private, allow, runs_on)
@@ -302,6 +439,30 @@ def hosted_cases(name, job_id, job):
             got = "error %s" % e
         if got is not want:
             fail("%s/%s hosted-runner guard: %s -> %s (want %s)" % (name, job_id, label, got, want))
+    selftest_expression(name, job_id, expr)
+
+
+def selftest_expression(name, job_id, expr):
+    """GitHub never evaluates the hosted-image test in this public repo (it sits behind the
+    private-repo check), so reusables-selftest.yml has GitHub evaluate a copy of it over a table.
+    The copy must be this very expression, and the table must say what this evaluator says: then a
+    difference between the two evaluators turns that job red."""
+    m = re.search(r"inputs\.allow-hosted \|\| !\((.*)\)$", " ".join(expr.split()))
+    if not m:
+        fail("%s/%s: the hosted-image test is not `... || !(<test>)`" % (name, job_id))
+        return
+    inner = m.group(1).strip()
+    st = yaml.safe_load(open(os.environ["SELFTEST_YML"], encoding="utf-8"))
+    job = st["jobs"].get("hosted-image-expression") or {}
+    steps = steps_of(job)
+    got = " ".join(str((steps[0].get("env") or {}).get("GOT", "")).split()) if steps else ""
+    want = "${{ %s }}" % inner.replace("inputs.runs-on", "matrix.label")
+    if got != want:
+        fail("%s/%s: reusables-selftest.yml evaluates another hosted-image test:\n      %s\n      %s" % (name, job_id, got, want))
+    for row in job.get("strategy", {}).get("matrix", {}).get("include", []):
+        mine = gh_truthy(gh_eval(inner, {"inputs.runs-on": row["label"]}))
+        if str(mine).lower() != row["hosted"]:
+            fail("%s/%s: the self-test expects hosted=%s for %s, this evaluator says %s" % (name, job_id, row["hosted"], row["label"], mine))
 
 
 def main(path):
@@ -347,6 +508,7 @@ comprueba() { # <file> <label> <want-exit>
   if [ "$rc" -eq "$3" ]; then ok "$2"; else bad "$2 (exit $rc, want $3)"; printf '%s\n' "$out"; fi
 }
 
+export SELFTEST_YML="$HERE/reusables-selftest.yml"
 echo "== the real files =="
 comprueba "$HERE/merge-when-green.yml" "merge-when-green.yml: static rules, gates and bodies" 0
 comprueba "$HERE/develop-health.yml" "develop-health.yml: static rules, gates and bodies" 0
@@ -385,8 +547,14 @@ mutate "$DH" "the revert job without an Environment" 'text.replace("    environm
 mutate "$DH" "the revert on any ref" 'text.replace("[ \"$REF\" = \"refs/heads/$DEFAULT_BRANCH\" ] || { echo \"::warning::ref $REF is not the default branch\"; ok=false; }", "true", 1)'
 mutate "$MWG" "a private repo runs the plan on a hosted runner" 'text.replace("!github.event.repository.private || inputs.allow-hosted ||", "true ||", 1)'
 mutate "$DH" "a private repo runs assess on a hosted runner" 'text.replace("!github.event.repository.private || inputs.allow-hosted ||", "true ||", 1)'
-mutate "$MWG" "a private repo's own runner never starts the plan" 'text.replace("startsWith(inputs.runs-on, '"'"'macos-'"'"'))", "startsWith(inputs.runs-on, '"'"'macos-'"'"') || startsWith(inputs.runs-on, '"'"''"'"'))", 1)'
-mutate "$DH" "a private repo's own runner never starts assess" 'text.replace("startsWith(inputs.runs-on, '"'"'macos-'"'"'))", "startsWith(inputs.runs-on, '"'"'macos-'"'"') || startsWith(inputs.runs-on, '"'"''"'"'))", 1)'
+mutate "$MWG" "a private repo's own runner never starts the plan" 'text.replace(", '"'"',macos-'"'"'))", ", '"'"',macos-'"'"') || startsWith(inputs.runs-on, '"'"''"'"'))", 1)'
+mutate "$MWG" "a hosted image in a JSON list starts the plan (the list is not flattened)" 'text.replace("join(startsWith(inputs.runs-on, '"'"'['"'"') && fromJSON(inputs.runs-on) || inputs.runs-on, '"'"','"'"')", '"'"'inputs.runs-on'"'"')'
+mutate "$MWG" "a hosted prefix anywhere in a label counts (not tied to its start)" 'text.replace("'"'"',ubuntu-'"'"')", "'"'"'ubuntu-'"'"')", 1)'
+mutate "$MWG" "a Windows image starts the plan" 'text.replace(" ||\n      contains(format('"'"',{0}'"'"', join(startsWith(inputs.runs-on, '"'"'['"'"') && fromJSON(inputs.runs-on) || inputs.runs-on, '"'"','"'"')), '"'"',windows-'"'"')", '"'"''"'"', 1)'
+mutate "$DH" "a private repo's own runner never starts assess" 'text.replace(", '"'"',macos-'"'"'))", ", '"'"',macos-'"'"') || startsWith(inputs.runs-on, '"'"''"'"'))", 1)'
+mutate "$DH" "a hosted image in a JSON list starts assess (the list is not flattened)" 'text.replace("join(startsWith(inputs.runs-on, '"'"'['"'"') && fromJSON(inputs.runs-on) || inputs.runs-on, '"'"','"'"')", '"'"'inputs.runs-on'"'"')'
+mutate "$DH" "a hosted prefix anywhere in a label counts (not tied to its start)" 'text.replace("'"'"',ubuntu-'"'"')", "'"'"'ubuntu-'"'"')", 1)'
+mutate "$DH" "a Windows image starts assess" 'text.replace(" ||\n      contains(format('"'"',{0}'"'"', join(startsWith(inputs.runs-on, '"'"'['"'"') && fromJSON(inputs.runs-on) || inputs.runs-on, '"'"','"'"')), '"'"',windows-'"'"')", '"'"''"'"', 1)'
 mutate "$MWG" "the plan does not read the hook settings" 'text.replace("            /.claude/settings.json\n", "", 1)'
 mutate "$DH" "the assess job reads the key" 'text.replace("          MWG_READ_TOKEN: ${{ github.token }}\n          REPO: ${{ github.repository }}\n          MODE:", "          MWG_READ_TOKEN: ${{ github.token }}\n          K: ${{ secrets.MERGE_APP_PRIVATE_KEY }}\n          REPO: ${{ github.repository }}\n          MODE:", 1)'
 
