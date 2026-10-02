@@ -761,12 +761,14 @@ on the code); never in the self-test.
    ```
 
    In a **private** repo the plan/assess jobs run where `runs-on` says, and they do not start at
-   all on a GitHub-hosted label unless the caller passes `allow-hosted: true` (billed minutes: with
-   the schedule above that is about 96 runs a day, a minute each at least). Live merging is refused
-   there — the Free plan has no Environments for private repositories, so there is nowhere to keep
-   the key out of reach of a pull request. Add `if: vars.RUNNER_TARGET != ''` to the calling job,
-   pass `runs-on: ${{ vars.RUNNER_TARGET }}`, keep only the `workflow_run` of the CI and drop or
-   thin the schedule. develop-health needs a push CI on the integration branch to have anything to
+   all on a GitHub-hosted image unless the caller passes `allow-hosted: true` (billed minutes: with
+   the schedule above that is about 96 runs a day, a minute each at least). A hosted image is any
+   label starting with `ubuntu-`, `windows-` or `macos-`, in any case, given alone or anywhere in a
+   JSON list (`'["ubuntu-latest"]'` counts; up to v0.11.1 a list slipped through and ran on billed
+   minutes). Live merging is refused there — the Free plan has no Environments for private
+   repositories, so there is nowhere to keep the key out of reach of a pull request. Add
+   `if: vars.RUNNER_TARGET != ''` to the calling job, pass `runs-on: ${{ vars.RUNNER_TARGET }}`,
+   keep only the `workflow_run` of the CI and drop or thin the schedule. develop-health needs a push CI on the integration branch to have anything to
    judge.
 
 3. Going live (public repos), by the repository owner:

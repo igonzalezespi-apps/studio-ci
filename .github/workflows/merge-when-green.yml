@@ -89,11 +89,16 @@ jobs:
   plan:
     name: plan
     # A private repository pays for hosted minutes (one minute at least per run): the job does not
-    # even start there on a GitHub-hosted label unless the caller opts in with allow-hosted.
+    # even start there on a GitHub-hosted image unless the caller opts in with allow-hosted. The
+    # image counts named alone or anywhere in a JSON list: `join` turns either form into
+    # "label,label", and the leading comma ties each prefix to the start of a label, so an own label
+    # that only contains "ubuntu-" is not taken for one. Prefixes, not a list of image names: an
+    # image GitHub adds later is caught from its first day. contains() ignores case, like labels.
     if: >-
-      !github.event.repository.private || inputs.allow-hosted ||
-      !(startsWith(inputs.runs-on, 'ubuntu-') || startsWith(inputs.runs-on, 'windows-') ||
-        startsWith(inputs.runs-on, 'macos-'))
+      !github.event.repository.private || inputs.allow-hosted || !(
+      contains(format(',{0}', join(startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on, ',')), ',ubuntu-') ||
+      contains(format(',{0}', join(startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on, ',')), ',windows-') ||
+      contains(format(',{0}', join(startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on, ',')), ',macos-'))
     runs-on: ${{ github.event.repository.private && (startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on) || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
