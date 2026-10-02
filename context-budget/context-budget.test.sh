@@ -130,6 +130,18 @@ caso 1 "fecha en una regla por ruta" "FAIL  [dated] .claude/rules/ci.md:1" 'mkdi
 caso 0 "la misma fecha con la marca de excepcion" "" 'printf "\nNode 24 (2026-09-29) <!-- context-budget: allow -->\n" >> CLAUDE.md'
 caso 0 "una fecha dentro de un bloque de codigo no cuenta" "" 'printf "\n\`\`\`\ngit log --since 2026-09-29\n\`\`\`\n" >> CLAUDE.md'
 caso 0 "una fecha en un README no es un fichero de reglas" "" 'echo "Publicado el 2026-09-29." >> README.md'
+# una fecha pegada a una letra sigue siendo una fecha; un numero mas largo no lo es. Un caso
+# por extremo de cada fecha numerica: cada limite tiene su mutante abajo.
+caso 1 "fecha ISO pegada a una hora (2026-09-29T10:00)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «2026-09-29»)" \
+  'printf "\nCerrado el 2026-09-29T10:00 por una incidencia.\n" >> CLAUDE.md'
+caso 1 "fecha ISO pegada a una letra delante (informe_2026-09-29)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «2026-09-29»)" \
+  'printf "\nLos datos salen de informe_2026-09-29.md.\n" >> CLAUDE.md'
+caso 1 "fecha DD-MM-AAAA pegada a una letra (informe_29-09-2026)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «29-09-2026»)" \
+  'printf "\nLos datos salen de informe_29-09-2026.md.\n" >> CLAUDE.md'
+caso 1 "fecha DD-MM-AAAA pegada a una hora (29-09-2026T10:00)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «29-09-2026»)" \
+  'printf "\nCierre 29-09-2026T10:00 por una incidencia.\n" >> CLAUDE.md'
+caso 0 "un numero mas largo no es una fecha (12026-09-29, 2026-09-291, 129/09/2026, 29/09/20261)" "" \
+  'printf "\nLotes 12026-09-29 y 2026-09-291, piezas 129/09/2026 y 29/09/20261.\n" >> CLAUDE.md'
 
 # --- marketplace ------------------------------------------------------------------------------
 caso 1 "marketplace canonico sin ref" 'extraKnownMarketplaces.ivan sin "ref": "main"' \
@@ -365,6 +377,47 @@ caso 0 "--staged: un directorio de estilos enlazado se sigue dentro del indice" 
 caso 2 "--staged fuera de un repo git: no se puede medir" "--staged necesita que --root" ":" --staged
 caso 2 "--staged en un subdirectorio del repo: no se puede medir" "--staged necesita que --root" \
   'indexa && mkdir -p sub && touch sub/x && git add sub/x' --staged --root "$R/sub"
+
+# --- mutantes de [dated]: cada caso de fechas de arriba distingue el script de su mutante ------
+# mutante <etiqueta> <exit-del-mutante> <pares python [(antes, despues), ...]> <mutacion del fixture>:
+# el script MUTADO (cada `antes` aparece UNA vez y se cambia), sobre la mutacion del fixture,
+# sale con el exit contrario al del caso que la cubre. Si saliera igual, ese caso no veria el
+# mutante.
+mutante() {
+  local label="$1" want="$2" pares="$3" mut="$4" m="$TMP/mutante.sh" rc=0
+  if ! python3 - "$CHECK" "$m" "$pares" <<'PYM'
+import ast, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+for antes, despues in ast.literal_eval(sys.argv[3]):
+    if text.count(antes) != 1:
+        sys.exit(1)
+    text = text.replace(antes, despues)
+open(sys.argv[2], "w", encoding="utf-8").write(text)
+PYM
+  then fail=$((fail + 1)); printf 'FAIL  mutante «%s»: el texto a mutar no esta una sola vez en el script\n' "$label"; return; fi
+  prepara
+  ( cd "$R" && eval "$mut" ) || { fail=$((fail + 1)); printf 'FAIL  mutante «%s»: la mutacion no se pudo aplicar\n' "$label"; return; }
+  bash "$m" --root "$R" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1)); printf 'FAIL  mutante «%s» (esperaba exit %s, salio %s): el caso que lo cubre no lo distingue\n' "$label" "$want" "$rc"; fi
+}
+ISO_T='printf "\nCerrado el 2026-09-29T10:00 por una incidencia.\n" >> CLAUDE.md'
+ISO_LETRA='printf "\nLos datos salen de informe_2026-09-29.md.\n" >> CLAUDE.md'
+DMY_LETRA='printf "\nLos datos salen de informe_29-09-2026.md.\n" >> CLAUDE.md'
+DMY_T='printf "\nCierre 29-09-2026T10:00 por una incidencia.\n" >> CLAUDE.md'
+LARGO='printf "\nLotes 12026-09-29 y 2026-09-291, piezas 129/09/2026 y 29/09/20261.\n" >> CLAUDE.md'
+# Un mutante por limite: uno que cambiara los dos extremos a la vez moriria por cualquiera de
+# ellos y dejaria el otro sin fijar.
+ISO_DELANTE='(?<!\\d)(?:19|20)'; ISO_DETRAS='(?:0[1-9]|[12]\\d|3[01])(?!\\d)'
+DMY_DELANTE='(?<!\\d)(?:0?[1-9]'; DMY_DETRAS='(?:19|20)\\d\\d(?!\\d)'
+mutante "la fecha ISO con \\b delante" 0 "[(\"$ISO_DELANTE\", \"\\\\b(?:19|20)\")]" "$ISO_LETRA"
+mutante "la fecha ISO con \\b detras" 0 "[(\"$ISO_DETRAS\", \"(?:0[1-9]|[12]\\\\d|3[01])\\\\b\")]" "$ISO_T"
+mutante "la fecha DD-MM-AAAA con \\b delante" 0 "[(\"$DMY_DELANTE\", \"\\\\b(?:0?[1-9]\")]" "$DMY_LETRA"
+mutante "la fecha DD-MM-AAAA con \\b detras" 0 "[(\"$DMY_DETRAS\", \"(?:19|20)\\\\d\\\\d\\\\b\")]" "$DMY_T"
+mutante "la fecha ISO sin limite delante" 1 "[(\"$ISO_DELANTE\", \"(?:19|20)\")]" "$LARGO"
+mutante "la fecha ISO sin limite detras" 1 "[(\"$ISO_DETRAS\", \"(?:0[1-9]|[12]\\\\d|3[01])\")]" "$LARGO"
+mutante "la fecha DD-MM-AAAA sin limite delante" 1 "[(\"$DMY_DELANTE\", \"(?:0?[1-9]\")]" "$LARGO"
+mutante "la fecha DD-MM-AAAA sin limite detras" 1 "[(\"$DMY_DETRAS\", \"(?:19|20)\\\\d\\\\d\")]" "$LARGO"
 
 # --- --quiet: solo hallazgos --------------------------------------------------------------------
 # corre <mutacion> [args...]: deja la salida en $out y el exit en $rc

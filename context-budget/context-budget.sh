@@ -646,9 +646,12 @@ def check_descriptions():
 # dated — parrafos fechados y notas de «antes decia»
 # ---------------------------------------------------------------------------------------------
 MONTHS_ES = "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre"
+# Las dos fechas numericas se delimitan con DIGITOS, no con \b: una fecha pegada a una letra
+# sigue siendo una fecha (`2026-09-26T10:00`, ISO 8601 con hora; `v26/09/2026`), y lo que no
+# debe contar es un numero mas largo (`12026-09-26`, `26/09/20261`).
 DATED_PATTERNS = [
-    (re.compile(r"\b(?:19|20)\d\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b"), "fecha"),
-    (re.compile(r"\b(?:0?[1-9]|[12]\d|3[01])[-/.](?:0?[1-9]|1[0-2])[-/.](?:19|20)\d\d\b"), "fecha"),
+    (re.compile(r"(?<!\d)(?:19|20)\d\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?!\d)"), "fecha"),
+    (re.compile(r"(?<!\d)(?:0?[1-9]|[12]\d|3[01])[-/.](?:0?[1-9]|1[0-2])[-/.](?:19|20)\d\d(?!\d)"), "fecha"),
     (re.compile(r"\b\d{1,2} de (?:%s)\b" % MONTHS_ES, re.I), "fecha"),
     (re.compile(r"\b(?:el|del|desde el|hasta el) (?:0?[1-9]|[12]\d|3[01])-(?:0[1-9]|1[0-2])\b", re.I), "fecha"),
     (re.compile(r"(?:^[\s>*_-]*|\()[*_]*(?:corregid[oa]|enmendad[oa]|corrected|amended)\b", re.I), "nota de correccion"),
