@@ -62,6 +62,8 @@ concurrency:
 
 permissions:
   contents: read
+  # Desde que el paso lee las etiquetas de la API y no del payload del evento (ver el paso).
+  pull-requests: read
 
 jobs:
   require-semver-label:
@@ -71,15 +73,35 @@ jobs:
       - name: At least one semver:* label
         shell: bash
         env:
-          # github.event.pull_request.labels is the live label set for the PR.
-          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # Las etiquetas se leen de la API, NO de `github.event.pull_request.labels`.
+          #
+          # Ese campo es la FOTO del payload del evento, no el estado vivo: el comentario que habia
+          # aqui decia lo contrario ("the live label set for the PR") y era falso. Una PR creada con
+          # su etiqueta en la MISMA llamada dispara `opened` y `labeled` sobre el mismo commit, y el
+          # payload de `opened` puede llegar SIN la etiqueta. Las dos runs caen en el mismo grupo y
+          # se serializan (ver `concurrency`); si GitHub crea la de `opened` despues, es la ultima
+          # en reportar y deja el check en rojo sobre una PR que SI lleva la etiqueta.
+          #
+          # Y relanzarla no lo arreglaba: un re-run reejecuta con el MISMO payload viejo, asi que
+          # hacia falta quitar y volver a poner la etiqueta para forzar un evento nuevo. Leyendo la
+          # API, cualquier run (la ultima en reportar o un re-run) juzga las etiquetas que la PR
+          # tiene AHORA.
+          #
+          # `curl` y `jq`, sin `node -e`: es la misma forma que el gate homologo de los productos, y
+          # las dos herramientas vienen en la imagen hosted. `issue_url` viene en todo payload de
+          # `pull_request`; el `format(...)` es solo una red.
+          GH_TOKEN: ${{ github.token }}
+          LABELS_URL: ${{ github.event.pull_request.issue_url || format('{0}/repos/{1}/issues/{2}', github.api_url, github.repository, github.event.pull_request.number) }}
         run: |
           set -euo pipefail
-          count="$(printf '%s' "$LABELS_JSON" | node -e '
-            const names = JSON.parse(require("fs").readFileSync(0, "utf8"));
-            const semver = names.filter((n) => /^semver:(major|minor|patch|none)$/.test(n));
-            console.log(semver.length);
-          ')"
+          # Fail-closed: si la API no contesta, el gate NO se pone verde por defecto.
+          body="$(curl -sSf -H "Authorization: Bearer ${GH_TOKEN}" \
+                            -H 'Accept: application/vnd.github+json' \
+                            "${LABELS_URL}/labels?per_page=100")" || {
+            echo "::error::could not read the PR labels from the API (${LABELS_URL}/labels)"; exit 1; }
+          echo "live labels: $(printf '%s' "$body" | jq -rc '[.[].name]')"
+          count="$(printf '%s' "$body" \
+            | jq -r '[.[].name | select(test("^semver:(major|minor|patch|none)$"))] | length')"
           if [ "$count" -ge 1 ]; then
             echo "OK: ${count} semver:* label(s) present; the highest (major>minor>patch>none) drives the release bump."
             exit 0
