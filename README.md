@@ -777,8 +777,8 @@ on the code); never in the self-test.
    enough — GitHub still cancels a *pending* run of the same group when a third one arrives. On a
    pull request, cancel only what a new commit made stale: grouping every PR event by ref lets a
    `reopened` (or `labeled`, `edited`) run cancel the one still running on the same head, and the
-   head is left with a `cancelled` check. studio-ci's own `ci.yml` uses this block (the same rule
-   as the job-level group of `security.yml`):
+   head is left with a `cancelled` check. studio-ci's own `ci.yml` uses this block (the rule of the
+   job-level group of `security.yml`, minus its `pull_request_target` case):
 
    ```yaml
    concurrency:
@@ -789,7 +789,9 @@ on the code); never in the self-test.
    `opened` and `synchronize` share one group per PR and cancel the older run, which by then
    belongs to a commit that is no longer the head. Every other event — `reopened`, `labeled`,
    `edited`, each push to the integration branch — gets a group of its own run: it neither cancels
-   nor is cancelled, and GitHub never drops it while pending.
+   nor is cancelled, and GitHub never drops it while pending. Not in a workflow that listens to
+   label-like events and calls `security.yml`: its `caller-guard` fails on any workflow-level
+   `concurrency` there (see **Concurrency** under security above).
 
    In a **private** repo the plan/assess jobs run where `runs-on` says, and they do not start at
    all on a GitHub-hosted image unless the caller passes `allow-hosted: true` (billed minutes: with
