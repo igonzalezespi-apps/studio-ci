@@ -19,7 +19,10 @@
 #
 # Harness contract: reads the tool-call JSON from STDIN
 #   {"tool_name":"Bash","tool_input":{"command":"..."}, ...}
-# and emits a verdict:
+# and emits a verdict. Every rule reads Bash commands, so the hook is wired with matcher `Bash`.
+# The one rule that also judges the file tools is `forbidden_paths` (see the policy schema): a
+# repository that sets it wires this same script a second time, with matcher
+# `Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob`. The verdict:
 #   - allow → exit 0, no output
 #   - deny  → exit 2 + "bash-guard DENY: <reason>. Alternative: <what to do>"
 #             on stderr (the harness blocks the command and the agent reads the
@@ -31,11 +34,14 @@
 # simple tokenizer — another interpreter, an indirection, a script written first
 # and run afterwards — is NOT guaranteed to be intercepted. The guard is also
 # fail-open: if command extraction fails (node absent, malformed JSON), it
-# allows — a broken tripwire must not take down the harness. The same holds for
-# a crash: Claude Code blocks only on exit 2, so any other exit lets the command
-# run. The one place that fails CLOSED instead is the source repository, where
-# source-guard.sh turns every exit other than 0 and 2 (and a missing node) into
-# a deny.
+# allows — a broken tripwire must not take down the harness. Nothing else lets a
+# command through: Claude Code blocks only on exit 2, so any other exit runs the
+# command, and so does a hook that runs past the harness's timeout. The guard
+# therefore judges in a child process under a supervisor (see the end of this
+# file), and a command it cannot read and judge within its own time limit, or one
+# it fails on (its reader or itself ending other than allow or deny, out of
+# resources, killed), is denied everywhere. The source repository goes further:
+# source-guard.sh also turns a missing node into a deny.
 #
 # Do NOT assume a server-side backstop behind it. Branch protection, rulesets and
 # required status checks are per-repository settings that this guard neither reads
@@ -58,6 +64,10 @@
 # TEST-ONLY (see project_identities).
 # BASH_GUARD_OWN_REPO: override of this repository's "owner/name" for the merge
 # check, TEST-ONLY (see merge_target).
+# BASH_GUARD_HOME: override of the home `~` stands for in forbidden_paths and in a
+# `cd ~`, TEST-ONLY.
+# BASH_GUARD_SECONDS: override of the guard's time limit, TEST-ONLY (see GUARD_DEADLINE
+# and the end of this file).
 # ============================================================================
 set -euo pipefail
 
@@ -122,6 +132,8 @@ const integ = typeof p.integration_branch === "string" && p.integration_branch ?
 const longLived = Array.isArray(p.long_lived_branches) ? p.long_lived_branches : [];
 const egress = Array.isArray(p.egress_allow) && p.egress_allow.length
   ? p.egress_allow : ["localhost", "127.0.0.1", "::1"];
+const worktree = p.one_worktree_per_task === true ? "true" : "false";
+const forbidden = Array.isArray(p.forbidden_paths) ? p.forbidden_paths : [];
 const out = [];
 out.push("MERGE\t" + merge);
 out.push("PRLABEL\t" + prLabel);
@@ -131,6 +143,8 @@ for (const b of longLived) if (typeof b === "string" && b) out.push("LONGLIVED\t
 out.push("REGEN\t" + regen);
 for (const t of trees) if (typeof t === "string" && t) out.push("TREE\t" + t);
 for (const h of egress) if (typeof h === "string" && h) out.push("EGRESS\t" + h);
+out.push("WORKTREE\t" + worktree);
+for (const f of forbidden) if (typeof f === "string" && f && !/[\t\n\r]/.test(f)) out.push("FORBID\t" + f);
 process.stdout.write(out.join("\n") + "\n");
 '
 
@@ -142,6 +156,8 @@ LONG_LIVED_BRANCHES=()
 GEN_REGEN_HINT=""
 GEN_TREES=()
 EGRESS_ALLOW=()
+ONE_WORKTREE_PER_TASK=false
+FORBIDDEN_PATHS=()
 # Sets the globals above from the policy of the mode in force. A function, called
 # right before the segments are checked, only because the published mode needs
 # helpers defined further down (published_policy_tsv); the vendored mode reads the
@@ -164,6 +180,8 @@ load_policy() {
         REGEN) GEN_REGEN_HINT="$val" ;;
         TREE) [ -n "$val" ] && GEN_TREES+=("$val") ;;
         EGRESS) [ -n "$val" ] && EGRESS_ALLOW+=("$val") ;;
+        WORKTREE) ONE_WORKTREE_PER_TASK="$val" ;;
+        FORBID) [ -n "$val" ] && FORBIDDEN_PATHS+=("$val") ;;
       esac
     done <<<"$POLICY_TSV"
   fi
@@ -179,7 +197,34 @@ load_policy() {
 # --git-dir, -c ...), set by check_git for its segment. Empty = git's own discovery.
 GIT_GLOBALS=()
 
+# A segment judged as what its command word stands for (see cw_read) says so in its deny:
+# CW_CONTEXT goes in front of the reason, CW_HINT in front of the alternative.
+CW_CONTEXT=""
+CW_HINT=""
+# The second of this shell's clock (SECONDS) past which judging stops and the command is denied; empty,
+# no limit. A hook that runs past the harness's timeout lets the command run, and a command can be
+# written to keep the guard busy that long while what it denies waits at the end: every
+# `git push --force-with-lease` reads every cd before it, and 100 pairs of `cd <dir>; git push
+# --force-with-lease` took 8 s, growing with the square (measured 2026-10-03, closing the second
+# verification round of #299: some 900 pairs, 34 KB, run past ten minutes; the smallest hook
+# timeout of the fleet is 15 s). Real commands are judged in milliseconds, one in
+# 1.2 s at most over the 31 days to that date. Set at the end of this file (GUARD_SECONDS): a
+# script that sources these functions sets its own.
+GUARD_DEADLINE=""
+# Set in the judge the supervisor runs (see the end of this file): $$ is the supervisor, and a judge whose
+# supervisor is gone (killed) has nobody to give its verdict to, so it stops.
+GUARD_SUPERVISED=0
+check_deadline() {
+  if [ "$GUARD_SUPERVISED" -eq 1 ] && ! kill -0 "$$" 2>/dev/null; then exit 2; fi
+  [ -n "$GUARD_DEADLINE" ] && [ "$SECONDS" -ge "$GUARD_DEADLINE" ] || return 0
+  deny "the guard could not judge this command within ${GUARD_DEADLINE} s, and a command it cannot judge is not let through" \
+    "split it into shorter commands"
+}
 deny() {
+  if [ -n "$CW_CONTEXT" ]; then
+    printf 'bash-guard DENY: %s: %s. Alternative: %s%s\n' "$CW_CONTEXT" "$1" "${CW_HINT:+$CW_HINT; then }" "$2" >&2
+    exit 2
+  fi
   printf 'bash-guard DENY: %s. Alternative: %s\n' "$1" "$2" >&2
   exit 2
 }
@@ -203,6 +248,129 @@ git_clean() {
     -u GIT_OBJECT_DIRECTORY -u GIT_NAMESPACE git "$@"
 }
 
+# words_of <text> [<separators>]: the words of the first line of <text>, split at blanks (or at
+# <separators>), in SPLIT_WORDS: what `read -r -a SPLIT_WORDS <<<"<text>"` gives, without the
+# here-string. Past 64 KiB bash writes a here-string to a temporary file, and where it cannot (a full
+# /tmp) the read fails, leaves the array empty and the segment went unjudged (found 2026-10-03, third
+# verification round of #299). No glob is expanded: the split runs with globbing off. The first line
+# is not cut with `${1%%$'\n'*}`, which bash matches in time quadratic in the length of the text, nor
+# is a quote taken off a word with `${w#\"}` (see check_segment): a word of 200 KB took seconds. A
+# fixed array, not the caller's through a nameref (`local -n`), which the bash 3.2 of macOS lacks.
+SPLIT_WORDS=()
+words_of() {
+  local text="$1" IFS=$'\n' noglob=0
+  local -a text_lines=()
+  case "$-" in *f*) noglob=1 ;; esac
+  set -f
+  case "$text" in
+    $'\n'*) text="" ;;
+    *$'\n'*)
+      # shellcheck disable=SC2206 # splitting is the point; globbing is off
+      text_lines=($text)
+      text="${text_lines[0]}"
+      ;;
+  esac
+  IFS="${2-$' \t\n'}"
+  # shellcheck disable=SC2206 # splitting is the point; globbing is off
+  SPLIT_WORDS=($text)
+  [ "$noglob" -eq 1 ] || set +f
+  return 0
+}
+
+# mapfile_of <text>: the lines of <text> in MAPPED_LINES, empty ones included (the command as written,
+# where an empty line can end a heredoc), as `mapfile -t MAPPED_LINES <<<"<text>"` gives them but not
+# past 64 KiB through a here-string, for the reason in words_of. A text that fits a pipe is still read
+# from a here-string, which bash keeps in one (an older bash writes even that one to /tmp); a longer
+# one, through a pipe of its own. The bash 3.2 of macOS has no mapfile: a line at a time there. One it
+# cannot read is denied: called as a condition, a failure would not stop the guard.
+MAPPED_LINES=()
+mapfile_of() {
+  local line
+  if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    MAPPED_LINES=()
+    while IFS= read -r line; do
+      MAPPED_LINES+=("$line")
+    done < <(printf '%s\n' "$1") && return 0
+  elif [ "${#1}" -le 4096 ]; then
+    mapfile -t MAPPED_LINES <<<"$1" && return 0
+  else
+    mapfile -t MAPPED_LINES < <(printf '%s\n' "$1") && return 0
+  fi
+  deny "the guard could not read this command's parts (no room for a temporary file?), and a command it cannot read is not let through" \
+    "free space in /tmp, then run it again"
+}
+# lines_of <text>: the lines of <text> that are not empty, in SPLIT_LINES, split by the shell itself:
+# no here-string (see words_of), and no pipe either, whose child process made every later subshell of
+# the guard slower (a third, measured on 60 cd/push pairs). Where an empty line means nothing (the
+# extractor's segments, the assignments of cw_assignments) this is the same reading.
+SPLIT_LINES=()
+lines_of() {
+  local IFS=$'\n' noglob=0
+  case "$-" in *f*) noglob=1 ;; esac
+  set -f
+  # shellcheck disable=SC2206 # splitting is the point; globbing is off
+  SPLIT_LINES=($1)
+  [ "$noglob" -eq 1 ] || set +f
+  return 0
+}
+# segment_lines: the lines of SEGMENTS (the extractor's output) in SEGMENT_LINES, split once for each
+# value it takes: several rules read them all.
+SEGMENT_LINES=()
+SEGMENT_LINES_OF=""
+SEGMENT_LINES_SET=0
+segment_lines() {
+  [ "$SEGMENT_LINES_SET" -eq 1 ] && [ "$SEGMENT_LINES_OF" = "${SEGMENTS:-}" ] && return 0
+  lines_of "${SEGMENTS:-}"
+  SEGMENT_LINES=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
+  SEGMENT_LINES_OF="${SEGMENTS:-}"
+  SEGMENT_LINES_SET=1
+}
+
+# bare_text <text>: <text> without quotes and backslashes, in BARE_TEXT: what `${1//[\'\"\\]/}` gives,
+# split at those characters and joined, in time linear in its length. The bash 3.2 of macOS takes that
+# substitution in quadratic time: a second for every 3 KB, and a real command of 3 KB with four
+# `gh api` calls was denied at the time limit (main judged it in 0.2 s).
+BARE_TEXT=""
+bare_text() {
+  # shellcheck disable=SC2141 # the backslash is one of the separators
+  local IFS=$'\'"\\' noglob=0
+  local -a parts=()
+  case "$-" in *f*) noglob=1 ;; esac
+  set -f
+  # shellcheck disable=SC2206 # splitting is the point; globbing is off
+  parts=($1)
+  [ "$noglob" -eq 1 ] || set +f
+  BARE_TEXT=""
+  [ "${#parts[@]}" -eq 0 ] || printf -v BARE_TEXT '%s' "${parts[@]}"
+  return 0
+}
+
+# base_name <word>: its last path component, in BASE_NAME. Not `${w##*/}`: bash matches that
+# pattern in time quadratic in what follows the last `/`, and a 120 KB word took seconds to name.
+BASE_NAME=""
+base_name() {
+  local head
+  case "$1" in
+    */*)
+      head="${1%/*}"
+      BASE_NAME="${1:${#head}+1}"
+      ;;
+    *) BASE_NAME="$1" ;;
+  esac
+  return 0
+}
+
+# shown_subst <text>: the text as a deny shows it, each substitution the extractor masked (see
+# EXTRACT_JS) written `$(…)`, in SHOWN. Byte-wise (LC_ALL=C): in a multibyte locale bash replaces
+# thousands of them in time quadratic in the length of the text, and a command word of 6,000 took
+# seconds (found 2026-10-03, third verification round of #299).
+SHOWN=""
+shown_subst() {
+  local LC_ALL=C
+  SHOWN="${1//\$__GUARD_SUBST__/\$(…)}"
+  return 0
+}
+
 # Is the path a real environment file? A committed TEMPLATE is not: env.example, and every
 # .env name whose LAST suffix is .example, .sample or .template (.env.example,
 # .env.production.example, .env.local.sample). Only the suffix decides, because it survives
@@ -215,7 +383,9 @@ git_clean() {
 # (.env.example.bak), a brace that ends elsewhere (.env.{prod,example}) and an unexpanded
 # glob (.env*, .env?) that would cover the real files when executed.
 is_env_file() {
-  local base="${1##*/}"
+  local base
+  base_name "$1"
+  base="$BASE_NAME"
   case "$base" in
     env.example) return 1 ;;
     # ...unless the name holds an expansion: the shell may split that word, and then a piece
@@ -264,27 +434,59 @@ check_generated_redirect() {
   return 0
 }
 
+# git_word <k>: the shell word that starts at whitespace token k of the segment (tok, with raw
+# beside it). A quoted part with blanks spans several tokens and all of them are that one word
+# (`-c user.name="A B"`, `-C "/a b"`, `-C /a\ b`): GW_VALUE is the word (its tokens joined by a
+# blank), GW_NEXT the token after it. Taking the second half for the subcommand left every git rule
+# out, the --force one included (pfx_next does the same for the wrappers in front).
+GW_VALUE=""
+GW_NEXT=0
+git_word() {
+  local k="$1"
+  GW_VALUE="${tok[k]:-}"
+  GW_NEXT=$((k + 1))
+  [ "${#raw[@]}" -eq "${#tok[@]}" ] || return 0
+  quote_carry "" "${raw[k]:-}"
+  while [ -n "$QC" ] && [ "$GW_NEXT" -lt "${#tok[@]}" ]; do
+    GW_VALUE+=" ${tok[GW_NEXT]}"
+    quote_carry "$QC" "${raw[GW_NEXT]}"
+    GW_NEXT=$((GW_NEXT + 1))
+  done
+  return 0
+}
+
 check_git() {
   # Skip git global options (those that take a separate value, in pairs) to
   # locate the real subcommand. `git -c x=y push` obfuscation is not guaranteed
-  # (see header).
+  # (see header), beyond the push configuration check_git_push reads from -c.
   # The ones that decide WHICH repository git works on and where its remotes point
   # are kept verbatim in GIT_GLOBALS, so the push check can replay them and ask git
   # itself instead of re-deriving git's repository discovery by hand.
-  local i=1 sub=""
+  local i=1 sub="" opt
   GIT_GLOBALS=()
   while [ "$i" -lt "${#tok[@]}" ]; do
-    case "${tok[i]}" in
-      -c | -C | --git-dir | --work-tree)
-        GIT_GLOBALS+=("${tok[i]}" "${tok[i + 1]:-}")
-        i=$((i + 2))
+    opt="${tok[i]}"
+    case "$opt" in
+      -c | -C | --git-dir | --work-tree | --config-env)
+        git_word $((i + 1))
+        GIT_GLOBALS+=("$opt" "$GW_VALUE")
+        i=$GW_NEXT
         ;;
-      --namespace | --exec-path) i=$((i + 2)) ;;
+      # Their value can also be the next word: taking it for the subcommand left `git
+      # --attr-source HEAD push --force` judged by no rule.
+      --namespace | --exec-path | --attr-source)
+        git_word $((i + 1))
+        i=$GW_NEXT
+        ;;
       --git-dir=* | --work-tree=* | --config-env=* | --bare)
-        GIT_GLOBALS+=("${tok[i]}")
-        i=$((i + 1))
+        git_word "$i"
+        GIT_GLOBALS+=("$GW_VALUE")
+        i=$GW_NEXT
         ;;
-      -*) i=$((i + 1)) ;;
+      -*)
+        git_word "$i"
+        i=$GW_NEXT
+        ;;
       *)
         sub="${tok[i]}"
         i=$((i + 1))
@@ -293,9 +495,14 @@ check_git() {
     esac
   done
   case "$sub" in
-    push) check_git_push "$i" ;;
+    # send-pack is the plumbing under push: the same <repository> [<refspec>...], --force,
+    # --all and --mirror, and a refspec with `+` or an empty source forces or deletes alike.
+    push | send-pack) check_git_push "$i" ;;
     commit) check_git_commit ;;
     merge) check_git_merge ;;
+    branch) check_git_branch "$i" ;;
+    update-ref) check_git_update_ref "$i" ;;
+    switch | checkout) check_git_switch "$sub" "$i" ;;
   esac
   return 0
 }
@@ -333,12 +540,14 @@ command_relocates() {
   local re_cd='(^|[[:space:]])(cd|pushd|popd)([[:space:]]|$)'
   # GIT_DIR & co. move git; GH_REPO moves gh (see pr_label_waived).
   local re_env='(^|[[:space:]])(GIT_[A-Z_]+|GH_REPO)='
-  local re_chdir='(^|[[:space:]])(--chdir|env([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*C)([=[:space:]]|$)'
-  while IFS= read -r line; do
+  # A wrapper that runs its command in another directory: env -C, sudo -D, nsenter/unshare -w.
+  local re_chdir='(^|[[:space:]])(--chdir|--wd|env([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*C|sudo([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*D|(nsenter|unshare)([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*w)([=[:space:]]|$)'
+  segment_lines
+  for line in ${SEGMENT_LINES[@]+"${SEGMENT_LINES[@]}"}; do
     [[ "$line" =~ $re_cd ]] && return 0
     [[ "$line" =~ $re_env ]] && return 0
     [[ "$line" =~ $re_chdir ]] && return 0
-  done <<<"${SEGMENTS:-}"
+  done
   return 1
 }
 
@@ -535,22 +744,58 @@ pr_label_waived() {
   esac
 }
 
+# Does `--<given>` name the long option `--<full>`? git takes any unambiguous prefix of a long
+# option (`--del` is --delete). A prefix two options share makes git refuse the push, so counting
+# it as either one costs nothing.
+push_long_is() {
+  [ -n "$1" ] && [ "${2#"$1"}" != "$2" ]
+}
+
+# push_dest_branch <destination ref as written>: the branch it names, in PUSH_BRANCH. git resolves
+# `heads/<b>` to refs/heads/<b> too.
+PUSH_BRANCH=""
+push_dest_branch() {
+  PUSH_BRANCH="$1"
+  case "$PUSH_BRANCH" in
+    refs/heads/*) PUSH_BRANCH="${PUSH_BRANCH#refs/heads/}" ;;
+    heads/*) PUSH_BRANCH="${PUSH_BRANCH#heads/}" ;;
+  esac
+  return 0
+}
+
+# Does the destination pattern of a refspec (`refs/heads/*`, `*`) match a long-lived branch?
+push_pattern_reaches_long_lived() {
+  local pat="$1" b
+  long_lived_names
+  for b in "${LONG_LIVED_NAMES[@]}"; do
+    # shellcheck disable=SC2053 # the right-hand side is the refspec's pattern, matched as one
+    if [[ "refs/heads/$b" == $pat || "heads/$b" == $pat || "$b" == $pat ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The branch HEAD is where this git command runs: the session's directory moved by the command's
+# own cd/pushd/popd and -C (command_git_dir), not the directory the hook happens to stand in.
+# Nothing when that directory cannot be told. TEST-ONLY override: BASH_GUARD_BRANCH.
+push_head_branch() {
+  if [ -n "${BASH_GUARD_BRANCH:-}" ]; then
+    printf '%s' "$BASH_GUARD_BRANCH"
+    return 0
+  fi
+  command_git_dir || return 0
+  git_clean -C "$CMD_GIT_DIR" branch --show-current 2>/dev/null || true
+}
+
 check_git_push() {
   local i="$1"
-  local force=0 noverify=0 a repo_opt=""
+  local force=0 noverify=0 lease=0 del=0 a o k repo_opt=""
   local -a positional=()
   while [ "$i" -lt "${#tok[@]}" ]; do
     a="${tok[i]}"
     i=$((i + 1))
     case "$a" in
-      --no-verify) noverify=1 ;;
-      # --force-with-lease is evaluated per target (only allowed toward != protected)
-      --force-with-lease | --force-with-lease=* | --force-if-includes) ;;
-      --force) force=1 ;;
-      --all | --mirror | --branches)
-        deny "git push ${a} pushes every branch, including ${PROTECTED_BRANCH}" \
-          "push only your PR branch: git push -u origin HEAD"
-        ;;
       # --repo=<repository> stands for the <repository> argument when there is none.
       --repo)
         repo_opt="${tok[i]:-}"
@@ -559,11 +804,40 @@ check_git_push() {
       --repo=*) repo_opt="${a#--repo=}" ;;
       # Push flags with a value in a separate token
       -o | --push-option | --receive-pack | --exec) i=$((i + 1)) ;;
-      --*) ;;
+      --no-force-with-lease) lease=0 ;;
+      --?*)
+        o="${a#--}"
+        o="${o%%=*}"
+        if push_long_is "$o" force; then
+          force=1
+        elif push_long_is "$o" force-with-lease; then
+          # Allowed toward the agent's own branches; judged per destination below.
+          lease=1
+        elif push_long_is "$o" no-verify; then
+          noverify=1
+        elif push_long_is "$o" delete; then
+          del=1
+        elif push_long_is "$o" all || push_long_is "$o" mirror || push_long_is "$o" branches; then
+          deny "git push ${a} pushes every branch, including ${PROTECTED_BRANCH}" \
+            "push only your PR branch: git push -u origin HEAD"
+        elif push_long_is "$o" prune; then
+          deny "git push ${a} deletes every remote branch that has no local counterpart, long-lived ones included" \
+            "delete a finished branch on the remote by name: git push origin --delete <branch>"
+        fi
+        ;;
       -?*)
-        # Short cluster: -f anywhere is --force; -n is --dry-run on push
-        # (harmless, allowed).
-        if [[ "$a" == -*f* ]]; then force=1; fi
+        # A short cluster: -f is --force, -d is --delete, -n is --dry-run (harmless); -o takes the
+        # rest of the cluster, or the next word, as its value.
+        for ((k = 1; k < ${#a}; k++)); do
+          case "${a:k:1}" in
+            f) force=1 ;;
+            d) del=1 ;;
+            o)
+              [ "$k" -eq $((${#a} - 1)) ] && i=$((i + 1))
+              break
+              ;;
+          esac
+        done
         ;;
       *) positional+=("$a") ;;
     esac
@@ -578,9 +852,128 @@ check_git_push() {
       "use git push --force-with-lease toward your PR branch (never toward ${PROTECTED_BRANCH})"
   fi
 
+  # The refspecs: positional[0] is the remote (name or URL); the rest are <src>:<dst> (without ':'
+  # the destination is the ref itself; HEAD, or `@`, is the current branch). Each is judged as the shell
+  # hands it to git: quotes ($'…' and $"…" too) and backslashes removed, braces expanded. One the
+  # shell fills in later (a variable, a substitution) is not judged. Braces past what brace_words
+  # reads (BRACE_MAX words, BRACE_MAX_LEN characters) would leave refspecs unread, `:develop` among
+  # them: denied, as check_env_dump does with a .env.
+  # The configuration this command sets for itself with -c is read too, never the one stored in the
+  # repository: remote.<name>.mirror is --mirror, remote.<name>.push gives the refspecs when the
+  # command line has none, and push.default=matching then pushes like `:`.
+  local -a refspecs=() cfg_specs=()
+  local r w dst kv key val matching=0
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    [ "${GIT_GLOBALS[k]}" = -c ] || continue
+    kv="${GIT_GLOBALS[k + 1]}"
+    k=$((k + 1))
+    # Lowercased (git's section and key names ignore case) without ${x,,}, which bash 3.2 lacks.
+    key="$(printf '%s' "${kv%%=*}" | tr '[:upper:]' '[:lower:]')"
+    val="$(printf '%s' "${kv#*=}" | tr '[:upper:]' '[:lower:]')"
+    case "$key" in
+      remote.*.mirror)
+        # Without `=` it is true; only a false value leaves the push alone.
+        case "$kv" in *=*) case "$val" in false | no | off | 0 | '') continue ;; esac ;; esac
+        deny "git -c ${kv} push mirrors every ref like --mirror, including ${PROTECTED_BRANCH}" \
+          "push only your PR branch: git push -u origin HEAD"
+        ;;
+      remote.*.push) [[ "$kv" == *=?* ]] && cfg_specs+=("${kv#*=}") ;;
+      push.default) [ "$val" = matching ] && matching=1 ;;
+    esac
+  done
+  local -a specs_in=()
+  if [ "${#positional[@]}" -gt 1 ]; then
+    specs_in=("${positional[@]:1}")
+  elif [ "${#cfg_specs[@]}" -gt 0 ]; then
+    specs_in=("${cfg_specs[@]}")
+  elif [ "$matching" -eq 1 ]; then
+    deny "git -c push.default=matching push pushes every branch that also exists on the remote, including ${PROTECTED_BRANCH}" \
+      "push only your PR branch: git push -u origin HEAD"
+  fi
+  if [ "${#specs_in[@]}" -gt 0 ]; then
+    for r in "${specs_in[@]}"; do
+      # What the guard does not expand: the escapes of $'…' (`$'\x64'evelop` is develop) and a
+      # sequence in braces (`develo{p..p}`). A ref name never needs either.
+      if [[ "$r" == *"\$'"*\\* ]] || [[ "$r" =~ \{[^{},]*\.\.[^{},]*\} ]]; then
+        deny "git push ${r}: the guard does not read \$'…' escapes or {a..b} sequences in a refspec" \
+          "write the branch name out: git push origin <branch>"
+      fi
+      w="${r//\$\'/\'}"
+      w="${w//\$\"/\"}"
+      w="${w//[\"\'\\]/}"
+      brace_words "$w"
+      if [ "$BRACE_OVER" -eq 1 ] || { [[ "$w" == *'{'*,* ]] && [ "${#w}" -gt "$BRACE_MAX_LEN" ]; }; then
+        deny "git push ${r}: its braces expand to more refspecs than the guard reads (${BRACE_MAX} at most)" \
+          "push or delete the refspecs in smaller groups"
+      fi
+      refspecs+=("${BRACE_OUT[@]}")
+    done
+  fi
+
+  # More rules about the agent, unconditional like the two above:
+  #   - a leading `+` forces that ref: it is --force for one ref, and it also overrides
+  #     --force-with-lease, so it is denied with or without a lease;
+  #   - `:` alone pushes every branch that also exists on the remote, and a pattern every branch
+  #     it matches: like --all, when that reaches a long-lived branch;
+  #   - deleting a long-lived branch (is_long_lived_branch, the list `git branch -D` uses) on the
+  #     remote: `--delete <b>`, `-d <b>`, an empty source (`:<b>`) or the null object id;
+  #   - --force-with-lease toward a long-lived branch: the lease is for the agent's own branches.
+  for r in ${refspecs[@]+"${refspecs[@]}"}; do
+    case "$r" in
+      +*)
+        deny "git push ${r}: a leading '+' forces that ref like --force, and it overrides --force-with-lease" \
+          "drop the '+'; to rewrite your own PR branch after a rebase: git push --force-with-lease origin <your-branch>"
+        ;;
+      :)
+        deny "git push ':' pushes every branch that also exists on the remote, including ${PROTECTED_BRANCH}" \
+          "push only your PR branch: git push -u origin HEAD"
+        ;;
+      *'*'*)
+        if push_pattern_reaches_long_lived "${r#*:}"; then
+          deny "git push ${r} pushes every branch the pattern matches, long-lived ones included" \
+            "push only your PR branch: git push -u origin HEAD"
+        fi
+        ;;
+    esac
+    dst=""
+    if [ "$del" -eq 1 ]; then
+      dst="$r"
+    elif [ "${r#:}" != "$r" ]; then
+      dst="${r#:}"
+    elif [[ "${r%%:*}" =~ ^(0{40}|0{64})$ ]] && [[ "$r" == *:* ]]; then
+      # The null object id as the source deletes the destination, like an empty source
+      # (measured with git 2.43: `0000…0000:develop` deleted develop).
+      dst="${r#*:}"
+    fi
+    [ -n "$dst" ] || continue
+    push_dest_branch "$dst"
+    if is_long_lived_branch "$PUSH_BRANCH"; then
+      deny "git push deleting '${PUSH_BRANCH}' on the remote: it is a long-lived branch of this flow, and deleting it is not a step of any task" \
+        "delete only finished work branches (git push origin --delete <type>/<branch>); deleting a long-lived branch is the user's call"
+    fi
+  done
+  if [ "$lease" -eq 1 ]; then
+    local -a lease_dsts=(HEAD)
+    if [ "${#refspecs[@]}" -gt 0 ]; then
+      lease_dsts=()
+      for r in "${refspecs[@]}"; do lease_dsts+=("${r#*:}"); done
+    fi
+    # The session's directory read here, once: push_head_branch runs in a subshell, which would read it
+    # again (a node each time) for every push, and 60 cd/push pairs went near 10 s on a slow runner.
+    load_session_cwd
+    for dst in "${lease_dsts[@]}"; do
+      case "$dst" in HEAD | @) dst="$(push_head_branch)" ;; esac
+      push_dest_branch "$dst"
+      if is_long_lived_branch "$PUSH_BRANCH"; then
+        deny "git push --force-with-lease toward '${PUSH_BRANCH}' rewrites the history of a long-lived branch of this flow" \
+          "a long-lived branch only moves through merged PRs; --force-with-lease is for your own PR branch (git push --force-with-lease origin <your-branch>), and rewriting a long-lived one is the user's call"
+      fi
+    done
+  fi
+
   # Everything below is the protected-branch rule, which is the policy of the repository
-  # the push LANDS IN. The --no-verify and --force checks above stay unconditional: they
-  # are rules about the agent, not about any repository.
+  # the push LANDS IN. The checks above stay unconditional: they are rules about the agent,
+  # not about any repository.
   #   - this repository (or not provably another one): the policy loaded at the top;
   #   - another repository: ITS policy (destination_protected_branch), so a session rooted
   #     here cannot push to another consumer's main, while a repository that vendors no
@@ -598,17 +991,9 @@ check_git_push() {
     [ -n "$protected_set" ] || return 0
   fi
 
-  # Resolve the push target(s). positional[0] is the remote (name or URL); the
-  # rest are refspecs <src>:<dst> (without ':' the target is the ref itself;
-  # HEAD resolves to the current branch).
-  local -a refspecs=()
-  if [ "${#positional[@]}" -gt 1 ]; then
-    refspecs=("${positional[@]:1}")
-  fi
-
   # Where the protected branch comes from, for the message: a foreign destination's own
   # policy is named, so the reader looks at the right file.
-  local by="" r dst
+  local by=""
   [ -n "$whose" ] && by=" in ${whose}, by that repository's own guard.policy.json"
 
   if [ "${#refspecs[@]}" -eq 0 ]; then
@@ -628,9 +1013,11 @@ check_git_push() {
     else
       dst="$r"
     fi
-    dst="${dst#refs/heads/}"
+    push_dest_branch "$dst"
+    dst="$PUSH_BRANCH"
     if [ -z "$dst" ]; then continue; fi
-    if [ "$dst" = "HEAD" ]; then
+    # `@` is git's short name for HEAD.
+    if [ "$dst" = "HEAD" ] || [ "$dst" = "@" ]; then
       dst="$(current_branch)"
     fi
     if [ -n "$dst" ] && identity_in "$dst" "$protected_set"; then
@@ -676,6 +1063,289 @@ check_git_merge() {
     esac
   done
   return 0
+}
+
+# `git branch -d/-D` of a long-lived branch (is_long_lived_branch: the built-in floor, the
+# protected and integration branches and `long_lived_branches`). A local copy of one of them that
+# is stale is brought up to date, never deleted; deleting it is not a step of any task. Applies in
+# every repository: the name is what counts, wherever the command runs. With -r the names are
+# remote-tracking (`origin/main`): the part after the remote is judged. A name the shell fills in
+# later is not judged, as for a push.
+check_git_branch() {
+  local i="$1" a del=0 rem=0 b
+  local -a names=()
+  while [ "$i" -lt "${#tok[@]}" ]; do
+    a="${tok[i]}"
+    i=$((i + 1))
+    case "$a" in
+      --)
+        names+=("${tok[@]:i}")
+        break
+        ;;
+      --delete) del=1 ;;
+      --remotes) rem=1 ;;
+      -u | --set-upstream-to) i=$((i + 1)) ;;
+      --*) ;;
+      -?*)
+        [[ "$a" == *[dD]* ]] && del=1
+        [[ "$a" == *r* ]] && rem=1
+        ;;
+      *) names+=("$a") ;;
+    esac
+  done
+  [ "$del" -eq 1 ] || return 0
+  for b in ${names[@]+"${names[@]}"}; do
+    [ "$rem" -eq 1 ] && b="${b#*/}"
+    deny_long_lived_delete "git branch" "$b"
+  done
+  return 0
+}
+
+# The same deletion through the plumbing: `git update-ref -d refs/heads/<branch>`.
+check_git_update_ref() {
+  local i="$1" a del=0 ref=""
+  while [ "$i" -lt "${#tok[@]}" ]; do
+    a="${tok[i]}"
+    i=$((i + 1))
+    case "$a" in
+      -d | --delete) del=1 ;;
+      -m) i=$((i + 1)) ;;
+      -*) ;;
+      *)
+        [ -n "$ref" ] || ref="$a"
+        ;;
+    esac
+  done
+  [ "$del" -eq 1 ] && [ -n "$ref" ] || return 0
+  case "$ref" in
+    refs/heads/*) deny_long_lived_delete "git update-ref -d" "${ref#refs/heads/}" ;;
+  esac
+  return 0
+}
+
+# deny_long_lived_delete <what> <branch as written>: denies when the shell's spelling of the name
+# (quotes and backslashes removed, braces expanded) is a long-lived branch.
+deny_long_lived_delete() {
+  local what="$1" b="${2//[\"\'\\]/}" x
+  brace_words "$b"
+  for x in "${BRACE_OUT[@]}"; do
+    if is_long_lived_branch "$x"; then
+      deny "${what} deleting '${x}': it is a long-lived branch of this flow, and deleting it is not a step of any task" \
+        "to refresh a stale local copy, update it instead (git fetch origin ${x}:${x}, or work from origin/${x} in a worktree); deleting a long-lived branch is the user's call"
+    fi
+  done
+  return 0
+}
+
+# --- One worktree per task (policy: one_worktree_per_task) --------------------
+# With `one_worktree_per_task: true`, switching branches in a SHARED checkout is denied: every
+# session working in that checkout sees its files change under it. A task gets its own worktree
+# (`git worktree add`). Shared = the MAIN worktree (git-dir == git-common-dir: not a linked one)
+# of the repository this guard protects, of a repository next to it (same parent directory) or of
+# one inside it. A linked worktree, and a clone anywhere else, belongs to whoever made it: allowed.
+# Restoring files is not switching: `git checkout -- <path>`, `git checkout <existing path>`,
+# `git checkout -p`. Off by default (absent = false): a repository opts in.
+#
+# Where the git command runs: the session's directory (the hook input's `cwd`), moved by every
+# `cd`/`pushd`/`popd` met so far in the command (SEG_CDS, in order) that holds where the command
+# stands (see seg_counts), and by git's own `-C`. A directory the guard cannot resolve (a `cd` into a
+# variable or a substitution, `--git-dir`/`--work-tree`) is not judged.
+SEG_CDS=()
+# The nesting past which the extractor does not read scopes (SCOPE_DEPTH_MAX in EXTRACT_JS).
+SCOPE_DEPTH_MAX=400
+# Where the segment being judged stands, from the extractor's position lines ("\x01<o> <p>", see
+# "Where each segment stands" in EXTRACT_JS): SEG_POS_O its offsets ("12", "40.7"), SEG_POS_P the
+# scopes around it ("/", "/12/q30/"). Empty SEG_POS_O: no position known, and every cd counts; "!":
+# the extractor could not read the scopes (see command_git_dir).
+SEG_POS_O=""
+SEG_POS_P="/"
+# pos_le <a> <b>: does position a stand at or before position b? Compared offset by offset.
+pos_le() {
+  local a="$1." b="$2." x y
+  while [ -n "$a" ] && [ -n "$b" ]; do
+    x="${a%%.*}" y="${b%%.*}"
+    [ "$x" -lt "$y" ] && return 0
+    [ "$x" -gt "$y" ] && return 1
+    a="${a#*.}" b="${b#*.}"
+  done
+  [ -z "$a" ]
+}
+# seg_counts <o> <p>: does a cd recorded at that position count where this segment stands? Its
+# scope must enclose this one (or be it), and it must stand before. A cd recorded without a position
+# counts everywhere, as before positions existed.
+seg_counts() {
+  [ -n "$1" ] && [ -n "$SEG_POS_O" ] || return 0
+  [[ "$SEG_POS_P" == "$2"* ]] || return 1
+  pos_le "$1" "$SEG_POS_O"
+}
+SESSION_CWD=""
+SESSION_CWD_READ=0
+CMD_GIT_DIR=""
+
+# The session's working directory, from the hook input; the hook's own directory without one.
+load_session_cwd() {
+  [ "$SESSION_CWD_READ" -eq 1 ] && return 0
+  SESSION_CWD_READ=1
+  SESSION_CWD="$(printf '%s' "${INPUT:-}" | node -e '
+    let d = {};
+    try { d = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch (e) {}
+    const c = d && typeof d.cwd === "string" ? d.cwd : "";
+    if (!/[\n\r]/.test(c)) process.stdout.write(c);
+  ' 2>/dev/null || true)"
+  [ -n "$SESSION_CWD" ] || SESSION_CWD="$PWD"
+  return 0
+}
+
+# resolve_dir <path> <base>: the physical directory <path> names from <base> (`~`, $HOME and
+# ${HOME} expanded), in RESOLVED_DIR, or exit 1 when it does not exist or holds an expansion the guard
+# cannot read. Each answer is kept for the rest of the process (the file system does not change while
+# the guard judges): command_git_dir resolves every cd before each git command, and 60 cd/push pairs
+# took some 1,800 subshells (main judged them in 0.3 s). Kept in a list, which the bash 3.2 of macOS
+# can hold.
+RESOLVED_DIR=""
+RESOLVED_KEYS=()
+RESOLVED_VALS=()
+resolve_dir() {
+  local p="$1" base="$2" h="${BASH_GUARD_HOME:-${HOME:-}}" k r
+  RESOLVED_DIR=""
+  # shellcheck disable=SC2088,SC2016 # the patterns are the LITERAL spellings, as a command writes them
+  case "$p" in
+    "~") p="$h" ;;
+    "~/"*) p="$h/${p#\~/}" ;;
+    '$HOME' | '${HOME}') p="$h" ;;
+    '$HOME/'*) p="$h/${p#\$HOME/}" ;;
+    '${HOME}/'*) p="$h/${p#\$\{HOME\}/}" ;;
+  esac
+  case "$p" in '' | *'$'* | *'`'*) return 1 ;; esac
+  case "$p" in
+    /*) ;;
+    *)
+      [ -n "$base" ] || return 1
+      p="$base/$p"
+      ;;
+  esac
+  for ((k = 0; k < ${#RESOLVED_KEYS[@]}; k++)); do
+    [ "${RESOLVED_KEYS[k]}" = "$p" ] || continue
+    RESOLVED_DIR="${RESOLVED_VALS[k]}"
+    [ -n "$RESOLVED_DIR" ]
+    return
+  done
+  r="$(cd "$p" 2>/dev/null && pwd -P)" || r=""
+  RESOLVED_KEYS+=("$p")
+  RESOLVED_VALS+=("$r")
+  RESOLVED_DIR="$r"
+  [ -n "$r" ]
+}
+
+# The directory the git command of this segment runs in -> CMD_GIT_DIR; exit 1 when unknown.
+# `cd -` goes back to the directory before the last change, `popd` to the one the last `pushd`
+# left; the session's own previous directory and stack are not known.
+command_git_dir() {
+  local d t k kind prev="" nd po pp
+  local -a stack=()
+  if [ "$SEG_POS_O" = "!" ] && [ "${#SEG_CDS[@]}" -gt 0 ]; then
+    deny "the command nests its subshells deeper than the guard reads (${SCOPE_DEPTH_MAX}), so it cannot tell which of its cd/pushd/popd still hold where this git command runs" \
+      "split it: run the cd and the git command in a command of their own (cd <dir> && git …), or use git -C <dir>"
+  fi
+  load_session_cwd
+  resolve_dir "$SESSION_CWD" "" || return 1
+  d="$RESOLVED_DIR"
+  for t in ${SEG_CDS[@]+"${SEG_CDS[@]}"}; do
+    check_deadline
+    po="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    pp="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    seg_counts "$po" "$pp" || continue
+    kind="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    if [ "$kind" = popd ]; then
+      [ "${#stack[@]}" -gt 0 ] || return 1
+      nd="${stack[${#stack[@]} - 1]}"
+      unset 'stack[${#stack[@]}-1]'
+    elif [ "$t" = "-" ]; then
+      [ "$kind" = cd ] && [ -n "$prev" ] || return 1
+      nd="$prev"
+    else
+      resolve_dir "$t" "$d" || return 1
+      nd="$RESOLVED_DIR"
+      [ "$kind" = pushd ] && stack+=("$d")
+    fi
+    prev="$d"
+    d="$nd"
+  done
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    case "${GIT_GLOBALS[k]}" in
+      -C)
+        resolve_dir "${GIT_GLOBALS[k + 1]}" "$d" || return 1
+        d="$RESOLVED_DIR"
+        k=$((k + 1))
+        ;;
+      -c) k=$((k + 1)) ;;
+      --git-dir | --work-tree | --git-dir=* | --work-tree=* | --bare) return 1 ;;
+    esac
+  done
+  CMD_GIT_DIR="$d"
+  return 0
+}
+
+# The main checkout of the repository this guard protects (the first entry of `git worktree
+# list`), or nothing when it cannot be told.
+own_main_checkout() {
+  local root="${BASH_GUARD_PROJECT_ROOT:-$ANCHOR_ROOT}" out line
+  [ -n "$root" ] && [ -d "$root" ] || return 0
+  out="$(git_clean -C "$root" worktree list --porcelain 2>/dev/null)" || return 0
+  line="${out%%$'\n'*}"
+  case "$line" in "worktree "*) ;; *) return 0 ;; esac
+  case "$out" in *$'\nbare'*) return 0 ;; esac
+  (cd "${line#worktree }" 2>/dev/null && pwd -P) || true
+}
+
+# Is <dir> inside a shared checkout? Prints its top level when it is.
+shared_checkout() {
+  local d="$1" gd common top mine
+  gd="$(git_clean -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  gd="$(cd "$gd" 2>/dev/null && pwd -P)" || return 1
+  common="$(cd "$d" 2>/dev/null && cd "$(git_clean rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)" || return 1
+  [ "$gd" = "$common" ] || return 1
+  top="$(git_clean -C "$d" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  top="$(cd "$top" 2>/dev/null && pwd -P)" || return 1
+  mine="$(own_main_checkout)"
+  # Not knowing which repository this guard protects leaves every main checkout shared.
+  if [ -n "$mine" ] && [ "$top" != "$mine" ] && [ "${top%/*}" != "${mine%/*}" ]; then
+    case "$top" in "$mine"/*) ;; *) return 1 ;; esac
+  fi
+  printf '%s' "$top"
+}
+
+check_git_switch() {
+  local sub="$1" i="$2" a newb=0 first="" top
+  [ "$ONE_WORKTREE_PER_TASK" = "true" ] || return 0
+  local -a args=("${tok[@]:i}")
+  for a in ${args[@]+"${args[@]}"}; do
+    case "$a" in -h | --help) return 0 ;; esac
+  done
+  command_git_dir || return 0
+  if [ "$sub" = checkout ]; then
+    for a in ${args[@]+"${args[@]}"}; do
+      case "$a" in
+        --) return 0 ;;
+        -p | --patch) return 0 ;;
+        -b | -B | --orphan) newb=1 ;;
+      esac
+    done
+    if [ "$newb" -eq 0 ]; then
+      for a in ${args[@]+"${args[@]}"}; do
+        case "$a" in -*) continue ;; esac
+        first="$a"
+        break
+      done
+      [ -n "$first" ] && [ -e "$CMD_GIT_DIR/$first" ] && return 0
+    fi
+  fi
+  top="$(shared_checkout "$CMD_GIT_DIR")" || return 0
+  deny "git ${sub} switches branches in the shared checkout ${top}: one worktree per task, and other sessions work in that checkout" \
+    "git worktree add .claude/worktrees/<branch> -b <branch> origin/${INTEGRATION_BRANCH:-$PROTECTED_BRANCH}, and work there"
 }
 
 # Resolve a PR's base AND head branch (for `gh pr merge <n>`) in ONE lookup, so
@@ -743,15 +1413,20 @@ pr_base_branch() {
 is_long_lived_branch() {
   local b="$1" x
   [ -z "$b" ] && return 1
-  case "$b" in
-    main | master | develop | development | trunk) return 0 ;;
-  esac
-  [ "$b" = "$PROTECTED_BRANCH" ] && return 0
-  [ -n "$INTEGRATION_BRANCH" ] && [ "$b" = "$INTEGRATION_BRANCH" ] && return 0
-  for x in ${LONG_LIVED_BRANCHES[@]+"${LONG_LIVED_BRANCHES[@]}"}; do
+  long_lived_names
+  for x in "${LONG_LIVED_NAMES[@]}"; do
     [ "$b" = "$x" ] && return 0
   done
   return 1
+}
+
+# Every long-lived branch name, in LONG_LIVED_NAMES: the built-in floor, then the policy's.
+LONG_LIVED_NAMES=()
+long_lived_names() {
+  LONG_LIVED_NAMES=(main master develop development trunk "$PROTECTED_BRANCH")
+  [ -n "$INTEGRATION_BRANCH" ] && LONG_LIVED_NAMES+=("$INTEGRATION_BRANCH")
+  LONG_LIVED_NAMES+=(${LONG_LIVED_BRANCHES[@]+"${LONG_LIVED_BRANCHES[@]}"})
+  return 0
 }
 
 # The "owner/name" a gh --repo value names (OWNER/REPO, HOST/OWNER/REPO or a URL), lowercase;
@@ -933,7 +1608,8 @@ check_pr_merge() {
   if [ "$pr_exp" = 1 ] || [ "$repo_exp" = 1 ]; then
     shown="gh pr merge ${pr}${repo:+ --repo $repo}"
     shown="${shown//\$__GUARD_SUBST__/\$(…)}"
-    deny "'${shown}' names its PR or its repository with something the shell fills in later (a variable, a substitution, a loop), and the guard reads the command before it runs, so it cannot look the PR up" \
+    shown="${shown//"$XARGS_PLACEHOLDER"/<from xargs>}"
+    deny "'${shown}' names its PR or its repository with something the shell fills in later (a variable, a substitution, a loop, xargs), and the guard reads the command before it runs, so it cannot look the PR up" \
       "write both literally, one merge per command: gh pr merge <number> --repo <owner>/<name>"
   fi
   url_repo="$(pr_url_repo "$pr")"
@@ -1010,57 +1686,56 @@ check_pr_merge() {
 GHW=()
 GHX=()
 GH_OPAQUE=0
+# The word that stands for what xargs appends (see prefix_end): a `$` makes every rule that asks
+# "is this word literal?" get a truthful no.
+# shellcheck disable=SC2016 # literal on purpose
+XARGS_PLACEHOLDER='$__XARGS__'
 gh_words() {
   local w k=0 n
   GHW=()
   GHX=()
   egress_words "$1"
   n=${#EGRESS_WORDS[@]}
-  while [ "$k" -lt "$n" ]; do
-    w="${EGRESS_WORDS[k]//$'\x1e'/}"
-    if [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      k=$((k + 1))
-      continue
-    fi
-    case "$w" in
-      env)
-        k=$((k + 1))
-        while [ "$k" -lt "$n" ]; do
-          case "${EGRESS_WORDS[k]//$'\x1e'/}" in
-            -u | -C | --unset | --chdir) k=$((k + 2)) ;;
-            -*) k=$((k + 1)) ;;
-            *) break ;;
-          esac
-        done
-        continue
-        ;;
-      sudo | command | exec | nohup | time | do | then | else | elif | if | while | until | '{' | '!' | coproc)
-        k=$((k + 1))
-        continue
-        ;;
-    esac
-    break
+  PFX_W=()
+  PFX_RAW=()
+  for w in ${EGRESS_WORDS[@]+"${EGRESS_WORDS[@]}"}; do
+    w="${w//$'\x1e'/}"
+    PFX_W+=("${w//$'\x1f'/\$}")
   done
+  prefix_end
+  k=$PFX_END
   # Both readings must land on the same word. If this one does not see `gh` where check_segment
   # did, it cannot say which words are gh's: GH_OPAQUE tells check_gh to fail closed.
   GH_OPAQUE=0
   w="${EGRESS_WORDS[k]:-}"
   w="${w//$'\x1e'/}"
-  [ "${w##*/}" = "gh" ] || GH_OPAQUE=1
+  base_name "$w"
+  [ "$BASE_NAME" = "gh" ] || GH_OPAQUE=1
   for ((k = k + 1; k < n; k++)); do
     w="${EGRESS_WORDS[k]}"
     if [[ "$w" == *'$'* || "$w" == *'`'* ]]; then GHX+=(1); else GHX+=(0); fi
     w="${w//$'\x1e'/}"
-    GHW+=("${w//$'\x1f'/\$}")
+    w="${w//$'\x1f'/\$}"
+    # A word holding xargs' replace string is filled in from stdin.
+    [ -n "$PFX_REPL" ] && [[ "$w" == *"$PFX_REPL"* ]] && GHX[${#GHX[@]} - 1]=1
+    GHW+=("$w")
   done
+  # Without a replace string, xargs appends what it reads to the command: one more word, unknown.
+  if [ "$PFX_XARGS" -eq 1 ] && [ -z "$PFX_REPL" ]; then
+    GHW+=("$XARGS_PLACEHOLDER")
+    GHX+=(1)
+  fi
   return 0
 }
 
-# gh options that take their value in the NEXT word: the global ones, then those of the two
+# gh options that take their value in the NEXT word: the global ones, then those of the
 # subcommands this guard reads. A value is never the PR, never a subcommand and never a flag.
 GH_VALUE_GLOBAL=" -R --repo --hostname "
 GH_VALUE_PR_MERGE=" -b --body -F --body-file -t --subject -A --author-email --match-head-commit "
 GH_VALUE_PR_CREATE=" -a --assignee -B --base -b --body -F --body-file -H --head -l --label -m --milestone -p --project -r --reviewer -T --template -t --title --recover "
+GH_VALUE_API=" -X --method -H --header -F --field -f --raw-field --input -q --jq -t --template --cache -p --preview "
+GH_VALUE_EDIT=" -B --base -b --body -F --body-file -m --milestone -t --title --add-assignee --remove-assignee --add-label --remove-label --add-project --remove-project --add-reviewer --remove-reviewer --attach --add-blocked-by --add-blocking --add-sub-issue --parent --remove-blocked-by --remove-blocking --remove-sub-issue --type "
+GH_VALUE_LABEL_EDIT=" -c --color -d --description -n --name "
 
 # A word of short options, as gh's flag parser (pflag) reads it: its letters in order, until one
 # takes a value (listed in $2, the " -x " set in force) or is followed by `=`. That letter goes in
@@ -1105,13 +1780,30 @@ check_gh() {
   # (number, URL or branch). Global options, and the options of `pr merge` / `pr create` that
   # take a value, are skipped with their value. The scan does NOT stop at the PR: `--repo`
   # usually comes AFTER it (`gh pr merge 123 --repo owner/name --squash`).
-  local i=0 n w sub1="" sub2="" merge_arg="" merge_set=0 repo_arg="" repo_exp=0 pr_exp=0
-  local has_label=0 opts_done=0 opaque=0 values="$GH_VALUE_GLOBAL" a
+  local i=0 n w sub1="" sub2="" sub2_x=0 merge_arg="" merge_set=0 repo_arg="" repo_exp=0 pr_exp=0
+  local has_label=0 opts_done=0 opaque=0 values="$GH_VALUE_GLOBAL" a admin=0 label_arg="" label_x=0 label_set=0
+  local alias_shell=0 label_mut=0
+  local -a removed=() removed_x=() alias_pos=() alias_pos_x=()
   gh_words "$seg"
   opaque="$GH_OPAQUE"
   n=${#GHW[@]}
   while [ "$i" -lt "$n" ]; do
     w="${GHW[i]}"
+    # Brace expansion makes several words of one (`--{admin,squash}`): the flags read below are
+    # looked for in each of them too.
+    if [ "$opts_done" -eq 0 ] && [[ "$w" == *'{'*,* ]]; then
+      brace_words "$w"
+      for a in "${BRACE_OUT[@]}"; do
+        case "$a" in
+          --admin) admin=1 ;;
+          --admin=*) admin_value "${a#*=}" "${GHX[i]}" && admin=1 ;;
+          --remove-label=*)
+            removed+=("${a#*=}")
+            removed_x+=("${GHX[i]}")
+            ;;
+        esac
+      done
+    fi
     if [ "$opts_done" -eq 0 ]; then
       case "$w" in
         --)
@@ -1133,18 +1825,31 @@ check_gh() {
           i=$((i + 1))
           continue
           ;;
-        --label | -l | --label=* | -l?*)
-          has_label=1
+        # Recorded wherever they stand (gh's flag parser takes them before or after the
+        # subcommands), and judged once the subcommands are known.
+        --admin) admin=1 ;;
+        --admin=*) admin_value "${w#*=}" "${GHX[i]}" && admin=1 ;;
+        --remove-label)
+          removed+=("${GHW[i + 1]-}")
+          removed_x+=("${GHX[i + 1]:-0}")
           ;;
+        --remove-label=*)
+          removed+=("${w#*=}")
+          removed_x+=("${GHX[i]}")
+          ;;
+        # `gh alias set --shell`: the expansion is a shell command (see the alias rule below).
+        -s | --shell) [ "$sub1 $sub2" = "alias set" ] && alias_shell=1 ;;
       esac
       case "$w" in
         --*=*)
+          [ "${w%%=*}" = --label ] && label_named "${w#*=}" "${GHX[i]}" && has_label=1
           i=$((i + 1))
           continue
           ;;
         --?*)
           # An option the shell fills in may turn into any option at all (`--repo x`).
           [ "${GHX[i]}" = 1 ] && opaque=1
+          [ "$w" = --label ] && label_named "${GHW[i + 1]-}" "${GHX[i + 1]:-0}" && has_label=1
           if [[ "$values" == *" $w "* ]]; then i=$((i + 2)); else i=$((i + 1)); fi
           continue
           ;;
@@ -1165,7 +1870,13 @@ check_gh() {
                 repo_exp="${GHX[i]}"
               fi
               ;;
-            l) has_label=1 ;;
+            l)
+              if [ "$SC_NEXT" -eq 1 ]; then
+                label_named "${GHW[i + 1]-}" "${GHX[i + 1]:-0}" && has_label=1
+              else
+                label_named "$SC_VALUE" "${GHX[i]}" && has_label=1
+              fi
+              ;;
           esac
           if [ "$SC_NEXT" -eq 1 ]; then i=$((i + 2)); else i=$((i + 1)); fi
           continue
@@ -1174,22 +1885,85 @@ check_gh() {
     fi
     if [ -z "$sub1" ]; then
       sub1="$w"
+      # `gh api`'s options take values too: `-X POST graphql` names the endpoint graphql, not POST.
+      [ "$sub1" = api ] && values+="${GH_VALUE_API# }"
     elif [ -z "$sub2" ]; then
       sub2="$w"
+      sub2_x="${GHX[i]}"
       case "$sub1 $sub2" in
         "pr merge") values+="${GH_VALUE_PR_MERGE# }" ;;
         "pr create") values+="${GH_VALUE_PR_CREATE# }" ;;
+        "pr edit" | "issue edit") values+="${GH_VALUE_EDIT# }" ;;
+        "label edit") values+="${GH_VALUE_LABEL_EDIT# }" ;;
       esac
     elif [ "$sub1 $sub2" = "pr merge" ] && [ "$merge_set" -eq 0 ]; then
       merge_arg="$w"
       pr_exp="${GHX[i]}"
       merge_set=1
+    elif { [ "$sub1 $sub2" = "label delete" ] || [ "$sub1 $sub2" = "label edit" ]; } && [ "$label_set" -eq 0 ]; then
+      label_arg="$w"
+      label_x="${GHX[i]}"
+      label_set=1
+    elif [ "$sub1 $sub2" = "alias set" ]; then
+      alias_pos+=("$w")
+      alias_pos_x+=("${GHX[i]}")
     elif [ "${GHX[i]}" = 1 ]; then
       # A positional gh would reject, unless the shell turns it into options (`--repo x`).
       opaque=1
     fi
     i=$((i + 1))
   done
+
+  # `gh pr merge --admin` merges past branch protection and the required checks, so it is denied
+  # whatever the policy says about merging (see "Merging belongs to GitHub Actions" below). No other
+  # gh command has --admin, and --remove-label is `pr edit`'s, `issue edit`'s and `discussion
+  # edit`'s: on any other first word (an alias, `gh pm 5 --admin`, or an extension that hands its
+  # flags on) both rules still apply, and gh rejects the flag anyway where it is unknown.
+  if [ "$admin" -eq 1 ]; then
+    deny "gh pr merge --admin merges past the branch protection and the required checks, the gates every merge has to clear" \
+      "merge without --admin once the checks are green, where the repository's policy lets an agent merge; a PR that protection still blocks is for a human: leave it ready and say so"
+  fi
+  # The human-review label and no-automerge come off only by a human's hand (see owner_label_word).
+  if [ "${#removed[@]}" -gt 0 ]; then
+    for ((i = 0; i < ${#removed[@]}; i++)); do
+      owner_label_list "${removed[i]}" "${removed_x[i]}" || continue
+      a="gh ${sub1} ${sub2} --remove-label '${removed[i]//\$__GUARD_SUBST__/\$(…)}'"
+      if [ "${removed_x[i]}" = 1 ]; then
+        deny_owner_label "${a} names the labels to take off with something the shell fills in later, which the guard cannot read: it may be ${HELD_LABEL}"
+      fi
+      deny_owner_label "${a} takes ${HELD_LABEL} off"
+    done
+  fi
+  if [ "$label_set" -eq 1 ] && owner_label_word "$label_arg" "$label_x"; then
+    a="gh label ${sub2} '${label_arg//\$__GUARD_SUBST__/\$(…)}'"
+    if [ "$label_x" = 1 ]; then
+      deny_owner_label "${a} names the label with something the shell fills in later, which the guard cannot read: it may be ${HELD_LABEL}"
+    fi
+    deny_owner_label "${a} deletes or rewrites the ${HELD_LABEL} label itself"
+  fi
+  # `gh alias set <name> <expansion>`: the alias runs its expansion later, out of the guard's sight,
+  # with the alias's own arguments appended. So the expansion is judged now, as the command it will
+  # be: a shell command (`--shell`, or `!` in front) as it stands, a gh one as `gh <expansion>` plus
+  # arguments the shell fills in, and as half a command (PARTIAL), since which PR it merges and in
+  # which repository are only known when it runs.
+  # An expansion read from stdin (`-`) or filled in by the shell cannot be judged now, and `gh alias
+  # import` defines its aliases from a file or stdin: both are denied, with the way that is read.
+  if [ "$sub1 $sub2" = "alias import" ]; then
+    deny "gh alias import defines aliases from a file or stdin, which the guard cannot read, and an alias runs its expansion later, out of the guard's sight" \
+      "define each alias with gh alias set <name> '<expansion>', the expansion written in the command"
+  fi
+  if [ "$sub1 $sub2" = "alias set" ] && [ "${#alias_pos[@]}" -ge 2 ]; then
+    a="${alias_pos[1]}"
+    if [ "$a" = - ] || [ "${alias_pos_x[1]}" = 1 ]; then
+      deny "gh alias set takes its expansion from stdin or from something the shell fills in, which the guard cannot read, and the alias runs it later, out of the guard's sight" \
+        "write the expansion in the command: gh alias set <name> '<expansion>'"
+    fi
+    if [ "$alias_shell" -eq 1 ] || [[ "$a" == '!'* ]]; then
+      check_segment "${a#!}"
+    else
+      check_segment $'\t'"gh ${a} ${XARGS_PLACEHOLDER}"
+    fi
+  fi
 
   # Half a command (see PARTIAL in check_segment) is not judged by the two rules that need the
   # WHOLE one: which PR, in which repository, and whether a label is there. Its masked twin, the
@@ -1229,22 +2003,1779 @@ check_gh() {
           ;;
       esac
     done
-    # The mutation may be split across segments by tokenization; search the
-    # whole command (SEGMENTS is global).
-    if [[ "$SEGMENTS" == *mergePullRequest* ]]; then
-      deny_human_merge "gh api graphql with mergePullRequest merges the PR"
+    # The endpoint as gh reads it (quotes taken out) and as GitHub routes it: a query string or a
+    # fragment after it still reaches the merge (see api_path).
+    api_path "$sub2"
+    if [[ "$API_PATH" =~ (^|/)pulls/[^/]+/merge$ || "$API_PATH" =~ (^|/)merges$ ]]; then
+      deny_human_merge "gh api on a merge endpoint is equivalent to merging the PR"
     fi
+    # The mutation may be split across segments by tokenization; search the
+    # whole command (SEGMENTS is global), read without the shell's quotes and backslashes, which
+    # GitHub never sees. Merging a PR, queueing it for the merge queue,
+    # arming auto-merge and merging one branch into another are all merges.
+    bare_text "$SEGMENTS"
+    a="$BARE_TEXT"
+    case "$a" in
+      *mergePullRequest* | *enablePullRequestAutoMerge* | *enqueuePullRequest* | *mergeBranch*)
+        deny_human_merge "gh api graphql with a merge mutation (mergePullRequest, enablePullRequestAutoMerge, enqueuePullRequest, mergeBranch) merges the PR"
+        ;;
+    esac
+    # A label mutation names labels by id, which says nothing about which label it is: any one
+    # that removes, replaces, renames or deletes labels may take revision-humana or no-automerge off.
+    # labelIds may come before the mutation that uses it (`-F 'input[labelIds][]=' -f query=…`).
+    # Only a request to the GraphQL endpoint (or to one the shell fills in) carries a mutation.
+    if [[ "$API_PATH" == graphql || "$API_PATH" == */graphql || "$sub2_x" = 1 ]]; then
+      case "$a" in
+        *removeLabelsFromLabelable* | *clearLabelsFromLabelable* | *updateLabel* | *deleteLabel*) label_mut=1 ;;
+        *updatePullRequest* | *updateIssue*) [[ "$a" == *labelIds* ]] && label_mut=1 ;;
+      esac
+    fi
+    if [ "$label_mut" -eq 1 ]; then
+      HELD_LABEL="$OWNER_LABELS"
+      deny_owner_label "gh api graphql with a mutation that removes, replaces, renames or deletes labels (removeLabelsFromLabelable, clearLabelsFromLabelable, labelIds in updatePullRequest/updateIssue, updateLabel, deleteLabel) names them by id, so the guard cannot tell it leaves ${OWNER_LABEL} and ${NOAUTO_LABEL} alone"
+    fi
+    # The GraphQL twins of a ref's DELETE and PATCH (see check_gh_api_refs): deleteRef and updateRef
+    # name the ref by its id, and updateRefs moves any number of them at once, with force when asked.
+    # createCommitOnBranch commits onto any branch it names, main included: a push without git push.
+    # The guard cannot tell they leave develop and main alone. No real command of the 31 days to
+    # 2026-10-02 uses them.
+    if [[ "$API_PATH" == graphql || "$API_PATH" == */graphql || "$sub2_x" = 1 ]]; then
+      case "$a" in
+        *deleteRef* | *updateRef* | *createCommitOnBranch*)
+          deny "gh api graphql with a mutation that deletes, moves or commits onto refs (deleteRef, updateRef, updateRefs, createCommitOnBranch) names them by id, moves several at once or names the branch in a body, so the guard cannot tell it leaves the long-lived branches alone" \
+            "update your own branch with git push (--force-with-lease after a rebase) and delete a finished one with git push origin --delete <branch>, which the guard reads; a long-lived branch is a human's"
+          ;;
+      esac
+      # The GraphQL twins of writing branch protection and rulesets (see check_gh_api_protection).
+      # Only the mutation names: a read may name the types (`... on BranchProtectionRule`). Only in
+      # the request, read as GraphQL reads it, when the guard can read it all (gql_document): a grep
+      # or an echo in the same command, and a comment body inside another mutation, are not one
+      # (found 2026-10-03, verifying this change). Otherwise in the whole command, as above.
+      local doc="$a"
+      gql_document && doc="$GQL_DOC"
+      case "$doc" in
+        *createBranchProtectionRule* | *updateBranchProtectionRule* | *deleteBranchProtectionRule* | *createRepositoryRuleset* | *updateRepositoryRuleset* | *deleteRepositoryRuleset*)
+          deny "gh api graphql with a mutation that creates, changes or deletes a branch protection rule or a ruleset (createBranchProtectionRule, updateBranchProtectionRule, deleteBranchProtectionRule, createRepositoryRuleset, updateRepositoryRuleset, deleteRepositoryRuleset): branch protection and rulesets are the repository owner's settings" \
+            "$PROTECTION_HINT"
+          ;;
+      esac
+    fi
+    check_gh_api_labels "$sub2" "$sub2_x"
+    check_gh_api_refs "$sub2" "$sub2_x"
+    check_gh_api_protection "$sub2" "$sub2_x"
+    case "$sub2" in
+      graphql | */graphql) [ "$PARTIAL" -eq 0 ] && check_gh_graphql_query ;;
+    esac
   fi
   return 0
 }
 
-check_env_dump() {
-  local a
-  for a in "${tok[@]:1}"; do
-    if is_env_file "$a"; then
-      deny "dumping the contents of '${a}' would expose credentials in the transcript" \
-        "read its template instead (.env.example, or .env.<name>.example / .sample / .template) or ask the user for the specific value"
+# Does this --label value name a label? <value> <1 if the shell fills it in>. An empty one (or
+# only commas and blanks) adds none; one the shell fills in counts, like any other option value.
+label_named() {
+  local v="$1" x="${2:-0}"
+  [ "$x" = 1 ] && return 0
+  v="${v//[[:space:],]/}"
+  [ -n "$v" ]
+}
+
+# The merge mutations above are read in the command, so a `gh api graphql` whose query is NOT
+# written in the command cannot be judged: the query must be text in it. Denied: the request body
+# from a file or stdin (--input), the query field from a file or stdin (-F query=@…), an empty
+# query, a query cut short (more `{` than `}`: the rest of it is not in what the guard
+# reads), a command substitution or backtick anywhere in it, and a shell variable in any query
+# that is not a read: only a query whose own text starts with `{` or `query` (an operation that
+# cannot be a mutation) may hold one (`issue(number:$n)` in a loop).
+GQL_NOT_WRITTEN_HINT="write the query in the command (gh api graphql -f query='...') and pass its values as fields (-F name=value, -F name=@file); a shell variable is fine inside a read query ({...} or query ...), never inside a mutation; merging a PR through the API is human-only"
+check_gh_graphql_query() {
+  local i=0 n=${#GHW[@]} w v x letter open close head
+  while [ "$i" -lt "$n" ]; do
+    w="${GHW[i]}"
+    v="" x=0 letter=""
+    case "$w" in
+      --input | --input=*)
+        deny "gh api graphql --input reads the request from a file or stdin, which the guard does not read" "$GQL_NOT_WRITTEN_HINT"
+        ;;
+      --field | --raw-field)
+        letter="${w#--}" v="${GHW[i + 1]-}" x="${GHX[i + 1]:-0}"
+        i=$((i + 1))
+        ;;
+      --field=* | --raw-field=*)
+        letter="${w%%=*}" letter="${letter#--}" v="${w#*=}" x="${GHX[i]}"
+        ;;
+      --?*) [[ "$GH_VALUE_GLOBAL$GH_VALUE_API" == *" $w "* ]] && i=$((i + 1)) ;;
+      -?*)
+        short_cluster "$w" "$GH_VALUE_GLOBAL$GH_VALUE_API"
+        case "$SC_LETTER" in
+          F | f)
+            letter="$SC_LETTER"
+            if [ "$SC_NEXT" -eq 1 ]; then v="${GHW[i + 1]-}" x="${GHX[i + 1]:-0}"; else v="$SC_VALUE" x="${GHX[i]}"; fi
+            ;;
+        esac
+        [ "$SC_NEXT" -eq 1 ] && i=$((i + 1))
+        ;;
+    esac
+    i=$((i + 1))
+    [ -n "$letter" ] || continue
+    [ "${v%%=*}" = query ] || continue
+    v="${v#*=}"
+    case "$letter" in
+      F | field)
+        case "$v" in
+          @*) deny "gh api graphql -F query=@… reads the query from a file or stdin, which the guard does not read" "$GQL_NOT_WRITTEN_HINT" ;;
+        esac
+        ;;
+    esac
+    # Counted and cut byte by byte or with a regular expression (see TRAIL_BLANKS_RE): a query of
+    # 60 KB took 5 s here in a UTF-8 locale (#302).
+    gql_braces "$v"
+    open="$GQL_OPEN" close="$GQL_CLOSE"
+    [[ "$v" =~ $LEAD_BLANKS_RE ]]
+    head="${v:${#BASH_REMATCH[0]}}"
+    if [[ "$v" =~ $ONLY_BLANKS_RE ]] || [ "$open" -gt "$close" ] \
+      || [[ "$v" == *__GUARD_SUBST__* || "$v" == *'`'* ]] \
+      || { [ "$x" = 1 ] && [[ "$head" != '{'* && "$head" != query* ]]; }; then
+      deny "gh api graphql with a query that is not written in the command ('query=${v//\$__GUARD_SUBST__/\$(…)}')" "$GQL_NOT_WRITTEN_HINT"
     fi
+  done
+  return 0
+}
+# gql_braces <query>: how many `{` and `}` it holds, in GQL_OPEN and GQL_CLOSE: the fields the text
+# splits into at each, less one (a byte after it, so a last one counts too), as bare_text splits. Not
+# by taking every other character out (`${1//[^\{]/}`): in a UTF-8 locale, and in the bash 3.2 of
+# macOS in any, that costs the square of the text's length (20,000 `#` took 10 s; #302).
+GQL_OPEN=0
+GQL_CLOSE=0
+LEAD_BLANKS_RE='^[[:space:]]*'
+ONLY_BLANKS_RE='^[[:space:]]*$'
+LEAD_TABS_RE=$'^\t*'
+FIRST_LINE_RE=$'^[^\n]*'
+gql_braces() {
+  local IFS noglob=0
+  local -a parts=()
+  case "$-" in *f*) noglob=1 ;; esac
+  set -f
+  IFS='{'
+  # shellcheck disable=SC2206 # splitting is the point; globbing is off
+  parts=($1.)
+  GQL_OPEN=$((${#parts[@]} - 1))
+  IFS='}'
+  # shellcheck disable=SC2206 # splitting is the point; globbing is off
+  parts=($1.)
+  GQL_CLOSE=$((${#parts[@]} - 1))
+  [ "$noglob" -eq 1 ] || set +f
+  return 0
+}
+
+# --- Merging belongs to GitHub Actions; the human-review label belongs to a human -------------
+# The merge-when-green workflow merges a PR from a GitHub Actions job, with a GitHub App's token and
+# after its own gates (the risk class, CI judged job by job, the integration branch green). A
+# session reads that decision (`pr-merge.sh decide`, read-only) and, where its repository's policy
+# lets an agent merge at all, merges with a plain `gh pr merge` once the gates are green; it never
+# stands in for the job. So, in a session, whatever the policy says:
+#   - `gh pr merge --admin` is denied: it merges past branch protection and the required checks
+#     (in check_gh);
+#   - the job's merge step, `pr-merge.sh merge` (`pr_merge.py merge` underneath), is denied
+#     (check_mwg_merge);
+#   - GITHUB_ACTIONS and MWG_WRITE_TOKEN_KIND are never assigned, exported or read into: they are
+#     what tells that step it runs as the job with the App's token (check_ci_identity_*);
+#   - `revision-humana` and `no-automerge` never come off a PR or an issue: the first is how a
+#     change reaches a human reviewer, the second keeps merge-when-green from merging the PR on its
+#     own, and only a human takes either off (owner_label_*, check_gh_api_labels). Adding them,
+#     reading them and filtering by them are untouched, and so is removing any other label;
+#   - branch protection and rulesets are not changed through the API (check_gh_api_protection):
+#     they are what stops a merge or a push the gates above do not see, and they are the owner's.
+
+# admin_value <value of --admin=…> <1 if the shell fills it in>: does it switch --admin on? gh
+# reads it as a boolean; only a written false leaves it off.
+admin_value() {
+  [ "${2:-0}" = 1 ] && return 0
+  case "$1" in
+    false | False | FALSE | f | F | 0) return 1 ;;
+  esac
+  return 0
+}
+
+# The labels only a human takes off: the human-review label, and the one that keeps
+# merge-when-green from merging a PR on its own (it skips a PR that carries it, and one that ever
+# carried it). GitHub matches label names without regard to case, so the comparison ignores it too,
+# and so do the blanks around a name. merge-when-green also skips `sin-revision-independiente` and
+# `merge-freeze`; those two are not read here.
+OWNER_LABEL="revision-humana"
+OWNER_LABEL_GLOB='[Rr][Ee][Vv][Ii][Ss][Ii][Oo][Nn]-[Hh][Uu][Mm][Aa][Nn][Aa]'
+NOAUTO_LABEL="no-automerge"
+NOAUTO_LABEL_GLOB='[Nn][Oo]-[Aa][Uu][Tt][Oo][Mm][Ee][Rr][Gg][Ee]'
+# Both, for a message about a label the guard cannot name.
+OWNER_LABELS="${OWNER_LABEL} or ${NOAUTO_LABEL}"
+# The one owner_label_word / owner_label_list matched last (OWNER_LABELS when it may be either).
+HELD_LABEL=""
+
+# owner_label_word <label name> <1 if the shell fills it in>: may it be one of those labels? One the
+# shell fills in may be anything, so it may. Which one goes in HELD_LABEL. Braces make several names
+# of one (`no-autom{e..e}rge`): each counts, and past the ones brace_words makes, it may be either.
+owner_label_word() {
+  local b
+  if [ "${2:-0}" = 1 ]; then
+    HELD_LABEL="$OWNER_LABELS"
+    return 0
+  fi
+  brace_words "$1"
+  for b in "${BRACE_OUT[@]}"; do
+    owner_label_name "$b" && return 0
+  done
+  if [ "$BRACE_OVER" -eq 1 ]; then
+    HELD_LABEL="$OWNER_LABELS"
+    return 0
+  fi
+  return 1
+}
+# owner_label_name <one name>: is it one of those labels? A pattern (`no-automerg?`, `[n]o-automerge`)
+# is a file name the shell puts in its place when one matches, in the directory where it runs, which
+# the same command may have made (`touch no-automerge && …`): it counts when it matches either.
+owner_label_name() {
+  local v="$1" l
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  # shellcheck disable=SC2254 # the glob is the point: it matches the name in any case
+  case "$v" in
+    $OWNER_LABEL_GLOB)
+      HELD_LABEL="$OWNER_LABEL"
+      return 0
+      ;;
+    $NOAUTO_LABEL_GLOB)
+      HELD_LABEL="$NOAUTO_LABEL"
+      return 0
+      ;;
+  esac
+  if [[ "$v" == *[\*\?\[]* ]]; then
+    # Lowercased; the bash 3.2 of macOS has no ${v,,} (there it stopped the guard, and the command ran).
+    if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
+      v="${v,,}"
+    else
+      v="$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')"
+    fi
+    for l in "$OWNER_LABEL" "$NOAUTO_LABEL"; do
+      # shellcheck disable=SC2053 # the pattern is the point
+      if [[ "$l" == $v ]]; then
+        HELD_LABEL="$l"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+# owner_label_list <value of --remove-label> <1 if the shell fills it in>: gh reads the value as a
+# comma-separated list (CSV: a name may come in double quotes). Does any name in it, or anything the
+# shell fills in, stand for one of those labels? Each name costs up to the length of the list, so
+# 50,000 of them took more than 40 s: the judge's time limit holds inside the loop (#302).
+owner_label_list() {
+  local v e b
+  if [ "${2:-0}" = 1 ]; then
+    HELD_LABEL="$OWNER_LABELS"
+    return 0
+  fi
+  # Brace expansion makes several words of one (`--remove-label={revision-humana,x}`): each counts.
+  brace_words "$1"
+  for b in "${BRACE_OUT[@]}"; do
+    v="${b//\"/}"
+    while :; do
+      check_deadline
+      e="${v%%,*}"
+      owner_label_word "$e" 0 && return 0
+      [ "$e" = "$v" ] && break
+      v="${v#*,}"
+    done
+  done
+  return 1
+}
+
+# deny_owner_label <what the command does>: the reason names the label in HELD_LABEL (both when it
+# is OWNER_LABELS), and says why that label stays.
+deny_owner_label() {
+  local why name="$HELD_LABEL"
+  case "$name" in
+    "$OWNER_LABEL") why="${OWNER_LABEL} is how a change reaches a human reviewer" ;;
+    "$NOAUTO_LABEL") why="${NOAUTO_LABEL} keeps merge-when-green from merging the PR on its own" ;;
+    *)
+      name="<label>"
+      why="${OWNER_LABEL} is how a change reaches a human reviewer and ${NOAUTO_LABEL} keeps merge-when-green from merging the PR on its own"
+      ;;
+  esac
+  deny "$1. ${why}, and only a human takes it off" \
+    "leave it on; if the reason for it no longer holds, say so in the PR's ## TL;DR and give the reviewer the command (gh pr edit <n> --repo <owner>/<name> --remove-label ${name}), in a body written with --body-file or a heredoc: a command written inside a quoted --body is read as one. Any other label comes off with gh pr edit <n> --remove-label <name>, the name written in the command"
+}
+
+# pct_decode <text>: <text> with each percent-escape decoded once, in PCT_DECODED; one that is not
+# two hex digits stays as written. Cut at each `%` with IFS, as gql_braces counts: linear, in any
+# bash and locale.
+PCT_DECODED=""
+pct_decode() {
+  local LC_ALL=C
+  local IFS=% piece h c noglob=0 first=1
+  local -a pieces=()
+  case "$-" in *f*) noglob=1 ;; esac
+  set -f
+  # shellcheck disable=SC2206 # splitting is the point; globbing is off
+  pieces=($1.)
+  [ "$noglob" -eq 1 ] || set +f
+  PCT_DECODED=""
+  for piece in "${pieces[@]}"; do
+    check_deadline
+    if [ "$first" -eq 1 ]; then
+      PCT_DECODED="$piece"
+      first=0
+      continue
+    fi
+    h="${piece:0:2}"
+    if [[ "$h" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+      printf -v c '%b' "\\x$h"
+      PCT_DECODED+="$c${piece:2}"
+    else
+      PCT_DECODED+="%$piece"
+    fi
+  done
+  PCT_DECODED="${PCT_DECODED%.}"
+  return 0
+}
+
+# api_eol <gh api endpoint>: does it hold a line break (LF or CR), written or percent-encoded once or
+# more (`%0a`, `%250a`, `%25%30%61`)? An escape whose digits the shell fills in or expands (`%$X`,
+# `%0$X`, `%{0,1}a`, `{%0,x}a`, at any depth) may be one. Decoded up to API_EOL_PASSES times, while
+# escapes are left; one still holding escapes after them is read as holding a line break. An
+# endpoint with one is denied whole (api_path): the path GitHub routes it to is not one the guard
+# reads, and no real request writes one (none in the transcripts of the 31 days to 2026-10-03).
+API_EOL_PASSES=4
+API_ESCAPE_RE='%[0-9A-Fa-f]{2}'
+API_FILLED_ESCAPE_RE='%[0-9A-Fa-f]?[$`{},]'
+api_eol() {
+  local LC_ALL=C
+  local t="$1" k
+  for ((k = 0; k <= API_EOL_PASSES; k++)); do
+    [[ "$t" == *[$'\n\r']* ]] && return 0
+    [[ "$t" =~ $API_FILLED_ESCAPE_RE ]] && return 0
+    [[ "$t" =~ $API_ESCAPE_RE ]] || return 1
+    [ "$k" -lt "$API_EOL_PASSES" ] || return 0
+    pct_decode "$t"
+    t="$PCT_DECODED"
+  done
+  return 0
+}
+
+# api_endpoint_text <gh api endpoint>: the endpoint as its escapes are read, in API_EP_TEXT: each
+# substitution (`$(…)`, `$((…))`, backquotes) written as `$_`, since its text never reaches the URL
+# (its output may, as any part the shell fills in: see api_eol), and a `${name%pattern}` written as
+# `$_{namepattern}`, since its `%` or `%%` is the shell's (`${sha%% *}`), not an escape; what its
+# pattern holds is still read. At most API_EP_TEXT_MAX of each are rewritten; past them, the rest
+# is read as written.
+API_EP_TEXT=""
+API_EP_TEXT_MAX=64
+API_EP_SUBST_RE='^(.*)(\$\(\([^()]*\)\)|\$\([^()]*\)|`[^`]*`)(.*)$'
+API_EP_PARAM_PCT_RE='^(.*)\$\{(#?[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?)%%?(.*)$'
+api_endpoint_text() {
+  local LC_ALL=C
+  local t="$1" k=0
+  if [[ "$t" == *'$('* || "$t" == *'`'* ]]; then
+    while [ "$k" -lt "$API_EP_TEXT_MAX" ] && [[ "$t" =~ $API_EP_SUBST_RE ]]; do
+      check_deadline
+      t="${BASH_REMATCH[1]}\$_${BASH_REMATCH[3]}"
+      k=$((k + 1))
+    done
+  fi
+  k=0
+  if [[ "$t" == *'${'*%* ]]; then
+    while [ "$k" -lt "$API_EP_TEXT_MAX" ] && [[ "$t" =~ $API_EP_PARAM_PCT_RE ]]; do
+      check_deadline
+      t="${BASH_REMATCH[1]}\$_{${BASH_REMATCH[2]}${BASH_REMATCH[4]}"
+      k=$((k + 1))
+    done
+  fi
+  API_EP_TEXT="$t"
+  return 0
+}
+
+# api_bad_escape <gh api endpoint>: does its path (before any query or fragment) hold a `%` without
+# two hex digits after it? gh does not send such a path (Go's URL parser refuses it), and how to
+# read it hangs on the locale (`%0é` was read as an escape in UTF-8 and not in C): an endpoint with
+# one is denied (api_path), not guessed.
+API_BAD_ESCAPE_RE='%([^0-9A-Fa-f]|[0-9A-Fa-f][^0-9A-Fa-f]|[0-9A-Fa-f]?$)'
+api_bad_escape() {
+  local LC_ALL=C
+  local p="${1%%#*}"
+  p="${p%%\?*}"
+  [[ "$p" =~ $API_BAD_ESCAPE_RE ]]
+}
+
+# api_path <gh api endpoint>: the path the request reaches, in API_PATH: without scheme, host,
+# query and fragment; percent-escapes decoded (an escaped `/` excepted, which stays part of its
+# segment); `.` and `..` segments resolved, the way the server reads the path. An endpoint holding a
+# line break, written or encoded (api_eol), or a malformed escape (api_bad_escape), is denied. Byte
+# by byte (LC_ALL=C), the scheme and host cut with regular expressions (see TRAIL_BLANKS_RE). Each
+# step of its loops costs up to the path's length, so a path written to repeat itself (5000 `%41`,
+# 20000 segments) took 11 s: the judge's time limit holds inside them (#302).
+API_PATH=""
+API_EOL_FREE=""
+api_path() {
+  local LC_ALL=C p="$1" out="" h c seg
+  local -a parts=() kept=()
+  # The checks of one endpoint read it several times: the last one found free of line breaks and
+  # malformed escapes is not read again.
+  [ "$p" = "$API_EOL_FREE" ] || api_endpoint_text "$p"
+  if [ "$p" != "$API_EOL_FREE" ] && api_eol "$API_EP_TEXT"; then
+    deny "gh api with a line break in its endpoint, written, percent-encoded (%0a, %0d, or encoded again, %250a) or in an escape the shell fills in or expands (%\$X, %{0,1}a): GitHub decodes the path, and the one a line break makes it reach is not the one the guard reads" \
+      "write the endpoint on one line and without encoded line breaks; text with line breaks goes in a field (-f body=..., --input), which gh encodes itself"
+  fi
+  if [ "$p" != "$API_EOL_FREE" ] && api_bad_escape "$API_EP_TEXT"; then
+    deny "gh api with a malformed percent-escape in the path of its endpoint (a % without two hex digits after it): gh does not send that path as written, and the guard does not guess which one it is" \
+      "write a literal % as %25, and each escape as % and two hex digits"
+  fi
+  API_EOL_FREE="$p"
+  p="${p%%#*}"
+  p="${p%%\?*}"
+  case "$p" in
+    *://*)
+      [[ "$p" =~ '://'(.*)$ ]]
+      p="${BASH_REMATCH[1]}"
+      if [[ "$p" =~ /(.*)$ ]]; then p="${BASH_REMATCH[1]}"; else p=""; fi
+      ;;
+  esac
+  while [[ "$p" == *%* ]]; do
+    check_deadline
+    out+="${p%%\%*}"
+    p="${p#*%}"
+    h="${p:0:2}"
+    if [[ "$h" =~ ^[0-9A-Fa-f]{2}$ ]] && [[ "$h" != 2[Ff] ]] && [[ "$h" != 00 ]]; then
+      printf -v c '%b' "\\x$h"
+      out+="$c"
+      p="${p:2}"
+    else
+      out+="%"
+    fi
+  done
+  p="$out$p"
+  words_of "$p" /
+  parts=(${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"})
+  for seg in ${parts[@]+"${parts[@]}"}; do
+    check_deadline
+    case "$seg" in
+      '' | .) ;;
+      ..) [ "${#kept[@]}" -gt 0 ] && unset 'kept[${#kept[@]}-1]' ;;
+      *) kept+=("$seg") ;;
+    esac
+  done
+  API_PATH=""
+  for seg in ${kept[@]+"${kept[@]}"}; do
+    check_deadline
+    API_PATH+="${API_PATH:+/}$seg"
+  done
+  # A trailing slash names the collection itself: kept as an empty last segment.
+  [[ "$p" == */ ]] && API_PATH+="/"
+  return 0
+}
+
+# The REST endpoints that take a label off: one label of an issue or PR (DELETE), all of them
+# (DELETE, or PUT, which replaces them), the label itself in the repository (DELETE, or PATCH,
+# which renames it), and an issue or PR edited with a `labels` field (PATCH, which replaces them).
+# PRs carry their labels through the issues endpoints. GitHub takes POST for PATCH on these two
+# (measured 2026-10-01: both answer as "update an issue" / "update a label"), and gh sends POST
+# when no method is given but fields or --input are (`gh api repos/o/n/issues/5 -f 'labels[]=x'`).
+# A method the shell fills in may be any. A body read with --input is not visible, except in the
+# command itself (`echo '{"labels":[]}' | gh api … --input -`, a heredoc): one that names `labels`
+# counts as a labels field.
+API_ISSUE_LABELS_RE='(^|/)issues/[^/]+/labels(/(.*))?$'
+API_REPO_LABEL_RE='(^|/)labels/([^/]+)$'
+API_ISSUE_RE='(^|/)issues/[^/]+$'
+
+# gh_api_request: the request a `gh api` call in GHW sends. API_METHOD is the method as GitHub gets
+# it: GET, POST, PUT, PATCH, DELETE, OTHER, or ANY when the shell fills it in; without -X, gh sends
+# POST when fields or --input are given and GET otherwise. API_KEYS holds the names of its fields
+# (-f/-F/--field/--raw-field) and API_FIELDS the fields whole (`name=value`); API_INPUT is 1 when
+# it reads a body with --input, and API_INPUT_FILE is 1 when that body comes from a file the guard
+# does not read: a file name (`--input f.json`), one the shell fills in (`"$F"`, `$(…)`), a process
+# substitution (`<(cat f.json)`), or stdin redirected from a file (`--input - < f.json`). Stdin
+# otherwise (a pipe, a heredoc, a here-string) is judged by the text the command holds.
+API_METHOD=""
+API_INPUT=0
+API_INPUT_FILE=0
+API_KEYS=()
+API_FIELDS=()
+# api_input_source <value of --input>: sets API_INPUT_FILE, the redirection of stdin aside.
+API_INPUT_STDIN=0
+api_input_source() {
+  case "$1" in
+    - | /dev/stdin | /dev/fd/0 | /proc/self/fd/0) API_INPUT_STDIN=1 ;;
+    '') ;;
+    *) API_INPUT_FILE=1 ;;
+  esac
+  return 0
+}
+gh_api_request() {
+  local i=0 n=${#GHW[@]} w method="" method_x=0 key params=0
+  API_INPUT=0
+  API_INPUT_FILE=0
+  API_INPUT_STDIN=0
+  API_KEYS=()
+  API_FIELDS=()
+  while [ "$i" -lt "$n" ]; do
+    w="${GHW[i]}" key=""
+    case "$w" in
+      --) break ;;
+      -X | --method)
+        method="${GHW[i + 1]-}" method_x="${GHX[i + 1]:-0}"
+        i=$((i + 1))
+        ;;
+      --method=*) method="${w#*=}" method_x="${GHX[i]}" ;;
+      -f | -F | --field | --raw-field)
+        key="${GHW[i + 1]-}" params=1
+        i=$((i + 1))
+        ;;
+      --field=* | --raw-field=*) key="${w#*=}" params=1 ;;
+      --input)
+        API_INPUT=1
+        api_input_source "${GHW[i + 1]-}"
+        i=$((i + 1))
+        ;;
+      --input=*)
+        API_INPUT=1
+        api_input_source "${w#*=}"
+        ;;
+      --?*) [[ "$GH_VALUE_GLOBAL$GH_VALUE_API" == *" $w "* ]] && i=$((i + 1)) ;;
+      -?*)
+        short_cluster "$w" "$GH_VALUE_GLOBAL$GH_VALUE_API"
+        case "$SC_LETTER" in
+          X)
+            if [ "$SC_NEXT" -eq 1 ]; then method="${GHW[i + 1]-}" method_x="${GHX[i + 1]:-0}"; else method="$SC_VALUE" method_x="${GHX[i]}"; fi
+            ;;
+          f | F)
+            if [ "$SC_NEXT" -eq 1 ]; then key="${GHW[i + 1]-}"; else key="$SC_VALUE"; fi
+            params=1
+            ;;
+        esac
+        [ "$SC_NEXT" -eq 1 ] && i=$((i + 1))
+        ;;
+    esac
+    if [ -n "$key" ]; then
+      API_KEYS+=("${key%%=*}")
+      API_FIELDS+=("$key")
+    fi
+    i=$((i + 1))
+  done
+  # Stdin redirected from a file (`< f.json`, `0<f.json`; not a heredoc, a here-string or `<&`), in
+  # its words or anywhere in the command (see stdin_unread).
+  if [ "$API_INPUT_STDIN" -eq 1 ]; then
+    for w in ${GHW[@]+"${GHW[@]}"}; do
+      case "$w" in
+        '<' | '0<' | '<'[!'<(&']* | '0<'[!'<(&']*) API_INPUT_FILE=1 ;;
+      esac
+    done
+    [ "$API_INPUT_FILE" -eq 1 ] || ! stdin_unread || API_INPUT_FILE=1
+  fi
+  case "$method" in
+    '') if [ "$params" -eq 1 ] || [ "$API_INPUT" -eq 1 ]; then API_METHOD=POST; else API_METHOD=GET; fi ;;
+    [Gg][Ee][Tt]) API_METHOD=GET ;;
+    [Dd][Ee][Ll][Ee][Tt][Ee]) API_METHOD=DELETE ;;
+    [Pp][Uu][Tt]) API_METHOD=PUT ;;
+    [Pp][Aa][Tt][Cc][Hh]) API_METHOD=PATCH ;;
+    [Pp][Oo][Ss][Tt]) API_METHOD=POST ;;
+    *) API_METHOD=OTHER ;;
+  esac
+  [ "$method_x" = 1 ] && API_METHOD=ANY
+  return 0
+}
+
+# filled_in <word> <1 if the shell fills part of the command word in>: does <word> hold a part the
+# shell fills in ($NAME, `…`) or xargs' or parallel's replace string (`{}`)?
+filled_in() {
+  [ "${2:-0}" = 1 ] || return 1
+  [[ "$1" == *'$'* || "$1" == *'`'* ]] && return 0
+  [ -n "$PFX_REPL" ] && [[ "$1" == *"$PFX_REPL"* ]]
+}
+
+# Braces make several endpoints of one (`issues/5/labels/no-autom{e..e}rge`): each is judged.
+# stdin_unread: may stdin hold text the command does not show? Called on a gh api call whose words
+# send no file to its stdin (the caller looked), and that reads its body from there (`--input -`).
+#   - Its own here-string or heredoc is its stdin, whatever stands around it: unread when the
+#     here-string holds an expansion outside single quotes (`<<< "$(cat f)"`, `<<< $(<f)`,
+#     `<<< "$B"`), or when the heredoc's delimiter is not quoted and a body holds one.
+#   - A pipe into it (`echo '{…}' | gh api …`) is its stdin: not read here, the text it carries is
+#     judged as the command shows it. Told by the segment's place in the command (RAW_COMMAND): a
+#     `|` right before every place it stands.
+#   - Otherwise read in the whole command, since a redirection may stand in front of the command, on
+#     a group, a subshell or a loop around it, or on exec (`< f gh api …`, `{ gh api …; } < f`,
+#     `exec 0<f; gh api …`): an input redirection from a file, `<>`, or `< <(…)`; a here-string or
+#     heredoc as above. Broad on purpose: a `<` inside a quoted argument counts too.
+# Until 2026-10-03 the whole command was read in every case, and a `<` anywhere (in the quoted body
+# of the call's own heredoc, a `wc -l < f` further on, the `done < ids.txt` of the loop around a
+# pipe into it) took a body the guard reads for one it does not (found verifying #299).
+STDIN_FILE_RE='(^|[^<])[0-9]*<([^<(&]|$)'
+HEREDOC_OP_RE="(^|[^<])<<(-?)[[:space:]]*([\"'\\\\]?)([A-Za-z_][A-Za-z0-9_]*)"
+OWN_HEREDOC_RE="(^|[[:space:]])0?<<(-?)[[:space:]]*([\"'\\\\]?)([A-Za-z_][A-Za-z0-9_-]*)"
+OWN_HERESTRING_RE='(^|[[:space:]])0?<<<'
+stdin_unread() {
+  local line w delim="" strip=0 expand=0 k own=""
+  local -a lines=()
+  raw_command
+  for ((k = 0; k < ${#GHW[@]}; k++)); do
+    w="${GHW[k]}"
+    case "$w" in
+      '<<<' | 0'<<<')
+        own=hs
+        [ "${GHX[k + 1]:-1}" = 1 ] && return 0
+        ;;
+      '<<<'* | 0'<<<'*)
+        own=hs
+        [ "${GHX[k]}" = 1 ] && return 0
+        ;;
+      '<<'* | 0'<<'*) own=hd ;;
+    esac
+  done
+  # GHW has the quotes taken out: the segment, as written, says whether that word is a redirection
+  # (a blank before it, not a quote) and whether the heredoc's delimiter is quoted (then its body is
+  # what the command shows). An unquoted one is read as below, with the rest.
+  case "$own" in
+    hs) [[ "${seg-}" =~ $OWN_HERESTRING_RE ]] && return 1 ;;
+    hd)
+      if [[ "${seg-}" =~ $OWN_HEREDOC_RE ]]; then
+        [ -n "${BASH_REMATCH[3]}" ] && return 1
+      else
+        own=""
+      fi
+      ;;
+  esac
+  [ "$own" != hs ] || own=""
+  [ -n "$own" ] || ! stdin_piped || return 1
+  [ "$own" = hd ] || [[ ! "$RAW_COMMAND" =~ $STDIN_FILE_RE ]] || return 0
+  ! herestring_unread || return 0
+  mapfile_of "$RAW_COMMAND"
+  lines=(${MAPPED_LINES[@]+"${MAPPED_LINES[@]}"})
+  for line in ${lines[@]+"${lines[@]}"}; do
+    check_deadline
+    if [ -n "$delim" ]; then
+      # The tabs off the front with a regular expression (see TRAIL_BLANKS_RE): 200,000 of them
+      # took 57 s with `${line#"${line%%[!$'\t']*}"}` (#302).
+      if [ "$strip" -eq 1 ]; then
+        [[ "$line" =~ $LEAD_TABS_RE ]]
+        line="${line:${#BASH_REMATCH[0]}}"
+      fi
+      if [ "$line" = "$delim" ]; then
+        delim=""
+        continue
+      fi
+      [ "$expand" -eq 1 ] && [[ "$line" == *'$'* || "$line" == *'`'* ]] && return 0
+      continue
+    fi
+    if [[ "$line" =~ $HEREDOC_OP_RE ]]; then
+      delim="${BASH_REMATCH[4]}"
+      strip=0 expand=1
+      [ "${BASH_REMATCH[2]}" = - ] && strip=1
+      [ -n "${BASH_REMATCH[3]}" ] && expand=0
+    fi
+  done
+  return 1
+}
+# herestring_unread: does a here-string anywhere in the command (RAW_COMMAND) hand stdin what the
+# shell fills in (a `$` or a backtick in its line, the word not single-quoted)? Cut byte by byte
+# (LC_ALL=C) with regular expressions (see TRAIL_BLANKS_RE): `${w#*<<<}` and taking the blanks off
+# the front cost the square of the length before the cut (a here-string after 200 KB took 15 s, one
+# behind 200,000 blanks more than 60, #302). Byte by byte, the blanks taken off the front are the
+# ASCII ones, the only ones the shell splits words on.
+herestring_unread() {
+  local LC_ALL=C w="$RAW_COMMAND" line
+  while [[ "$w" =~ '<<<'(.*)$ ]]; do
+    check_deadline
+    w="${BASH_REMATCH[1]}"
+    [[ "$w" =~ $LEAD_BLANKS_RE ]]
+    line="${w:${#BASH_REMATCH[0]}}"
+    [[ "$line" =~ $FIRST_LINE_RE ]]
+    line="${BASH_REMATCH[0]}"
+    [[ "$line" == \'* ]] && continue
+    [[ "$line" == *'$'* || "$line" == *'`'* ]] && return 0
+  done
+  return 1
+}
+
+# stdin_piped: is the segment being judged (check_segment's seg) fed by a pipe wherever it stands
+# in the command? Its text found in RAW_COMMAND with `|` (or `|&`) before it, past blanks, every
+# time, and at least as many times as the extractor sent it (segs_holding): one the extractor
+# rewrote (a line joined, a substitution masked) is not found as written, and a pipe into a decoy
+# with the same text does not speak for it.
+# Not piped, the stricter reading, past what the guard spends looking for it (as_written_fits,
+# AS_WRITTEN_PLACES_MAX). Until 2026-10-03 each place cost the square of the length before it
+# (`${rest#*"$s"}`), and 500 piped copies of one call ran past ten seconds (#302): each match now
+# takes what follows it too (`(.*)$`, see TRAIL_BLANKS_RE).
+stdin_piped() {
+  local LC_ALL=C s="${seg-}" rest="$RAW_COMMAND" before found=0
+  [ -n "$s" ] || return 1
+  as_written_fits "$s" || return 1
+  while [[ "$rest" =~ "$s"(.*)$ ]]; do
+    check_deadline
+    [ "$found" -lt "$AS_WRITTEN_PLACES_MAX" ] || return 1
+    before="${rest:0:${#rest}-${#BASH_REMATCH[0]}}"
+    rest="${BASH_REMATCH[1]}"
+    [[ "$before" =~ $TRAIL_BLANKS_RE ]]
+    before="${before:0:${#before}-${#BASH_REMATCH[0]}}"
+    case "$before" in
+      *'||') return 1 ;;
+      *'|' | *'|&') found=$((found + 1)) ;;
+      *) return 1 ;;
+    esac
+  done
+  segs_holding "$s"
+  [ "$found" -ge 1 ] && [ "$found" -ge "$SEGS_HOLDING" ]
+}
+
+# segs_holding <text>: how many of the segments the extractor sent are the text, the copies of quoted
+# spans (\v) aside, in SEGS_HOLDING.
+SEGS_HOLDING=0
+segs_holding() {
+  local line
+  SEGS_HOLDING=0
+  segment_lines
+  for line in ${SEGMENT_LINES[@]+"${SEGMENT_LINES[@]}"}; do
+    case "$line" in $'\v'* | $'\x01'*) continue ;; esac
+    [[ "$line" == $'\t'* ]] && line="${line:1}"
+    [ "$line" = "$1" ] && SEGS_HOLDING=$((SEGS_HOLDING + 1))
+  done
+  return 0
+}
+
+check_gh_api_labels() {
+  local e
+  [ -n "$1" ] || return 0
+  brace_words "$1"
+  for e in "${BRACE_OUT[@]}"; do check_gh_api_labels_one "$e" "${2:-0}"; done
+  return 0
+}
+check_gh_api_labels_one() {
+  local ep="$1" ep_x="${2:-0}" key m name name_x fields=0
+  [ -n "$ep" ] || return 0
+  gh_api_request
+  m="$API_METHOD"
+  # A field name the shell fills in may be `labels`.
+  for key in ${API_KEYS[@]+"${API_KEYS[@]}"}; do
+    [[ "$key" == labels* || "$key" == *'$'* || "$key" == *'`'* ]] && fields=1
+  done
+  api_path "$ep"
+  if [[ "$API_PATH" =~ $API_ISSUE_LABELS_RE ]]; then
+    if [ -n "${BASH_REMATCH[3]}" ]; then
+      name="${BASH_REMATCH[3]}"
+      name_x=0
+      filled_in "$name" "$ep_x" && name_x=1
+      case "$m" in
+        DELETE | ANY)
+          if owner_label_word "$name" "$name_x"; then
+            deny_owner_label "gh api ${m/ANY/<method>} ${ep}: takes the label '${name}' off an issue or PR"
+          fi
+          ;;
+      esac
+    else
+      case "$m" in
+        DELETE | PUT | ANY)
+          HELD_LABEL="$OWNER_LABELS"
+          deny_owner_label "gh api ${m/ANY/<method>} ${ep}: clears or replaces every label of an issue or PR, ${OWNER_LABEL} and ${NOAUTO_LABEL} included"
+          ;;
+      esac
+    fi
+  elif [[ "$API_PATH" =~ $API_REPO_LABEL_RE ]]; then
+    name="${BASH_REMATCH[2]}"
+    name_x=0
+    filled_in "$name" "$ep_x" && name_x=1
+    case "$m" in
+      DELETE | PATCH | POST | ANY)
+        if owner_label_word "$name" "$name_x"; then
+          deny_owner_label "gh api ${m/ANY/<method>} ${ep}: deletes or renames the repository's label '${name}'"
+        fi
+        ;;
+    esac
+  elif [[ "$API_PATH" =~ $API_ISSUE_RE ]]; then
+    case "$m" in
+      PATCH | POST | ANY)
+        HELD_LABEL="$OWNER_LABELS"
+        # A body read from a file is not in front of the guard, so the path decides: it may carry
+        # a labels field like any other.
+        if [ "$fields" -eq 0 ] && [ "$API_INPUT_FILE" -eq 1 ]; then
+          deny "gh api ${m/ANY/<method>} ${ep} --input <file>: edits the issue or PR with a body read from a file (or from stdin the shell fills from a file or an expansion), which the guard does not read, and a labels field in it would replace every label, ${OWNER_LABEL} and ${NOAUTO_LABEL} included (only a human takes those off)" \
+            "write the fields in the command (gh api -X PATCH ${ep} -f title=… -F body=@<file>), or use gh pr edit / gh issue edit (--body-file <file>, --add-label <name>)"
+        fi
+        if [ "$fields" -eq 0 ] && [ "$API_INPUT" -eq 1 ]; then
+          raw_command
+          [[ "$RAW_COMMAND" == *labels* ]] && fields=1
+        fi
+        if [ "$fields" -eq 1 ]; then
+          deny_owner_label "gh api ${m/ANY/<method>} ${ep} with a labels field: replaces every label of the issue or PR, ${OWNER_LABEL} and ${NOAUTO_LABEL} included"
+        fi
+        ;;
+    esac
+  fi
+  return 0
+}
+
+# A long-lived branch deleted or moved through the REST API never reaches git push, where the guard
+# reads those rules: DELETE, PATCH, PUT and POST (which gh sends when fields are given,
+# `-F force=true -f sha=…`) on git/refs/heads/<branch>, the branch being long-lived
+# (is_long_lived_branch: the list `git branch -D` and `git push --delete` use). Until 2026-10-02
+# `gh api -X DELETE …/git/refs/heads/develop` passed, and no branch protection behind the guard can
+# be assumed (see the header). Reading a ref passes, and so do the real cleanups of the 31 days to
+# that date: DELETE of a finished work branch, PATCH with force of the agent's own one, and POST to
+# git/refs, which creates a branch or a tag and fails when it exists. A branch the shell fills in is
+# not judged, as for `git push --delete "$b"`; one its braces spell (`d{e..e}velop`) or whose slash
+# is escaped (`heads%2Fdevelop`) is read as GitHub gets it.
+# Two more doors of the REST API do the same (found 2026-10-02, verifying this change; no real
+# command of the 31 days uses them): renaming the branch (POST branches/<branch>/rename: the
+# long-lived name is gone) and writing a file through the contents endpoint (PUT or DELETE
+# contents/<path>), which commits onto the branch its `branch` field names, or onto the default
+# branch without one: a push to main without git push.
+API_REF_RE='(^|/)git/refs?/heads/(.+)$'
+API_RENAME_RE='(^|/)branches/(.+)/rename$'
+API_CONTENTS_RE='(^|/)(repos/[^/]+/[^/]+|repositories/[^/]+)/contents(/.*)?$'
+check_gh_api_refs() {
+  local ep="$1" ep_x="${2:-0}" p b w f fb="" fb_set=0 why
+  [ -n "$ep" ] || return 0
+  api_path "$ep"
+  p="${API_PATH//%2[Ff]//}"
+  if [[ "$p" =~ $API_CONTENTS_RE ]]; then
+    gh_api_request
+    case "$API_METHOD" in
+      PUT | DELETE | ANY) ;;
+      *) return 0 ;;
+    esac
+    for f in ${API_FIELDS[@]+"${API_FIELDS[@]}"}; do
+      [[ "$f" == branch=* ]] && fb="${f#branch=}" fb_set=1
+    done
+    if [ "$fb_set" -eq 0 ]; then
+      why="it names no branch field"
+      [ "$API_INPUT" -eq 1 ] && why="its branch, if any, is in a body read with --input, which the guard does not see"
+      deny "gh api ${API_METHOD/ANY/<method>} ${ep}: writes a commit onto the repository's default branch when no branch is given, and ${why}; that is past the rules git push follows" \
+        "commit in your branch's worktree and push it (git push), then open a PR; a long-lived branch moves by a merged PR"
+    fi
+    [[ "$fb" == *'$'* || "$fb" == *'`'* ]] && return 0
+    brace_words "$fb"
+    for w in "${BRACE_OUT[@]}"; do
+      is_long_lived_branch "$w" || continue
+      deny "gh api ${API_METHOD/ANY/<method>} ${ep}: writes a commit onto the long-lived branch '${w}', past the rules git push follows" \
+        "commit in your branch's worktree and push it (git push), then open a PR; a long-lived branch moves by a merged PR"
+    done
+    return 0
+  fi
+  if [[ "$p" =~ $API_REF_RE || "$p" =~ $API_RENAME_RE ]]; then
+    b="${BASH_REMATCH[2]%/}"
+  else
+    return 0
+  fi
+  [ "$ep_x" = 1 ] && [[ "$b" == *'$'* || "$b" == *'`'* ]] && return 0
+  gh_api_request
+  case "$API_METHOD" in
+    DELETE | PATCH | PUT | POST | ANY) ;;
+    *) return 0 ;;
+  esac
+  brace_words "$b"
+  for w in "${BRACE_OUT[@]}"; do
+    is_long_lived_branch "$w" || continue
+    deny "gh api ${API_METHOD/ANY/<method>} ${ep}: deletes, renames or moves the long-lived branch '${w}' on GitHub, past the rules git push follows" \
+      "a long-lived branch moves by a merged PR, and only a human deletes, renames or rewrites it; your own branch is updated with git push (--force-with-lease after a rebase)"
+  done
+  return 0
+}
+
+# Branch protection and rulesets are what stops, on GitHub's side, a push or a merge the guard does
+# not see; where a repository has them, an agent that lowers them has opened every door at once. So
+# no write reaches them through the REST API (and the GraphQL twins are denied in check_gh):
+#   - repos/<o>/<r>/branches/<branch>/protection and every subresource under it
+#     (required_status_checks and its contexts, required_pull_request_reviews, enforce_admins,
+#     required_signatures, restrictions and its apps/teams/users), whatever the branch: DELETE
+#     takes the protection or the rule off, PUT replaces it whole, PATCH and POST change it;
+#   - the rulesets of a repository, an organization or an enterprise (…/rulesets[/<id>]): POST
+#     creates one, PUT changes it, DELETE removes it.
+# The path decides, not the body: one read from a file (`--input f.json`) is not in front of the
+# guard, and any write there is the owner's call, raising it too (a PUT replaces the whole
+# protection, and the guard cannot tell from it whether it raises or lowers). Reading passes: GET,
+# and gh's default without fields or --input; `-X GET` with fields too. With fields and no -X, gh
+# sends POST. A method the shell fills in (`-X "$M"`) may be any. No real command of the 31 days to
+# 2026-10-03 writes there; reading the protection and the rulesets is common, and passes.
+PROTECTION_HINT="leave branch protection and rulesets as they are; read them with gh api <path> (GET, or -X GET with fields), and if they need to change, say so in the PR's ## TL;DR or an issue with the exact command, for the repository owner to run (write that body with --body-file or a heredoc: a command written inside a quoted --body is read as one)"
+# The repository part is <owner>/<name>, one word the shell fills in with both (`repos/$R/…`), or
+# the repository's id: GitHub serves the same resources under repositories/<id>/… (measured
+# 2026-10-03: repositories/<id>/rulesets answers 200, and …/branches/<b>/protection answers as
+# repos/<o>/<r>/… does).
+API_PROTECTION_RE='(^|/)(repos/([^/]+/[^/]+|[^/]*[$][^/]*)|repositories/[^/]+)/branches/(.+)/protection(/.*)?$'
+API_RULESETS_RE='(^|/)(repos/([^/]+/[^/]+|[^/]*[$][^/]*)|repositories/[^/]+|orgs/[^/]+|enterprises/[^/]+)/rulesets(/.*)?$'
+# protection_path <path>: is it branch protection or rulesets? What it is goes in API_TARGET.
+API_TARGET=""
+protection_path() {
+  if [[ "$1" =~ $API_PROTECTION_RE ]]; then
+    API_TARGET="the branch protection of '${BASH_REMATCH[4]}'"
+    return 0
+  fi
+  if [[ "$1" =~ $API_RULESETS_RE ]]; then
+    API_TARGET="the rulesets of ${BASH_REMATCH[2]#repos/}"
+    return 0
+  fi
+  return 1
+}
+# seg_glob <one segment of a path>: the segment as a pattern, in SEG_GLOB: each part the shell fills
+# in (${…}, $NAME, $1, `…`, xargs' or parallel's replace string) becomes `*`; a pattern of its own
+# (`prot*`) stays one, since the shell may put a file name in its place.
+SEG_GLOB=""
+seg_glob() {
+  local s="$1" g=""
+  [ -n "$PFX_REPL" ] && s="${s//"$PFX_REPL"/\$}"
+  while [[ "$s" =~ $SEG_FILLED_RE ]]; do
+    g+="${BASH_REMATCH[1]}*"
+    s="${BASH_REMATCH[3]}"
+  done
+  SEG_GLOB="$g$s"
+}
+SEG_FILLED_RE='^([^$`]*)(\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]|`[^`]*`?|\$)(.*)$'
+# api_path_variants <path>: the paths it may stand for when the shell fills in part of it, in
+# API_VARIANTS (API_VARIANTS_OVER is 1 past 256 of them). A segment the shell fills in whole may be
+# any word: here, branches/<x>, protection or rulesets (`repos/o/r/$Y/protection`). Right after
+# repos/ it is the owner and the name (`repos/$R/rulesets`), unless the next one is filled in too:
+# two in a row (`repos/$OWNER/$REPO/…`) are the owner and the name. Read as the owner and the name
+# together, the second was free to be rulesets, and every write to repos/$OWNER/$REPO/… was denied as
+# one to the rulesets (found 2026-10-03, verifying #299: a commit through the API from a loop over
+# the fleet's repositories). One filled in in part (`rule$S`, `prot*`) may be each of protection,
+# rulesets and branches its pattern matches, or another word.
+API_VARIANTS=()
+API_VARIANTS_OVER=0
+api_path_variants() {
+  local seg v o k i n
+  local -a parts=() lit=() globs=() cur=("") next=() alts=()
+  API_VARIANTS=() API_VARIANTS_OVER=0
+  words_of "$1" /
+  parts=(${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"})
+  n=${#parts[@]}
+  for ((i = 0; i < n; i++)); do
+    check_deadline
+    seg_glob "${parts[i]}"
+    globs[i]="$SEG_GLOB"
+    lit[i]=0
+    [ "$SEG_GLOB" = "${parts[i]}" ] && [[ "${parts[i]}" != *[\*\?\[]* ]] && lit[i]=1
+  done
+  for ((i = 0; i < n; i++)); do
+    check_deadline
+    seg="${parts[i]}"
+    if [ "${lit[i]}" -eq 1 ]; then
+      alts=("$seg")
+    elif [ "$i" -ge 1 ] && [ "${parts[i - 1]}" = repos ]; then
+      alts=("x/x")
+      [ "$((i + 1))" -lt "$n" ] && [ "${lit[i + 1]}" -eq 0 ] && alts=(x)
+    elif [ "$i" -ge 2 ] && [ "${parts[i - 2]}" = repos ]; then
+      alts=(x)
+    elif [ -z "${globs[i]//\*/}" ]; then
+      alts=(x branches/x protection rulesets)
+    else
+      alts=(x)
+      for k in protection rulesets branches; do
+        # shellcheck disable=SC2053 # the pattern is the point
+        [[ "$k" == ${globs[i]} ]] && alts+=("$k")
+      done
+    fi
+    next=()
+    for v in "${cur[@]}"; do
+      for o in "${alts[@]}"; do next+=("${v:+$v/}$o"); done
+    done
+    if [ "${#next[@]}" -gt 256 ]; then
+      API_VARIANTS_OVER=1
+      return 0
+    fi
+    cur=("${next[@]}")
+  done
+  API_VARIANTS=("${cur[@]}")
+}
+# api_protection_target <endpoint> <1 if the shell fills part of it in>: does a request to it reach
+# branch protection or rulesets? What it writes goes in API_TARGET.
+api_protection_target() {
+  local p v
+  api_path "$1"
+  p="${API_PATH//%2[Ff]//}"
+  protection_path "$p" && return 0
+  [ "${2:-0}" = 1 ] || [[ "$p" == *[\*\?\[]* ]] || return 1
+  api_path_variants "$p"
+  if [ "$API_VARIANTS_OVER" -eq 1 ]; then
+    API_TARGET="a path the shell fills in in too many places to read, which may be branch protection or rulesets"
+    return 0
+  fi
+  for v in ${API_VARIANTS[@]+"${API_VARIANTS[@]}"}; do
+    if protection_path "$v"; then
+      API_TARGET="${API_TARGET} (the shell fills in part of the path, which may make it ${v})"
+      return 0
+    fi
+  done
+  return 1
+}
+# Braces make several endpoints of one (`prot{e..e}ction`, `rule{s..s}ets`): each counts, and past
+# the ones brace_words makes, it may be any. A part the shell fills in, or a pattern, may be what
+# makes it branch protection or rulesets (`branches/main/$X`, `rule$S/1`, `branches/main/{}` behind
+# xargs -I{}): see api_path_variants. The endpoint filled in whole (`gh api -X DELETE "$EP"`) is
+# not read.
+check_gh_api_protection() {
+  local ep="$1" ep_x="${2:-0}" e what="" body=""
+  [ -n "$ep" ] || return 0
+  brace_words "$ep"
+  for e in "${BRACE_OUT[@]}"; do
+    if api_protection_target "$e" "$ep_x"; then
+      what="$API_TARGET"
+      break
+    fi
+  done
+  if [ -z "$what" ] && [ "$BRACE_OVER" -eq 1 ]; then
+    what="a path whose braces make more endpoints than the guard reads, which may be branch protection or rulesets"
+  fi
+  [ -n "$what" ] || return 0
+  gh_api_request
+  case "$API_METHOD" in
+    POST | PUT | PATCH | DELETE | ANY) ;;
+    *) return 0 ;;
+  esac
+  [ "$API_INPUT" -eq 1 ] && body=" (its body comes from --input, which the guard does not read: the path alone decides)"
+  deny "gh api ${API_METHOD/ANY/<method>} ${ep}: writes ${what}${body}; branch protection and rulesets are the repository owner's settings, and lowering them opens every push and merge they hold back" \
+    "$PROTECTION_HINT"
+}
+
+# The GraphQL document a `gh api graphql` call in GHW sends, as GraphQL reads it, in GQL_DOC: the
+# values of its query fields, with string values taken out (a mutation named inside one is not one). Exit 1 when the guard cannot read it all (a field the shell fills in, one read from a
+# file, --input): the caller reads the whole command then, as before.
+GQL_DOC=""
+gql_document() {
+  local i=0 n=${#GHW[@]} w v x letter
+  GQL_DOC=""
+  while [ "$i" -lt "$n" ]; do
+    w="${GHW[i]}" v="" x=0 letter=""
+    case "$w" in
+      --input | --input=*) return 1 ;;
+      -f | -F | --field | --raw-field)
+        letter="$w" v="${GHW[i + 1]-}" x="${GHX[i + 1]:-0}"
+        i=$((i + 1))
+        ;;
+      --field=* | --raw-field=*) letter="${w%%=*}" v="${w#*=}" x="${GHX[i]}" ;;
+      --?*) [[ "$GH_VALUE_GLOBAL$GH_VALUE_API" == *" $w "* ]] && i=$((i + 1)) ;;
+      -?*)
+        short_cluster "$w" "$GH_VALUE_GLOBAL$GH_VALUE_API"
+        case "$SC_LETTER" in
+          F | f)
+            letter="-$SC_LETTER"
+            if [ "$SC_NEXT" -eq 1 ]; then v="${GHW[i + 1]-}" x="${GHX[i + 1]:-0}"; else v="$SC_VALUE" x="${GHX[i]}"; fi
+            ;;
+        esac
+        [ "$SC_NEXT" -eq 1 ] && i=$((i + 1))
+        ;;
+    esac
+    i=$((i + 1))
+    [ -n "$letter" ] || continue
+    [ "$x" = 1 ] && return 1
+    [ "${v%%=*}" = query ] || continue
+    v="${v#*=}"
+    case "$letter" in -F | --field) [[ "$v" == @* ]] && return 1 ;; esac
+    gql_value "$v"
+  done
+  return 0
+}
+# gql_value <the value of a query field>: added to GQL_DOC as GraphQL reads it (gql_strip). A comment
+# (`#`) runs to the end of its line, and the segment the guard reads has its lines joined (see the
+# extractor), so a value that holds a `#` is read with its lines from the command as written
+# (RAW_COMMAND): inside each place the segment stands (raw_regex: a blank of the segment may be a
+# newline there), the value, and all of them go in. Until 2026-10-03 such a value was read whole, and
+# a read query whose comment named a protection mutation was denied as that mutation (found
+# verifying #299). Where the segment or the value cannot be found as written (a line joined, a shell
+# escape the segment took out), or finding it would cost more than the guard spends on it
+# (as_written_fits, AS_WRITTEN_PLACES_MAX): the value whole, nothing taken out of it, as before. Whole
+# is the stricter reading: it holds every mutation name the value holds.
+gql_value() {
+  local LC_ALL=C v="$1" sre vre rest r m mrest doc="" places=0 found=0 ok=1
+  if [[ "$v" != *'#'* ]]; then
+    gql_strip "$v" 0
+    GQL_DOC+="$GQL_STRIPPED"$'\n'
+    return 0
+  fi
+  raw_command
+  if [ -z "${seg-}" ] || ! as_written_fits "$seg"; then
+    GQL_DOC+="$v"$'\n'
+    return 0
+  fi
+  raw_regex "$seg"
+  sre="$RAW_RE"
+  raw_regex "$v"
+  vre="$RAW_RE"
+  # Each match takes what follows it too (`(.*)$`, see TRAIL_BLANKS_RE): cutting the place off with
+  # `${rest#*"$r"}` costs the square of the length before it (a 5000-`#` value took 42 s, #302).
+  rest="$RAW_COMMAND"
+  while [[ "$rest" =~ $sre(.*)$ ]]; do
+    check_deadline
+    places=$((places + 1))
+    if [ "$places" -gt "$AS_WRITTEN_PLACES_MAX" ]; then
+      ok=0
+      break
+    fi
+    rest="${BASH_REMATCH[1]}"
+    r="${BASH_REMATCH[0]:0:${#BASH_REMATCH[0]}-${#rest}}"
+    [[ "$r" =~ $vre ]] || ok=0
+    mrest="$r"
+    while [[ "$mrest" =~ $vre(.*)$ ]]; do
+      check_deadline
+      found=$((found + 1))
+      if [ "$found" -gt "$AS_WRITTEN_PLACES_MAX" ]; then
+        ok=0
+        break 2
+      fi
+      mrest="${BASH_REMATCH[1]}"
+      m="${BASH_REMATCH[0]:0:${#BASH_REMATCH[0]}-${#mrest}}"
+      gql_strip "$m" 1
+      doc+="$GQL_STRIPPED"$'\n'
+    done
+  done
+  if [ "$places" -ge 1 ] && [ "$ok" -eq 1 ]; then GQL_DOC+="$doc"; else GQL_DOC+="$v"$'\n'; fi
+  return 0
+}
+# raw_regex <text of a segment>: a regular expression that finds it in RAW_COMMAND, in RAW_RE: each
+# character itself (the ones a regular expression reads as operators, behind a backslash), and each
+# blank any blank (the extractor writes a newline as a blank). Byte by byte (LC_ALL=C), like the
+# callers' matching. Built with replacements, not character by character: each `${t:k:1}` copies the
+# whole text, and a loop of them grows with the square of its length. Each replacement comes from a
+# variable, unquoted, with patsub_replacement off (bash 5.2 reads a `\` or `&` in it): the bash 3.2
+# of macOS keeps the double quotes of a quoted one in the text, so a value with a blank or any of
+# those characters was never found, and was read whole.
+RAW_RE=""
+raw_regex() {
+  local LC_ALL=C t="$1" c rep sp='[[:space:]]' psr=0
+  shopt -q patsub_replacement 2>/dev/null && psr=1 && shopt -u patsub_replacement
+  for c in '\' . '[' ']' '(' ')' '*' + '?' '{' '}' '|' '^' '$'; do
+    rep="\\$c"
+    t="${t//"$c"/$rep}"
+  done
+  RAW_RE="${t// /$sp}"
+  [ "$psr" -eq 0 ] || shopt -s patsub_replacement
+  return 0
+}
+# How much work the guard spends finding a text where it stands in the command as written
+# (RAW_COMMAND: gql_value, stdin_piped). Looking for a text costs up to its length times the
+# command's, and a text written to repeat itself takes that much (#302: a GraphQL value of 5000 `#`
+# took 42 s, and 20000 more than 300, past every hook's timeout, which lets the command run). So a
+# text is looked for only while the two lengths multiplied stay within AS_WRITTEN_WORK_MAX (2^25),
+# and in AS_WRITTEN_PLACES_MAX places at most; past either, the caller takes its stricter reading.
+# Real commands: 268,185 at most over the 86,620 of the 31 days to 2026-10-03 (a 95-byte segment in a
+# 2,823-byte command), and 2 places.
+AS_WRITTEN_WORK_MAX=33554432
+AS_WRITTEN_PLACES_MAX=64
+# as_written_fits <text>: may it be looked for in RAW_COMMAND (read it first)?
+as_written_fits() {
+  local LC_ALL=C
+  [ $((${#1} * ${#RAW_COMMAND})) -le "$AS_WRITTEN_WORK_MAX" ]
+}
+# These readers cut a long text with a regular expression: what comes before the first of a set of
+# characters (`[[ $t =~ ^[^"#]* ]]`), the blanks it ends with (TRAIL_BLANKS_RE), or a text and all that
+# follows it (`[[ $t =~ "<text>"(.*)$ ]]`, the rest in BASH_REMATCH[1]). Not with `${t#*<text>}`,
+# `${t/<text>*/}`, `${t/[<set>]*/}` or `${t##*[![:space:]]}`: bash tries those at every position
+# before the cut that could start a match, each against the whole rest of the text, and the time
+# grows with the square of its length (20 KB took 11 s, 20,000 trailing blanks 6 s, 4,000 piped
+# calls 95 s; measured 2026-10-03, fixing #302).
+TRAIL_BLANKS_RE='[[:space:]]*$'
+# gql_strip <text> <1 if its lines are as written>: the text without its string values ("…", with
+# \-escapes, and """…""", with \""" inside) and, when its lines are as written, its comments (from a
+# `#` to the end of the line), as GraphQL's lexer reads them, in GQL_STRIPPED. A text with its lines
+# joined that holds a `#` is left whole: a `"` in a comment could not be told from one that opens a
+# string. So is one longer than GQL_TEXT_MAX (whole is the stricter reading; real GraphQL values:
+# 1,066 bytes at most over the 31 days to 2026-10-03). Read through a window of GQL_STRIP_CHUNK bytes
+# and a piece at a time, from one `"`, `\`, `#` or end of line to the next: every `${s:k:1}` or cut of
+# the text copies all of it, and reading it a character at a time took 1.5 s on 18 KB (#302).
+GQL_STRIPPED=""
+GQL_TEXT_MAX=65536
+GQL_STRIP_CHUNK=512
+GQL_CODE_RE='^[^"#]*'
+GQL_COMMENT_RE=$'^[^\n\r]*'
+GQL_STRING_RE='^[^\"]*'
+GQL_BLOCK_END_RE='"""(.*)$'
+gql_strip() {
+  local LC_ALL=C s="$1" out="" b="" pre st=code ci=0 nc k
+  local -a cs=()
+  GQL_STRIPPED="$s"
+  [ "$2" -eq 1 ] || [[ "$s" != *'#'* ]] || return 0
+  [ "${#s}" -le "$GQL_TEXT_MAX" ] || return 0
+  for ((k = 0; k < ${#s}; k += GQL_STRIP_CHUNK)); do cs+=("${s:k:GQL_STRIP_CHUNK}"); done
+  nc=${#cs[@]}
+  while :; do
+    # At least 8 bytes in the window while there are more: enough to see `"""` and `\"""` whole.
+    while [ "${#b}" -lt 8 ] && [ "$ci" -lt "$nc" ]; do
+      b+="${cs[ci]}"
+      ci=$((ci + 1))
+    done
+    [ -n "$b" ] || break
+    [ $((ci & 15)) -ne 0 ] || check_deadline
+    case "$st" in
+      code)
+        case "$b" in
+          '#'*)
+            out+=' '
+            b="${b:1}"
+            st=comment
+            ;;
+          '"""'*)
+            out+=' "" '
+            b="${b:3}"
+            st=block
+            ;;
+          '"'*)
+            out+=' "" '
+            b="${b:1}"
+            st=string
+            ;;
+          *)
+            [[ "$b" =~ $GQL_CODE_RE ]]
+            out+="${BASH_REMATCH[0]}"
+            b="${b:${#BASH_REMATCH[0]}}"
+            ;;
+        esac
+        ;;
+      comment)
+        # To the end of its line; the newline itself is read as code.
+        [[ "$b" =~ $GQL_COMMENT_RE ]]
+        b="${b:${#BASH_REMATCH[0]}}"
+        [ -z "$b" ] || st=code
+        ;;
+      string)
+        # To the closing ", past each \-escape.
+        case "$b" in
+          '\'*) b="${b:2}" ;;
+          '"'*)
+            b="${b:1}"
+            st=code
+            ;;
+          *)
+            [[ "$b" =~ $GQL_STRING_RE ]]
+            b="${b:${#BASH_REMATCH[0]}}"
+            ;;
+        esac
+        ;;
+      block)
+        # To the closing """, past each \""" inside. Without one in the window, its last 3 bytes stay
+        # for the next: a `"""` (or the `\` in front of one) may start there.
+        if [[ "$b" =~ $GQL_BLOCK_END_RE ]]; then
+          pre="${b:0:${#b}-${#BASH_REMATCH[0]}}"
+          b="${BASH_REMATCH[1]}"
+          [[ "$pre" == *'\' ]] || st=code
+        elif [ "$ci" -lt "$nc" ]; then
+          b="${b:${#b}-3}"
+          b+="${cs[ci]}"
+          ci=$((ci + 1))
+        else
+          b=""
+        fi
+        ;;
+    esac
+  done
+  GQL_STRIPPED="$out"
+}
+
+# The command as the harness sent it, heredoc bodies included, in RAW_COMMAND (read once).
+RAW_COMMAND=""
+RAW_COMMAND_READ=0
+raw_command() {
+  [ "$RAW_COMMAND_READ" -eq 1 ] && return 0
+  RAW_COMMAND_READ=1
+  RAW_COMMAND="$(printf '%s' "${INPUT-}" | node -e '
+let d;
+try { d = JSON.parse(require("fs").readFileSync(0, "utf8")); } catch (e) { process.exit(0); }
+const c = d && d.tool_input ? d.tool_input.command : undefined;
+if (typeof c === "string") process.stdout.write(c);
+' 2>/dev/null || true)"
+  return 0
+}
+
+# Assigning one of the two names, in any of the shell's spellings: NAME=…, NAME+=…, NAME[i]=…
+CI_IDENTITY_ASSIGN_RE='^(GITHUB_ACTIONS|MWG_WRITE_TOKEN_KIND)(\[[^]]*\])?\+?='
+CI_IDENTITY_NAME_RE='^(GITHUB_ACTIONS|MWG_WRITE_TOKEN_KIND)$'
+CI_IDENTITY_DEFAULT_RE='\$\{(GITHUB_ACTIONS|MWG_WRITE_TOKEN_KIND):?='
+
+# unquoted <word>: the word with the shell's quotes and backslashes taken out, in UNQUOTED. The
+# builtins and env see `"GITHUB_ACTIONS"=true` or `GITHUB_ACT''IONS=true` as the assignment itself.
+# The quotes and backslashes come out as bare_text takes them (in time linear in the word's length:
+# `${1//[\'\"\\]/}` took the square of it in a UTF-8 locale and in the bash 3.2 of macOS; #302),
+# the `$'` byte by byte (LC_ALL=C), which gives the same text.
+UNQUOTED=""
+unquoted() {
+  local LC_ALL=C
+  UNQUOTED="${1//\$\'/\'}"
+  bare_text "$UNQUOTED"
+  UNQUOTED="$BARE_TEXT"
+  return 0
+}
+
+# shell_words <word>: the words the shell makes of it, quotes taken out and braces expanded, in
+# SHELL_WORDS (`{GITHUB_ACTIONS,X}=true` is two assignments to export and env).
+SHELL_WORDS=()
+shell_words() {
+  unquoted "$1"
+  brace_words "$UNQUOTED"
+  SHELL_WORDS=("${BRACE_OUT[@]}")
+  return 0
+}
+
+deny_ci_identity() {
+  deny "the command sets ${1} in the session: it is what tells the merge step of merge-when-green (pr-merge.sh merge) that it runs as that GitHub Actions job, holding the merge App's token, and a session never stands in for that job" \
+    "leave ${1} to the GitHub Actions runner; a test sets it inside its own script (the merge-when-green suites do), and env -u ${1} clears it for one command"
+}
+
+# The words in front of the command word (assignments, wrappers and theirs) and the command word
+# itself, which is where a bare `NAME=…` or `NAME+=…` statement stands; and the `${NAME:=…}`
+# expansion, which assigns as it expands. Reads tok and PFX_END (see check_segment).
+check_ci_identity_prefix() {
+  local k w last=$PFX_END
+  [ "$last" -lt "${#tok[@]}" ] || last=$((${#tok[@]} - 1))
+  for ((k = 0; k <= last; k++)); do
+    shell_words "${tok[k]}"
+    for w in "${SHELL_WORDS[@]}"; do
+      if [[ "$w" =~ $CI_IDENTITY_ASSIGN_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
+    done
+  done
+  if [[ "$seg" =~ $CI_IDENTITY_DEFAULT_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
+  return 0
+}
+
+# The builtins that set or export a variable they name: export, declare/typeset (with -x, a bare
+# name is exported), readonly, local and let (with a value), printf -v and read.
+check_ci_identity_builtin() {
+  local k n=${#tok[@]} a w opts=""
+  case "$cmd0" in
+    printf)
+      for ((k = 1; k < n; k++)); do
+        a="${tok[k]}"
+        case "$a" in
+          -v) a="${tok[k + 1]-}" ;;
+          -v?*) a="${a#-v}" ;;
+          *) continue ;;
+        esac
+        shell_words "$a"
+        for w in "${SHELL_WORDS[@]}"; do
+          w="${w%%\[*}"
+          if [[ "$w" =~ $CI_IDENTITY_NAME_RE ]]; then deny_ci_identity "$w"; fi
+        done
+      done
+      return 0
+      ;;
+    read)
+      for ((k = 1; k < n; k++)); do
+        a="${tok[k]}"
+        case "$a" in
+          # A redirection's target, a here-string included, is data, not a name.
+          '<'* | '>'* | [0-9]'<'* | [0-9]'>'* | '&>'*) break ;;
+          # -d, -i, -n, -N, -p, -t and -u take the next word as their value (-a names an array).
+          -*[dinNptu]) k=$((k + 1)) ;;
+          *)
+            shell_words "$a"
+            for w in "${SHELL_WORDS[@]}"; do
+              if [[ "$w" =~ $CI_IDENTITY_NAME_RE ]]; then deny_ci_identity "$w"; fi
+            done
+            ;;
+        esac
+      done
+      return 0
+      ;;
+  esac
+  for ((k = 1; k < n; k++)); do
+    a="${tok[k]}"
+    case "$a" in
+      -*)
+        opts+="${a#-}"
+        continue
+        ;;
+      +*) continue ;;
+    esac
+    shell_words "$a"
+    for a in "${SHELL_WORDS[@]}"; do
+      if [[ "$a" =~ $CI_IDENTITY_ASSIGN_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
+      # A nameref (declare/typeset/local -n) to one of them sets it through another name.
+      if [[ "$opts" == *n* && "$cmd0" != export && "${a#*=}" =~ $CI_IDENTITY_NAME_RE ]]; then
+        deny_ci_identity "${a#*=}"
+      fi
+      if [[ "$a" =~ $CI_IDENTITY_NAME_RE ]]; then
+        case "$cmd0" in
+          export) [[ "$opts" == *[np]* ]] || deny_ci_identity "$a" ;;
+          declare | typeset) [[ "$opts" == *x* && "$opts" != *p* ]] && deny_ci_identity "$a" ;;
+        esac
+      fi
+    done
+  done
+  return 0
+}
+
+# mwg_py_cluster <-cluster>: the first of python's value-taking short options (c, m, W, X) in a
+# cluster, in PY_LETTER (empty: none), and what follows it in the same word, in PY_REST.
+PY_LETTER=""
+PY_REST=""
+mwg_py_cluster() {
+  local w="${1#-}" j c
+  PY_LETTER="" PY_REST=""
+  for ((j = 0; j < ${#w}; j++)); do
+    c="${w:j:1}"
+    case "$c" in
+      c | m | W | X)
+        PY_LETTER="$c"
+        PY_REST="${w:j+1}"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
+# The step a session never runs: `pr-merge.sh merge`, called directly, through a shell or python
+# (`bash -euo pipefail pr-merge.sh merge`, `python3 pr_merge.py merge`, `python3 -m pr_merge merge`)
+# or sourced. The subcommand is the first argument after the script (or the module); one the shell
+# fills in (a variable, a substitution, what xargs reads) may be `merge`, so it is denied too.
+# `decide`, `sweep`, `--help` and the rest pass. A script the shell or python reads from stdin
+# (`bash -s`, `python3 -`), from a descriptor (`/dev/stdin`, `/dev/fd/N`) or from a word the shell
+# fills in is this one when the command names it (`cat pr-merge.sh | bash -s merge`), unless what
+# it reads is a heredoc or a here-string.
+check_mwg_merge() {
+  local k=1 n=${#tok[@]} a s="" si="" sub rawsub module=0 elsewhere=0
+  case "$cmd0" in
+    pr-merge.sh | pr_merge.py) s=0 ;;
+    source | .) s=1 ;;
+    bash | sh | dash | zsh | ksh | ash | mksh)
+      while [ "$k" -lt "$n" ]; do
+        a="${tok[k]}"
+        # -s: the script comes from stdin, and every word after the options is its argument.
+        [[ "$a" == -* && "$a" != --* && "$a" == *s* ]] && elsewhere=1
+        case "$a" in
+          --)
+            k=$((k + 1))
+            break
+            ;;
+          --rcfile | --init-file) k=$((k + 2)) ;;
+          --*) k=$((k + 1)) ;;
+          # -c runs a command string, which the extractor reads as a command of its own.
+          -*c*) return 0 ;;
+          # A cluster that ends in o/O takes the next word as its option name (`-euo pipefail`).
+          [-+]*[oO]) k=$((k + 2)) ;;
+          -* | +*) k=$((k + 1)) ;;
+          *) break ;;
+        esac
+      done
+      s=$k
+      if [ "$elsewhere" -eq 1 ]; then si=$k; else si=$((k + 1)); fi
+      ;;
+    python | python[0-9]*)
+      while [ "$k" -lt "$n" ]; do
+        a="${tok[k]}"
+        case "$a" in
+          --)
+            k=$((k + 1))
+            break
+            ;;
+          # `python3 - …`: the script comes from stdin, and its arguments follow.
+          -)
+            elsewhere=1
+            k=$((k + 1))
+            break
+            ;;
+          --check-hash-based-pycs) k=$((k + 2)) ;;
+          --*) k=$((k + 1)) ;;
+          -?*)
+            # A cluster of short options: c, m, W and X take the rest of the word, or the next
+            # word when nothing is left (`-c '…'`, `-um pr_merge`, `-Werror`, `-X dev`).
+            mwg_py_cluster "$a"
+            case "$PY_LETTER" in
+              # -c runs a command string, not a script file.
+              c) return 0 ;;
+              # -m runs a module as the script: pr_merge (any package path) is this one.
+              m)
+                if [ -n "$PY_REST" ]; then a="$PY_REST"; else k=$((k + 1)); a="${tok[k]-}"; fi
+                a="${a//[\"\'\\]/}"
+                [ "${a##*.}" = pr_merge ] || return 0
+                s=$k
+                module=1
+                break
+                ;;
+              W | X) if [ -n "$PY_REST" ]; then k=$((k + 1)); else k=$((k + 2)); fi ;;
+              *) k=$((k + 1)) ;;
+            esac
+            ;;
+          *) break ;;
+        esac
+      done
+      [ "$module" -eq 1 ] || s=$k
+      if [ "$elsewhere" -eq 1 ]; then si=$k; else si=$((s + 1)); fi
+      ;;
+    *) return 0 ;;
+  esac
+  [ -n "$si" ] || si=$((s + 1))
+  if [ "$elsewhere" -eq 0 ]; then
+    [ "$s" -lt "$n" ] || return 0
+    unquoted "${tok[s]}"
+    if [ "$module" -eq 1 ]; then BASE_NAME="pr_merge.py"; else base_name "$UNQUOTED"; fi
+    case "$BASE_NAME" in
+      pr-merge.sh | pr_merge.py) ;;
+      *)
+        # A script read from a descriptor, or one the shell fills in (`bash <(cat …)`, `"$S"`).
+        case "$UNQUOTED" in
+          /dev/stdin | /dev/fd/* | /proc/*/fd/* | *'$'* | *'`'*) elsewhere=1 ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ "$elsewhere" -eq 1 ]; then
+    # Fed a heredoc or a here-string, the script is that text, not this one.
+    [[ "$seg" =~ (^|[^<])\<\<([^<]|$) || "$seg" == *'<<<'* ]] && return 0
+    case "$SEGMENTS" in
+      *pr-merge.sh* | *pr_merge*) BASE_NAME="pr-merge.sh" ;;
+      *) return 0 ;;
+    esac
+  fi
+  case "$BASE_NAME" in
+    pr-merge.sh | pr_merge.py) ;;
+    *) return 0 ;;
+  esac
+  rawsub="${raw[si]-}"
+  sub="${tok[si]-}"
+  sub="${sub//[\"\'\\]/}"
+  # Brace expansion makes several words of one (`{merge,x}`): the first is the subcommand.
+  brace_words "$sub"
+  sub="${BRACE_OUT[0]}"
+  if [ -z "$rawsub" ]; then
+    # Without a replace string, xargs appends what it reads: the subcommand comes from stdin.
+    [ "$SEG_XARGS" -eq 1 ] && [ -z "$SEG_REPL" ] && sub='$'
+  elif [[ "$rawsub" == *'$'* || "$rawsub" == *'`'* ]] || { [ -n "$SEG_REPL" ] && [[ "$rawsub" == *"$SEG_REPL"* ]]; }; then
+    sub='$'
+  fi
+  case "$sub" in
+    merge)
+      deny "${BASE_NAME} merge is the merge step of the merge-when-green job: it merges with the merge App's token, from GitHub Actions only, after the job's own gates, and a session never runs it" \
+        "in a session read its decision with ${BASE_NAME} decide --repo <owner>/<name> --pr <n> (read-only), and merge with gh pr merge (no --admin) where the repository's policy lets an agent merge; to exercise the merge path, run the suite (merge-when-green/merge-when-green.test.sh)"
+      ;;
+    '$')
+      deny "${BASE_NAME} is given its subcommand by something the shell fills in later, which the guard cannot read, and the merge subcommand is the merge-when-green job's alone" \
+        "write the subcommand in the command: ${BASE_NAME} decide --repo <owner>/<name> --pr <n>"
+      ;;
+  esac
+  return 0
+}
+
+# The files a word names are the ones the SHELL opens. Quotes do not change them; outside quotes, a
+# backslash only escapes the next character; brace expansion turns one word into several; and an
+# unquoted glob reaches every file it matches. So a word is judged as the shell reads it (quote
+# characters removed, and its backslashes too when no part of it is quoted), once per word its
+# braces make (brace_words), and an unquoted glob that matches a real environment file (env_glob)
+# counts as one. A quoted pattern (`grep '\.env'`, `grep -E 'saved .* ok'`) is not a glob: the
+# shell passes it as written.
+check_env_dump() {
+  local k a w x quoted rq=0 sq="'"
+  for ((k = 1; k < ${#tok[@]}; k++)); do
+    a="${tok[k]}"
+    # Only a name that starts with `.` (or a word with braces, quotes or backslashes, which the
+    # shell may turn into one) can be an environment file: the rest is skipped cheaply.
+    case "$a" in .* | */.* | *[{\"\'\\]*) ;; *) continue ;; esac
+    quoted=0
+    case "${raw[k]:-$a}" in *[\"\']*) quoted=1 ;; esac
+    # A whitespace token may sit inside a quoted string that an earlier token opened.
+    if [ "$quoted" -eq 0 ] && [[ "$a" == *[\\*?[]* ]]; then
+      [ "$rq" -eq 1 ] || raw_quoting
+      rq=1
+      quoted="${RAWQ[k]:-0}"
+    fi
+    # $'…' and $"…" are quotes too. The quote put back is a variable: the bash 3.2 of macOS keeps the
+    # backslash of a `\'` written there, and `cat $'.env'` read as `\.env` (bash 5 denies it).
+    w="${a//\$\'/$sq}"
+    w="${w//\$\"/\"}"
+    if [ "$quoted" -eq 1 ]; then w="${w//[\"\']/}"; else w="${w//\\/}"; fi
+    brace_words "$w" .env
+    if [ "$BRACE_OVER" -eq 1 ] && [[ "$w" == *env* ]]; then
+      deny_env_dump "$a"
+    fi
+    for x in "${BRACE_OUT[@]}"; do
+      is_env_file "$x" && deny_env_dump "$a"
+      [ "$quoted" -eq 0 ] && env_glob "$x" && deny_env_dump "$a"
+    done
+  done
+  return 0
+}
+
+# RAWQ[k] is 1 when any part of the whitespace token raw[k] (from the command word on) is quoted: it
+# holds a quote character, or it starts inside a quote an earlier token opened. One pass over the
+# characters of the segment: linear, like egress_words.
+RAWQ=()
+raw_quoting() {
+  local LC_ALL=C k j t c q="" start n
+  RAWQ=()
+  for ((k = 0; k < ${#raw[@]}; k++)); do
+    t="${raw[k]}"
+    start="$q"
+    n=${#t}
+    for ((j = 0; j < n; j++)); do
+      c="${t:j:1}"
+      if [ "$q" = "'" ]; then
+        [ "$c" = "'" ] && q=""
+        continue
+      fi
+      if [ "$c" = '\' ]; then
+        j=$((j + 1))
+        continue
+      fi
+      if [ "$q" = '"' ]; then
+        [ "$c" = '"' ] && q=""
+        continue
+      fi
+      case "$c" in "'" | '"') q="$c" ;; esac
+    done
+    if [ -n "$start" ] || [[ "$t" == *[\"\']* ]]; then RAWQ+=(1); else RAWQ+=(0); fi
+  done
+  return 0
+}
+
+deny_env_dump() {
+  deny "dumping the contents of '${1}' would expose credentials in the transcript" \
+    "read its template instead (.env.example, or .env.<name>.example / .sample / .template) or ask the user for the specific value"
+}
+
+# A glob whose matches include a real environment file: its name starts with a literal `.` (the
+# shell never matches a leading dot otherwise) and it matches `.env` or a `.env.<name>`.
+env_glob() {
+  local base s
+  base_name "$1"
+  base="$BASE_NAME"
+  case "$base" in .*) ;; *) return 1 ;; esac
+  case "$base" in *[*?[]*) ;; *) return 1 ;; esac
+  for s in .env .env.local .env.dev .env.development .env.prod .env.production .env.staging .env.test; do
+    # shellcheck disable=SC2053 # the right side is a pattern on purpose
+    [[ "$s" == $base ]] && return 0
+  done
+  return 1
+}
+
+# brace_words <word> [<needle>]: the words the shell's brace expansion makes of <word> (comma lists,
+# nested ones included, and sequences: see brace_seq) in BRACE_OUT. A `{` right after `$`
+# opens a parameter expansion, not a list. With a needle, only a word that can expand into one
+# containing it is expanded: a comma list keeps the order of what it copies, so the needle's
+# characters are in <word> in that order (a sequence makes characters of its own: a word holding
+# `..` is always expanded). Words longer than BRACE_MAX_LEN are not expanded; past
+# BRACE_MAX words the expansion stops and BRACE_OVER is 1.
+BRACE_OUT=()
+BRACE_OVER=0
+BRACE_MAX=64
+BRACE_MAX_LEN=2048
+brace_words() {
+  local w="$1" needle="${2:-}" r k
+  local -a todo=()
+  BRACE_OUT=("$w")
+  BRACE_OVER=0
+  [[ "$w" == *'{'* && ("$w" == *,* || "$w" == *..*) ]] || return 0
+  [ "${#w}" -le "$BRACE_MAX_LEN" ] || return 0
+  r="$w"
+  [[ "$w" == *..* ]] && needle=""
+  for ((k = 0; k < ${#needle}; k++)); do
+    [[ "$r" == *"${needle:k:1}"* ]] || return 0
+    r="${r#*"${needle:k:1}"}"
+  done
+  BRACE_OUT=()
+  todo=("$w")
+  while [ "${#todo[@]}" -gt 0 ]; do
+    w="${todo[0]}"
+    todo=("${todo[@]:1}")
+    if brace_split "$w"; then
+      for r in "${BR_ALTS[@]}"; do todo+=("${BR_PRE}${r}${BR_POST}"); done
+      if [ $((${#todo[@]} + ${#BRACE_OUT[@]})) -gt "$BRACE_MAX" ]; then
+        BRACE_OVER=1
+        return 0
+      fi
+    else
+      BRACE_OUT+=("$w")
+    fi
+  done
+  return 0
+}
+
+# brace_split <word>: the first brace of <word> that brace expansion splits, as BR_PRE, BR_ALTS
+# (its comma-separated alternatives, or the words of its sequence) and BR_POST. Exit 1: there is none.
+BR_PRE=""
+BR_POST=""
+BR_ALTS=()
+brace_split() {
+  # LC_ALL=C first, on its own: the words of one `local` are expanded before any is set, and n
+  # counted in characters while the loop reads bytes left the last braces of a word holding
+  # multibyte characters unread (found 2026-10-03, fixing #302: `--remove-label` with 40 `é` and
+  # then `,no-autom{e,x}rge` passed).
+  local LC_ALL=C
+  local w="$1" n=${#1} s j c depth from cm
+  local -a commas=()
+  BR_ALTS=()
+  for ((s = 0; s < n; s++)); do
+    [ "${w:s:1}" = "{" ] || continue
+    [ "$s" -gt 0 ] && [ "${w:s-1:1}" = '$' ] && continue
+    depth=0
+    commas=()
+    for ((j = s; j < n; j++)); do
+      c="${w:j:1}"
+      case "$c" in
+        '{') depth=$((depth + 1)) ;;
+        '}')
+          depth=$((depth - 1))
+          [ "$depth" -eq 0 ] && break
+          ;;
+        ,) [ "$depth" -eq 1 ] && commas+=("$j") ;;
+      esac
+    done
+    [ "$j" -lt "$n" ] || continue
+    if [ "${#commas[@]}" -eq 0 ]; then
+      brace_seq "${w:s+1:j-s-1}" || continue
+      BR_PRE="${w:0:s}"
+      BR_POST="${w:j+1}"
+      return 0
+    fi
+    BR_PRE="${w:0:s}"
+    BR_POST="${w:j+1}"
+    from=$((s + 1))
+    for cm in "${commas[@]}"; do
+      BR_ALTS+=("${w:from:cm-from}")
+      from=$((cm + 1))
+    done
+    BR_ALTS+=("${w:from:j-from}")
+    return 0
+  done
+  return 1
+}
+
+# brace_seq <what is between the braces>: the words of a sequence expression {x..y} or
+# {x..y..incr}, in BR_ALTS, as bash makes them (`.e{n..n}v` is .env, `d{e..e}velop` is develop):
+# x and y both integers, zero-padded to the wider of the two when either is written with a leading
+# zero, or both single letters (every character between them); every incr-th one, whose sign does
+# not count and 0 stands for 1. Exit 1: not a sequence, and the shell leaves it as written. One word
+# past BRACE_MAX is enough for brace_words to stop, so no more are made: `{1..99999999}` costs nothing.
+brace_seq() {
+  local t="$1" x y inc a b sx sy width=0 count k cur v LC_ALL=C
+  BR_ALTS=()
+  [[ "$t" =~ ^([^.]+)\.\.([^.]+)(\.\.([^.]+))?$ ]] || return 1
+  x="${BASH_REMATCH[1]}" y="${BASH_REMATCH[2]}" inc="${BASH_REMATCH[4]:-1}"
+  [[ "$inc" =~ ^[-+]?[0-9]{1,18}$ ]] || return 1
+  inc="${inc#[-+]}"
+  inc=$((10#$inc))
+  [ "$inc" -gt 0 ] || inc=1
+  if [[ "$x" =~ ^[-+]?[0-9]{1,18}$ && "$y" =~ ^[-+]?[0-9]{1,18}$ ]]; then
+    sx="${x#[-+]}" sy="${y#[-+]}"
+    a=$((10#$sx)) b=$((10#$sy))
+    [ "${x:0:1}" = - ] && a=$((-a))
+    [ "${y:0:1}" = - ] && b=$((-b))
+    if [[ "$sx" == 0?* || "$sy" == 0?* ]]; then
+      width=${#x}
+      [ "${#y}" -gt "$width" ] && width=${#y}
+    fi
+  elif [[ "$x" =~ ^[A-Za-z]$ && "$y" =~ ^[A-Za-z]$ ]]; then
+    printf -v a '%d' "'$x"
+    printf -v b '%d' "'$y"
+    width=-1
+  else
+    return 1
+  fi
+  if [ "$a" -le "$b" ]; then count=$(((b - a) / inc + 1)); else count=$(((a - b) / inc + 1)); fi
+  [ "$count" -le $((BRACE_MAX + 1)) ] || count=$((BRACE_MAX + 1))
+  [ "$a" -le "$b" ] || inc=$((-inc))
+  cur=$a
+  for ((k = 0; k < count; k++)); do
+    if [ "$width" -lt 0 ]; then
+      printf -v v '%x' "$cur"
+      printf -v v "\\x$v"
+    else
+      printf -v v '%0*d' "$width" "$cur"
+    fi
+    BR_ALTS+=("$v")
+    cur=$((cur + inc))
   done
   return 0
 }
@@ -1317,16 +3848,36 @@ check_generated_write() {
 # its input turns a long command into a hook timeout. So the scan runs byte-wise (LC_ALL=C: a
 # character offset in a multibyte locale costs a walk from the start of the string) over
 # fixed-size chunks (an offset into a short chunk costs the same wherever the chunk sits), and
-# nothing inside the loop copies the remainder of the string.
+# nothing inside the loop copies the remainder of the string. A run of characters that only go into
+# the word as they are is taken in one step: a character at a time, a command word of 6,000 `$()`
+# took seconds (found 2026-10-03, third verification round of #299).
 EGRESS_WORDS=()
+# What ends such a run: outside quotes, inside single quotes, inside double quotes.
+EGRESS_RUN_END_U=$'[ \t\'"\\\\$`{,.}]*'
+EGRESS_RUN_END_S=$'[\'$`]*'
+EGRESS_RUN_END_D=$'["\\\\]*'
 egress_words() {
   local LC_ALL=C
-  local s="$1" w="" q="" c chunk i j m off n=${#1} inword=0 esc=0 br=0 brsep=0 dot=0
+  local s="$1" w="" q="" c chunk i j m off n=${#1} inword=0 esc=0 br=0 brsep=0 dot=0 run
   EGRESS_WORDS=()
   for ((off = 0; off < n; off += 4096)); do
     chunk="${s:off:4096}"
     m=${#chunk}
     for ((j = 0; j < m; j++)); do
+      if ((!esc)); then
+        run="${chunk:j}"
+        case "$q" in
+          "'") run="${run%%$EGRESS_RUN_END_S}" ;;
+          '"') run="${run%%$EGRESS_RUN_END_D}" ;;
+          *) run="${run%%$EGRESS_RUN_END_U}" ;;
+        esac
+        if [ -n "$run" ]; then
+          w+="$run"
+          j=$((j + ${#run} - 1))
+          [ -n "$q" ] || dot=0 inword=1
+          continue
+        fi
+      fi
       c="${chunk:j:1}"
       if ((esc)); then
         # The character after a backslash, outside single quotes.
@@ -1419,6 +3970,7 @@ deny_egress_nonliteral() {
   local shown="${1//$'\x1e'/}"
   shown="${shown//$'\x1f'/\$}"
   shown="${shown//\$__GUARD_SUBST__/\$(…)}"
+  shown="${shown//"$XARGS_PLACEHOLDER"/<from xargs>}"
   deny "curl/wget toward a destination that is not written literally ('${shown}'): network egress is restricted to the allow-list, and it can only judge a host written in the command" \
     "write the URL with its scheme and host literally, quoted, one command per URL (the path may keep variables inside the quotes); ${EGRESS_READ_HINT}; or ask the user to fetch the resource"
 }
@@ -1466,10 +4018,16 @@ check_egress_literal() {
   while [ "$i" -lt "$n" ]; do
     w="${EGRESS_WORDS[i]}"
     i=$((i + 1))
-    [ "${w##*/}" = "$tool" ] && break
+    base_name "$w"
+    [ "$BASE_NAME" = "$tool" ] && break
   done
+  # Under xargs, what it reads from stdin becomes part of the command: in place of its replace
+  # string, or appended at the end (one more destination word, unknown).
+  if [ "$SEG_XARGS" -eq 1 ] && [ -z "$SEG_REPL" ]; then EGRESS_WORDS+=("$XARGS_PLACEHOLDER"); fi
+  n=${#EGRESS_WORDS[@]}
   for (( ; i < n; i++)); do
     w="${EGRESS_WORDS[i]}"
+    [ -n "$SEG_REPL" ] && w="${w//"$SEG_REPL"/\$}"
     if [ "$skip_next" -eq 1 ]; then
       skip_next=0
       continue
@@ -1551,104 +4109,975 @@ check_egress() {
 
 # --- Segment analysis -------------------------------------------------------
 
-# Does this text end inside a word the shell has not finished? A whitespace token can: `X="a b"`
-# arrives as `X="a` and `b"`, and `X=a\ b` as `X=a\` and `b` (the blank was escaped).
-quote_open() {
-  local s="$1" q="" c k LC_ALL=C
-  for ((k = 0; k < ${#s}; k++)); do
-    c="${s:k:1}"
-    if [ "$q" = "'" ]; then
-      [ "$c" = "'" ] && q=""
-      continue
+# Does a whitespace token end inside a word the shell has not finished? It can: `X="a b"` arrives
+# as `X="a` and `b"`, and `X=a\ b` as `X=a\` and `b` (the blank was escaped).
+# quote_carry <quote open before> <token>: the quote still open after <token>, in QC (empty: none;
+# `\` stands for a trailing backslash, which escaped the blank that ended the token). Read one
+# token at a time, carrying the state, so a word spread over many tokens is read in one pass.
+QC=""
+quote_carry() {
+  local q="$1" s="$2" c k m off chunk rest pre esc=0 n LC_ALL=C
+  [ "$q" = '\' ] && q=""
+  n=${#s}
+  # Linear, like egress_words: over fixed-size chunks, and from one quote or backslash to the next.
+  # A character at a time over the whole token, its offset into it cost a walk of the token each, and
+  # a command word of 6,000 `$()` (96 KB as the extractor sends it) took minutes (found 2026-10-03,
+  # third verification round of #299).
+  for ((off = 0; off < n; off += 4096)); do
+    chunk="${s:off:4096}"
+    m=${#chunk}
+    k=0
+    if [ "$esc" -eq 1 ]; then
+      esc=0
+      k=1
     fi
-    if [ "$c" = '\' ]; then
-      # A backslash that ends the token escaped the blank that ended it.
-      [ $((k + 1)) -lt ${#s} ] || return 0
+    while [ "$k" -lt "$m" ]; do
+      rest="${chunk:k}"
+      if [ "$q" = "'" ]; then
+        pre="${rest%%\'*}"
+      else
+        pre="${rest%%[\'\"\\]*}"
+      fi
+      k=$((k + ${#pre}))
+      [ "$k" -lt "$m" ] || break
+      c="${chunk:k:1}"
       k=$((k + 1))
-      continue
-    fi
-    if [ "$q" = '"' ]; then
-      [ "$c" = '"' ] && q=""
-      continue
-    fi
-    case "$c" in "'" | '"') q="$c" ;; esac
+      if [ "$q" = "'" ]; then
+        q=""
+        continue
+      fi
+      if [ "$c" = '\' ]; then
+        if [ $((off + k)) -ge "$n" ]; then
+          [ -n "$q" ] || q='\'
+          break
+        fi
+        if [ "$k" -ge "$m" ]; then esc=1; else k=$((k + 1)); fi
+        continue
+      fi
+      if [ "$q" = '"' ]; then
+        [ "$c" = '"' ] && q=""
+        continue
+      fi
+      q="$c"
+    done
   done
-  [ -n "$q" ]
+  QC="$q"
+  return 0
 }
 
+# --- The command word: what a segment RUNS ------------------------------------
+# Every rule judges a segment by its command word, so the words in front of it that are not it
+# are skipped: assignments, shell keywords, and WRAPPERS — programs that run the command written
+# after their own options (sudo, env, nice, timeout, xargs…). A wrapper is skipped together with
+# its options, the values those options take (`sudo -u <user>`, `nice -n <n>`, `stdbuf -o <mode>`)
+# and the operands that come before the command (timeout's duration, flock's lock file, chroot's
+# new root), so the command word is the program that runs. One skipper serves the two readings of
+# a segment (check_segment's whitespace tokens, gh_words' shell words): they must land on the same
+# word.
+#
+# A wrapper not listed here hides the command like an interpreter does (see the header).
+#
+# xargs also ADDS arguments the command line does not show: read from stdin and appended, or put
+# where its replace string is (-I {}). The rules that must read a value — which PR, which host —
+# treat those as a value the shell fills in later: PFX_XARGS says xargs is there, PFX_REPL holds
+# its replace string (empty: the arguments are appended).
+
+# wrapper_grammar <name>: WG_SHORT = short options whose value is the rest of the word or the next
+# word; WG_OPT_ATTACHED = short options whose value can only be attached (xargs -i{} -e -l);
+# WG_LONG = long options whose value is the next word when not given with `=`; WG_POS = operands
+# before the command. Exit 1: not a wrapper.
+WG_SHORT=""
+WG_OPT_ATTACHED=""
+WG_LONG=" "
+WG_POS=0
+wrapper_grammar() {
+  WG_SHORT="" WG_OPT_ATTACHED="" WG_LONG=" " WG_POS=0
+  case "$1" in
+    # -S (--split-string) is NOT a value here: its value is the start of the command it runs.
+    env) WG_SHORT="uC" WG_LONG=" --unset --chdir " ;;
+    sudo)
+      WG_SHORT="aCcDghpRrTtUu"
+      WG_LONG=" --auth-type --close-from --login-class --chdir --group --host --prompt --chroot --role --type --command-timeout --other-user --user "
+      ;;
+    doas) WG_SHORT="aCu" ;;
+    nice) WG_SHORT="n" WG_LONG=" --adjustment " ;;
+    timeout) WG_SHORT="sk" WG_LONG=" --signal --kill-after " WG_POS=1 ;;
+    stdbuf) WG_SHORT="ioe" WG_LONG=" --input --output --error " ;;
+    ionice) WG_SHORT="cnpPu" WG_LONG=" --class --classdata --pid --pgid --uid " ;;
+    time) WG_SHORT="fo" WG_LONG=" --format --output " ;;
+    exec) WG_SHORT="a" ;;
+    flock) WG_SHORT="wE" WG_LONG=" --wait --timeout --conflict-exit-code " WG_POS=1 ;;
+    chroot) WG_LONG=" --userspec --groups " WG_POS=1 ;;
+    caffeinate) WG_SHORT="tw" ;;
+    runuser)
+      WG_SHORT="cgGsuw"
+      WG_LONG=" --command --group --supp-group --shell --user --whitelist-environment "
+      ;;
+    nsenter) WG_SHORT="tSG" WG_OPT_ATTACHED="rwmuinpUCT" WG_LONG=" --target --setuid --setgid " ;;
+    unshare)
+      WG_SHORT="SGRw" WG_OPT_ATTACHED="muinpUCT"
+      WG_LONG=" --setuid --setgid --root --wd --setgroups --propagation --map-user --map-group --map-users --map-groups --monotonic --boottime "
+      ;;
+    strace) WG_SHORT="abeEIoOpPsSuUX" WG_LONG=" --output --env --user " ;;
+    ltrace) WG_SHORT="aADeFlnopsuwx" WG_LONG=" --output --library " ;;
+    watch) WG_SHORT="nq" WG_OPT_ATTACHED="d" WG_LONG=" --interval --equexit " ;;
+    xargs)
+      WG_SHORT="adEILnPs" WG_OPT_ATTACHED="eil"
+      WG_LONG=" --arg-file --delimiter --max-args --max-procs --max-chars --process-slot-var "
+      ;;
+    # GNU parallel runs its command once per input, like xargs (see parallel_inputs for its inputs).
+    parallel)
+      WG_SHORT="aCdEIjJLnNPsS" WG_OPT_ATTACHED="eil"
+      WG_LONG=" --arg-file --arg-file-sep --arg-sep --basefile --bf --basenamereplace --bnr --basenameextensionreplace --bner --block --block-size --colsep --compress-program --decompress-program --delay --delimiter --dirnamereplace --dnr --env --eof --extensionreplace --er --halt --halt-on-error --header --hostgroups --id --jobs --joblog --load --max-args --max-chars --max-line-length-allowed --max-lines --max-procs --max-replace-args --memfree --memsuspend --nice --process-slot-var --profile --recend --recstart --replace --res --results --retries --return --rpl --semaphorename --seqreplace --shebang --slotreplace --sql --sqlandworker --sqlmaster --sqlworker --ssh --sshdelay --sshlogin --sshloginfile --slf --tagstring --termseq --tf --timeout --tmpdir --transferfile --wd --workdir "
+      ;;
+    # ssh runs the words after its destination (the one operand) on the remote host: unquoted, they
+    # are the command the remote shell reads. A quoted one is a command of its own for the extractor.
+    ssh) WG_SHORT="BbcDEeFIiJLlmOoPpQRSWw" WG_POS=1 ;;
+    # eval joins its words and runs them: unquoted (`eval gh pr merge 5 --admin`) its first word is
+    # the command word; a quoted string is also read as a command of its own by the extractor.
+    setsid | nohup | command | builtin | busybox | eval) ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# A cluster of short options of the wrapper in WG_*: the first letter that takes a value ends it.
+# WC_LETTER is that letter (empty: none), WC_VALUE its attached value, WC_NEXT 1 when the value
+# is the next word.
+WC_LETTER=""
+WC_VALUE=""
+WC_NEXT=0
+wrapper_cluster() {
+  local w="${1#-}" k c
+  WC_LETTER="" WC_VALUE="" WC_NEXT=0
+  for ((k = 0; k < ${#w}; k++)); do
+    c="${w:k:1}"
+    if [[ "$WG_SHORT" == *"$c"* ]]; then
+      WC_LETTER="$c"
+      WC_VALUE="${w:k+1}"
+      [ -n "$WC_VALUE" ] || WC_NEXT=1
+      WC_VALUE="${WC_VALUE#=}"
+      return 0
+    fi
+    if [[ "$WG_OPT_ATTACHED" == *"$c"* ]]; then
+      WC_LETTER="$c"
+      WC_VALUE="${w:k+1}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# prefix_end: reads PFX_W (the words of a segment) and, when given, PFX_RAW (the same words before
+# quote stripping, to join a word whose quoted part spans several of them). Sets PFX_END to the
+# index of the command word (>= the number of words: there is none), PFX_XARGS and PFX_REPL, and
+# PFX_PARALLEL when GNU parallel is among the wrappers: it adds arguments like xargs (`{}` is its
+# replace string when the command holds one; otherwise they are appended).
+PFX_W=()
+PFX_RAW=()
+PFX_END=0
+PFX_XARGS=0
+PFX_REPL=""
+PFX_PARALLEL=0
+# pfx_next <k>: the index right after the word that starts at token k, in PFX_NEXT. With PFX_RAW
+# (whitespace tokens), a quoted part with blanks spans several tokens and all of them are that one
+# word: an assignment (`X="a b" git push`), an option value (`sudo -u "a b" git push`) or an
+# operand (`flock "/tmp/my lock" git push`). Taking the second half for the next word made it the
+# command word, which no rule looked at. The quote state is carried token to token: linear.
+PFX_NEXT=0
+pfx_next() {
+  local k="$1" q=""
+  if [ "${#PFX_RAW[@]}" -ne "${#PFX_W[@]}" ]; then
+    PFX_NEXT=$((k + 1))
+    return 0
+  fi
+  while [ "$k" -lt "${#PFX_RAW[@]}" ]; do
+    quote_carry "$q" "${PFX_RAW[k]}"
+    q="$QC"
+    k=$((k + 1))
+    [ -n "$q" ] || break
+  done
+  PFX_NEXT=$k
+  return 0
+}
+# A redirection may stand anywhere in a simple command, in front of the command word too
+# (`2>/dev/null git push …`, `<cmds.txt parallel`): an operator with its target attached is one
+# word, and one standing alone takes the next word as its target.
+PFX_REDIR_RE='^[0-9]*(<<<|<<-|<<|<>|<&|<|>>|>\||>&|>|&>>|&>)(.*)$'
+prefix_end() {
+  local n=${#PFX_W[@]} i=0 w name p
+  PFX_XARGS=0 PFX_REPL="" PFX_PARALLEL=0
+  while [ "$i" -lt "$n" ]; do
+    w="${PFX_W[i]}"
+    if [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      pfx_next "$i"
+      i=$PFX_NEXT
+      continue
+    fi
+    if [[ "$w" =~ $PFX_REDIR_RE ]]; then
+      p="${BASH_REMATCH[2]}"
+      pfx_next "$i"
+      i=$PFX_NEXT
+      if [ -z "$p" ]; then
+        pfx_next "$i"
+        i=$PFX_NEXT
+      fi
+      continue
+    fi
+    case "$w" in
+      do | then | else | elif | if | while | until | '{' | '!' | coproc)
+        i=$((i + 1))
+        continue
+        ;;
+    esac
+    base_name "$w"
+    name="$BASE_NAME"
+    wrapper_grammar "$name" || break
+    pfx_next "$i"
+    i=$PFX_NEXT
+    while [ "$i" -lt "$n" ]; do
+      w="${PFX_W[i]}"
+      case "$w" in
+        --)
+          i=$((i + 1))
+          break
+          ;;
+        --*=*)
+          [[ "$name" == xargs || "$name" == parallel ]] && [ "${w%%=*}" = --replace ] && PFX_REPL="${w#*=}"
+          pfx_next "$i"
+          i=$PFX_NEXT
+          ;;
+        --?*)
+          [ "$name" = xargs ] && [ "$w" = --replace ] && PFX_REPL="{}"
+          [ "$name" = parallel ] && [ "$w" = --replace ] && PFX_REPL="${PFX_W[i + 1]:-}"
+          pfx_next "$i"
+          i=$PFX_NEXT
+          if [[ "$WG_LONG" == *" $w "* ]]; then
+            pfx_next "$i"
+            i=$PFX_NEXT
+          fi
+          ;;
+        -)
+          # `env -` is `env -i`; for the others a lone `-` is no option.
+          [ "$name" = env ] || break
+          i=$((i + 1))
+          ;;
+        -?*)
+          wrapper_cluster "$w"
+          if [ "$name" = xargs ] || [ "$name" = parallel ]; then
+            case "$WC_LETTER" in
+              I) if [ "$WC_NEXT" -eq 1 ]; then PFX_REPL="${PFX_W[i + 1]:-}"; else PFX_REPL="$WC_VALUE"; fi ;;
+              i) if [ -n "$WC_VALUE" ]; then PFX_REPL="$WC_VALUE"; else PFX_REPL='{}'; fi ;;
+            esac
+          fi
+          pfx_next "$i"
+          i=$PFX_NEXT
+          if [ "$WC_NEXT" -eq 1 ]; then
+            pfx_next "$i"
+            i=$PFX_NEXT
+          fi
+          ;;
+        *) break ;;
+      esac
+    done
+    for ((p = 0; p < WG_POS; p++)); do
+      pfx_next "$i"
+      i=$PFX_NEXT
+    done
+    # ssh reads its options after the destination too (`ssh host -p 2222 cmd`, measured).
+    while [ "$name" = ssh ] && [ "$i" -lt "$n" ]; do
+      w="${PFX_W[i]}"
+      case "$w" in
+        --)
+          i=$((i + 1))
+          break
+          ;;
+        -?*)
+          wrapper_cluster "$w"
+          pfx_next "$i"
+          i=$PFX_NEXT
+          if [ "$WC_NEXT" -eq 1 ]; then
+            pfx_next "$i"
+            i=$PFX_NEXT
+          fi
+          ;;
+        *) break ;;
+      esac
+    done
+    [ "$name" = xargs ] && PFX_XARGS=1
+    if [ "$name" = parallel ]; then
+      PFX_XARGS=1 PFX_PARALLEL=1
+      if [ -z "$PFX_REPL" ]; then
+        for ((p = i; p < n; p++)); do
+          [[ "${PFX_W[p]}" == *'{}'* ]] && PFX_REPL='{}' && break
+        done
+      fi
+    fi
+  done
+  PFX_END=$i
+  return 0
+}
+
+# --- The command word, as the shell reads it --------------------------------------------------
+# Every rule picks its program by the command word, and the shell reads that word before it runs
+# it: quotes and backslashes come off (`\git`, `g''h`, `gi"t"`), braces expand (`{gh,pr} merge` is
+# `gh pr merge`, `{g..g}h` is `gh`), and a parameter or a substitution becomes its value
+# (`G=gh; $G pr merge`). Read as written, each of them left the command to no rule at all, --force
+# and --admin included (found 2026-10-01). So a command word holding any of those characters is
+# read again (cw_read):
+#   - one the guard can read (quotes, backslashes, braces) is replaced by the words the shell makes
+#     of it, and the segment is judged again. Once: what that reading leaves (`\"git\"`) is the
+#     name, except behind eval, which reads its words again (`eval \$G …`);
+#   - a pattern (`/usr/bin/gi[t]`) is judged as each program a rule reads whose name it matches;
+#   - a parameter that this same command gives a literal value (`G=gh`, `export G="git -C x"`,
+#     `for G in gh git`, `set -- gh …` for "$@") is replaced by each of those values in turn: the
+#     guard reads the whole command, so it knows every value the command itself gives the name
+#     (cw_assignments). 318 real commands of the 31 days to 2026-10-02 run their program that way;
+#   - anything else (a value from a substitution or from the environment, `$1`, `"$@"`, `$(…)`,
+#     `${G:-x}`, `$'…'`) cannot be read. Denying it outright would have denied 285 real commands of
+#     those 31 days (test harnesses running "$@", `S="python3 $R/x.py"; $S …`, `./$d`), so the
+#     guard judges what the word may stand for instead (cw_as_if): nothing (an empty value, or a
+#     wrapper, so the next word runs), git, gh and a reader (cat, for the .env rule), and denies,
+#     saying so, when any of them is denied. curl is left out on purpose: read as curl, every
+#     argument holding a variable would be a destination.
+# Only on a segment that is certainly a command. A quoted span may be data, and it keeps being read
+# as written: read as the shell reads a command, the grep pattern 'pr-merge\.sh merge|…' is the
+# merge step, and a `|parallel|` in an alternation is parallel reading its commands from stdin.
+# Certainly commands, though quoted, are a substitution's body (`x="$(cd d && \git push)"`) and
+# the script of `bash -c '…'`, `eval '…'` and `ssh host '…'`: the extractor hands those over
+# unmarked (see splitSegments and addBodies).
+# A path whose directory is filled in (`"$W/scripts/run.sh"`) names its program in its last part,
+# which is what every rule reads: it is not an unreadable command word.
+
+# command_word <the word, as written>: CW_EXP is 1 when the last part of its path holds something
+# the shell fills in ($NAME, ${…}, $(…), `…`, $'…'), and then CW_VAR is NAME when the whole word is
+# one plain parameter ($NAME, ${NAME}, "$NAME", "${NAME}"). Otherwise CW_WORDS are the words the
+# shell makes of it (quotes and backslashes removed, braces expanded; of a path, only its last
+# part), and CW_OVER is 1 when its braces make more words than the guard reads.
+CW_WORDS=()
+CW_EXP=0
+CW_VAR=""
+CW_OVER=0
+command_word() {
+  local w b
+  CW_WORDS=() CW_EXP=0 CW_VAR="" CW_OVER=0
+  if [[ "$1" =~ ^\"?\$(\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))\"?$ ]]; then
+    CW_VAR="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
+    CW_EXP=1
+    return 0
+  fi
+  # A positional parameter ($@, "$*", $1, ${2}…): what `set --` gives them (see cw_assignments).
+  if [[ "$1" =~ ^\"?\$(\{([@*]|[1-9][0-9]*)\}|[@*1-9])\"?$ ]]; then
+    CW_VAR="@"
+    CW_EXP=1
+    return 0
+  fi
+  # egress_words reads quotes and backslashes as the shell does: an expansion keeps its `$` (or
+  # backtick), a literal one becomes \x1f, and an unquoted expansion or brace that expands is
+  # marked with \x1e.
+  egress_words "$1"
+  w="${EGRESS_WORDS[*]-}"
+  # base_name, not `${w##*/}`, which took seconds on a 96 KB command word (see base_name).
+  base_name "$w"
+  b="$BASE_NAME"
+  # Whether it holds a `$` or a backtick, \x1e marks or not (not `${b//$'\x1e'/}`: bash replaces
+  # thousands of marks in time quadratic in the length of the word).
+  if [[ "$b" == *[\$\`]* ]]; then
+    CW_EXP=1
+    return 0
+  fi
+  if [[ "$w" == *$'\x1e'* ]]; then
+    brace_words "${w//$'\x1e'/}"
+    if [ "$BRACE_OVER" -eq 1 ]; then
+      CW_OVER=1
+      return 0
+    fi
+    # The shell drops the empty words a brace makes (`{,} git` runs git).
+    for w in "${BRACE_OUT[@]}"; do
+      w="${w//$'\x1f'/\$}"
+      [ -n "$w" ] && CW_WORDS+=("$w")
+    done
+    # Of a path, its last part names the program; the words the braces add after it are arguments.
+    # A quoted name with a blank is no path to cut: it stays whole (cw_read reads it as written).
+    if [ "${#CW_WORDS[@]}" -gt 0 ] && [[ "${CW_WORDS[0]}" != *[[:space:]]* ]]; then
+      base_name "${CW_WORDS[0]}"
+      CW_WORDS[0]="$BASE_NAME"
+    fi
+    return 0
+  fi
+  w="${w//$'\x1f'/\$}"
+  if [[ "$w" == *[[:space:]]* ]]; then
+    CW_WORDS=("$w")
+  else
+    base_name "$w"
+    CW_WORDS=("$BASE_NAME")
+  fi
+  return 0
+}
+
+# cw_value <value of an assignment or a for word, as written>: the value the shell gives, in CWV;
+# $'\x1e' when the guard cannot read it (an expansion, a brace, a glob, or empty: an empty value
+# leaves the next word to run, which cw_as_if judges anyway).
+CWV=""
+cw_value() {
+  local v
+  egress_words "$1"
+  v="${EGRESS_WORDS[*]-}"
+  if [ -z "$v" ] || [[ "$v" == *$'\x1e'* || "$v" == *[\$\`*?[]* ]]; then
+    CWV=$'\x1e'
+    return 0
+  fi
+  CWV="${v//$'\x1f'/\$}"
+  return 0
+}
+
+# Every value this command gives a name, as "NAME<TAB>VALUE" lines in CW_ASSIGN, read once from all
+# its segments: NAME=value and NAME[i]=value (alone, in front of a command, after eval, or after
+# export, declare, typeset, local or readonly), the words of `for NAME in …`, and the words of
+# `set -- …`, which are the positional parameters ($@, $*, $1…, recorded as `@`). A value the guard
+# cannot read is $'\x1e' (cw_value), as is `+=`, a nameref (declare -n: the name stands for another
+# one) and every name read, mapfile, readarray and printf -v set.
+CW_ASSIGN=""
+CW_ASSIGN_READ=0
+cw_assignments() {
+  local line k n w name plus nameref
+  local -a t=()
+  [ "$CW_ASSIGN_READ" -eq 1 ] && return 0
+  CW_ASSIGN_READ=1
+  segment_lines
+  for line in ${SEGMENT_LINES[@]+"${SEGMENT_LINES[@]}"}; do
+    [[ "$line" == $'\v'* ]] && line="${line:1}"
+    [[ "$line" == $'\t'* ]] && line="${line:1}"
+    words_of "$line"
+    t=(${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"})
+    n=${#t[@]}
+    k=0
+    nameref=0
+    while [ "$k" -lt "$n" ]; do
+      case "${t[k]}" in
+        do | then | else | elif | if | while | until | '{' | '!' | coproc | eval | builtin | command) k=$((k + 1)) ;;
+        *) break ;;
+      esac
+    done
+    [ "$k" -lt "$n" ] || continue
+    case "${t[k]}" in
+      set)
+        for ((k = k + 1; k < n; k++)); do
+          [ "${t[k]}" = -- ] && break
+          [[ "${t[k]}" == [-+]* ]] || break
+        done
+        if [ "${t[k]-}" = -- ]; then
+          cw_value "${t[*]:k+1}"
+          [ "$k" -lt $((n - 1)) ] || CWV=$'\x1e'
+          CW_ASSIGN+="@"$'\t'"${CWV}"$'\n'
+        fi
+        continue
+        ;;
+      for)
+        name="${t[k + 1]-}"
+        [ "${t[k + 2]-}" = in ] || continue
+        for ((k = k + 3; k < n; k++)); do
+          cw_value "${t[k]}"
+          CW_ASSIGN+="${name}"$'\t'"${CWV}"$'\n'
+        done
+        continue
+        ;;
+      read | mapfile | readarray)
+        for ((k = k + 1; k < n; k++)); do
+          [[ "${t[k]}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && CW_ASSIGN+="${t[k]}"$'\t'$'\x1e\n'
+        done
+        continue
+        ;;
+      printf)
+        for ((k = k + 1; k < n; k++)); do
+          case "${t[k]}" in
+            -v) CW_ASSIGN+="${t[k + 1]-}"$'\t'$'\x1e\n' ;;
+            -v?*) CW_ASSIGN+="${t[k]#-v}"$'\t'$'\x1e\n' ;;
+          esac
+        done
+        continue
+        ;;
+      export | declare | typeset | local | readonly)
+        k=$((k + 1))
+        while [ "$k" -lt "$n" ] && [[ "${t[k]}" == [-+]* ]]; do
+          [[ "${t[k]}" == -*n* ]] && nameref=1
+          k=$((k + 1))
+        done
+        ;;
+    esac
+    while [ "$k" -lt "$n" ] && [[ "${t[k]}" =~ ^([A-Za-z_][A-Za-z0-9_]*)(\[[^]]*\])?(\+?)= ]]; do
+      name="${BASH_REMATCH[1]}" plus="${BASH_REMATCH[3]}"
+      # One shell word: a quoted part with blanks spans several tokens (`G="git -C x"`).
+      w="${t[k]}"
+      quote_carry "" "$w"
+      k=$((k + 1))
+      while [ -n "$QC" ] && [ "$k" -lt "$n" ]; do
+        w+=" ${t[k]}"
+        quote_carry "$QC" "${t[k]}"
+        k=$((k + 1))
+      done
+      cw_value "${w#*=}"
+      [ -n "$plus" ] && CWV=$'\x1e'
+      [ "$nameref" -eq 1 ] && CWV=$'\x1e'
+      CW_ASSIGN+="${name}"$'\t'"${CWV}"$'\n'
+    done
+  done
+  return 0
+}
+
+# cw_values <NAME>: the values this command gives NAME, in CWV_LIST; CWV_UNKNOWN is 1 when one of
+# them cannot be read, or when the command gives it none (it comes from the environment).
+CWV_LIST=()
+CWV_UNKNOWN=0
+cw_values() {
+  local line
+  local -a lines=()
+  CWV_LIST=()
+  CWV_UNKNOWN=0
+  cw_assignments
+  lines_of "$CW_ASSIGN"
+  lines=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
+  for line in ${lines[@]+"${lines[@]}"}; do
+    [ "${line%%$'\t'*}" = "$1" ] || continue
+    line="${line#*$'\t'}"
+    if [ "$line" = $'\x1e' ]; then CWV_UNKNOWN=1; else CWV_LIST+=("$line"); fi
+  done
+  [ "${#CWV_LIST[@]}" -gt 0 ] || CWV_UNKNOWN=1
+  # `${NAME:=value}` and `${NAME=value}` assign it too, wherever they stand.
+  [[ "${SEGMENTS:-}" == *'${'"$1"'='* || "${SEGMENTS:-}" == *'${'"$1"':='* ]] && CWV_UNKNOWN=1
+  return 0
+}
+
+# cw_judge <word>...: judge this segment again with its command word replaced by these words; the
+# words in front of it (assignments, wrappers and theirs) and the rest of it stay as written, and so
+# do its marks. Reads check_segment's pre_raw, raw, cw_end, QUOTED and PARTIAL.
+CW_DEPTH=0
+CW_DEPTH_MAX=3
+cw_judge() {
+  local text="" w
+  for w in ${pre_raw[@]+"${pre_raw[@]}"} "$@" "${raw[@]:cw_end}"; do text+="$w "; done
+  text="${text% }"
+  [ "$PARTIAL" -eq 1 ] && text=$'\t'"$text"
+  [ "$QUOTED" -eq 1 ] && text=$'\v'"$text"
+  CW_DEPTH=$((CW_DEPTH + 1))
+  check_segment "$text"
+  CW_DEPTH=$((CW_DEPTH - 1))
+  return 0
+}
+
+# cw_as_if <the command word, as shown>: judge this segment as each program an unreadable command
+# word may stand for (see the top of this section). Not again inside one of them.
+CW_ASIF=0
+cw_as_if() {
+  local cand saved_c="$CW_CONTEXT" saved_h="$CW_HINT"
+  CW_ASIF=1
+  CW_HINT="write the program's name in the command, or give the name a literal value earlier in this same command (NAME=gh; \$NAME …), which the guard reads"
+  for cand in "" git gh cat; do
+    if [ -z "$cand" ]; then
+      CW_CONTEXT="the program ${1} is filled in by the shell, which the guard cannot read; read as empty (or as a wrapper, so the next word runs), this is denied"
+      cw_judge
+    else
+      CW_CONTEXT="the program ${1} is filled in by the shell, which the guard cannot read; read as ${cand}, this is denied"
+      cw_judge "$cand"
+    fi
+  done
+  CW_ASIF=0
+  CW_CONTEXT="$saved_c" CW_HINT="$saved_h"
+  return 0
+}
+
+# The programs some rule reads by its command word (check_segment) and the wrappers prefix_end
+# skips: what a pattern in the command word is matched against (cw_read).
+CW_RULE_PROGRAMS="git gh curl wget find pr-merge.sh pr_merge.py source bash sh dash zsh ksh ash mksh python python2 python3 export declare typeset readonly local let printf read cat head tail less more grep sed awk strings base64 xxd od tee cp mv rm cd pushd popd env sudo doas nice timeout stdbuf ionice time exec flock chroot caffeinate runuser nsenter unshare strace ltrace watch xargs parallel ssh setsid nohup command builtin busybox eval"
+
+# cw_read: the command word of this segment (raw[0], and the tokens a quoted part with blanks carries
+# it over), read as the shell reads it; the segment is judged as what it runs, and CW_DONE is 1: the
+# caller is done. CW_DONE 0: the command word is what it says, read on as written. (A flag, not the
+# exit status: a function called as a condition runs without `set -e`, and so would every rule.)
+CW_DONE=0
+cw_read() {
+  local w="${raw[0]}" v shown saved="$CW_CONTEXT" ev
+  local -a vals=()
+  CW_DONE=0
+  cw_end=1
+  quote_carry "" "$w"
+  while [ -n "$QC" ] && [ "$cw_end" -lt "${#raw[@]}" ]; do
+    w+=" ${raw[cw_end]}"
+    quote_carry "$QC" "${raw[cw_end]}"
+    cw_end=$((cw_end + 1))
+  done
+  command_word "$w"
+  shown_subst "$w"
+  shown="'${SHOWN}'"
+  if [ "$CW_EXP" -eq 0 ]; then
+    if [ "$CW_OVER" -eq 1 ]; then
+      deny "the command word ${shown}: its braces expand to more words than the guard reads (${BRACE_MAX} at most)" \
+        "write the program and its arguments out"
+    fi
+    # Read on as written when the reading adds nothing or cannot be written back into the segment:
+    # the same word, an empty one (`""`: the shell finds no program), or one holding a blank (a
+    # quoted program name) or a literal `$`, backtick, backslash, quote or brace: the shell reads a
+    # word once, and what one reading leaves (`\"git\"`, `\$G`, `\{a,b\}`) is part of the name. Not
+    # after eval, which reads its words once more: `G=gh; eval \$G pr merge 5 --admin` runs gh
+    # (found 2026-10-02, verifying this change), so there the reading goes on.
+    ev=0
+    for v in ${pre_raw[@]+"${pre_raw[@]}"}; do [ "$v" = eval ] && ev=1; done
+    for v in ${CW_WORDS[@]+"${CW_WORDS[@]}"}; do
+      [[ -z "$v" || "$v" == *[[:space:]]* ]] && return 0
+      [ "$ev" -eq 0 ] && [[ "$v" == *[\$\`\\\'\"\{]* ]] && return 0
+    done
+    # A pattern in the program's name (`/usr/bin/gi[t]`, `/usr/bin/g?t`) is the file it matches:
+    # judged as each program a rule reads whose name it matches. One that matches none of them runs
+    # nothing a rule reads, and is read as written (`[ -f x ]`, `./run-*.sh`). So is one with no
+    # arguments: a `case` arm's pattern (`*)`, `[a-z]*)`) arrives as a segment of its own, and 120
+    # real commands of the 31 days to 2026-10-02 hold one; a program run bare does nothing any rule
+    # denies but read commands from stdin (parallel), which a pattern for it would be a long way to.
+    if [[ "${CW_WORDS[0]-}" == *[\*\?\[]* ]] && { [ "${#CW_WORDS[@]}" -gt 1 ] || [ "$cw_end" -lt "${#raw[@]}" ]; }; then
+      for v in $CW_RULE_PROGRAMS; do
+        # shellcheck disable=SC2053 # matching the pattern is the point
+        [[ "$v" == ${CW_WORDS[0]} ]] || continue
+        CW_CONTEXT="the program ${shown} is a pattern the shell fills in with a file's name; read as ${v}, this is denied"
+        cw_judge "$v" "${CW_WORDS[@]:1}"
+        CW_DONE=1
+      done
+      CW_CONTEXT="$saved"
+      return 0
+    fi
+    base_name "${tok[0]}"
+    if [ "$cw_end" -eq 1 ] && [ "${#CW_WORDS[@]}" -eq 1 ] && [ "${CW_WORDS[0]}" = "$BASE_NAME" ]; then return 0; fi
+    cw_judge ${CW_WORDS[@]+"${CW_WORDS[@]}"}
+    CW_DONE=1
+    return 0
+  fi
+  if [ -n "$CW_VAR" ]; then
+    cw_values "$CW_VAR"
+    for v in ${CWV_LIST[@]+"${CWV_LIST[@]}"}; do
+      CW_CONTEXT="${shown} is '${v}' in this command"
+      words_of "$v"
+      vals=(${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"})
+      cw_judge ${vals[@]+"${vals[@]}"}
+    done
+    CW_CONTEXT="$saved"
+    CW_DONE=1
+    [ "$CWV_UNKNOWN" -eq 1 ] || return 0
+  fi
+  # Inside one of the readings of cw_as_if, a second unreadable word is read as written.
+  [ "$CW_ASIF" -eq 0 ] || return 0
+  cw_as_if "$shown"
+  CW_DONE=1
+  return 0
+}
+
+# find runs the command after -exec, -execdir, -ok and -okdir (up to `;`, or a `+` right after `{}`)
+# once per file it finds, with the file's name where `{}` stands: that command is judged like one
+# xargs -I{} runs, `{}` being a value filled in later. Until 2026-10-02, `find . -exec gh pr merge
+# 5 --admin \;` reached no rule.
+check_find_exec() {
+  local k=1 n=${#tok[@]} start text
+  while [ "$k" -lt "$n" ]; do
+    unquoted "${raw[k]}"
+    case "$UNQUOTED" in
+      -exec | -execdir | -ok | -okdir)
+        start=$((k + 1))
+        text=""
+        for ((k = start; k < n; k++)); do
+          unquoted "${raw[k]}"
+          [ "$UNQUOTED" = ";" ] && break
+          [ "$UNQUOTED" = "+" ] && [ "$k" -gt "$start" ] && [ "${tok[k - 1]}" = "{}" ] && break
+          text+="${raw[k]} "
+        done
+        if [ -n "$text" ]; then
+          text="xargs -I{} ${text% }"
+          [ "$PARTIAL" -eq 1 ] && text=$'\t'"$text"
+          [ "$QUOTED" -eq 1 ] && text=$'\v'"$text"
+          check_segment "$text"
+        fi
+        ;;
+    esac
+    k=$((k + 1))
+  done
+  return 0
+}
+
+# GNU parallel (a wrapper, see prefix_end) runs its command once per input: the words after ::: (or
+# :::+), the lines of the files after :::: (or ::::+), or the lines it reads. The words after :::
+# are read as arguments appended to the command, which is what parallel does with one input and
+# what it does with each of several. With no command, the inputs ARE the commands
+# (parallel_commands); lines read from stdin or a file cannot be read, so that is denied. CW_DONE is
+# 1 when the segment was judged here.
+# Each command parallel runs is a process of its own: a cd in one (`parallel 'cd {} && …' ::: <dir>`)
+# moves its own git commands (parallel_job) and nothing after it, so the ones judging it records are
+# dropped (seg_cds_keep). Until 2026-10-03 they stood at the place of the parallel and moved the git
+# commands after it (found verifying #299: a lease push to the agent's own branch denied as one
+# toward develop).
+parallel_inputs() {
+  local k n=${#raw[@]} sep=0 groups=0 plain=1 w repl="$PFX_REPL" ncds=${#SEG_CDS[@]}
+  local -a rest=() cmd=() inputs=() each=()
+  CW_DONE=0
+  unquoted "${raw[0]}"
+  case "$UNQUOTED" in
+    ::: | :::+)
+      parallel_commands
+      seg_cds_keep "$ncds"
+      CW_DONE=1
+      return 0
+      ;;
+    :::: | ::::+) deny_parallel_input ;;
+  esac
+  for ((k = 1; k < n; k++)); do
+    unquoted "${raw[k]}"
+    case "$UNQUOTED" in
+      ::: | :::+ | :::: | ::::+)
+        sep=1
+        groups=$((groups + 1))
+        [ "$UNQUOTED" = ::: ] || plain=0
+        ;;
+      *)
+        rest+=("${raw[k]}")
+        if [ "$sep" -eq 0 ]; then cmd+=("${raw[k]}"); else inputs+=("${raw[k]}"); fi
+        ;;
+    esac
+  done
+  [ "$sep" -eq 1 ] || return 0
+  # With its replace string in the command (`parallel gh api -X DELETE {} ::: <endpoint>`), parallel
+  # puts each input there and appends nothing: each command it runs is judged, when the inputs are
+  # one group of plain words, at most 16 (found 2026-10-03, verifying this change: read as appended
+  # to the command, the endpoint written after ::: was not the endpoint).
+  if [ -n "$PFX_REPL" ] && [ "$groups" -eq 1 ] && [ "$plain" -eq 1 ] && [ "${#inputs[@]}" -gt 0 ] && [ "${#inputs[@]}" -le 16 ] \
+    && [[ " ${raw[0]} ${cmd[*]-} " == *"$PFX_REPL"* ]]; then
+    for w in "${inputs[@]}"; do
+      case "$w" in *[\'\"\\\$\`]*) plain=0 ;; esac
+    done
+  else
+    plain=0
+  fi
+  if [ "$plain" -eq 1 ]; then
+    cmd=("${raw[0]}" ${cmd[@]+"${cmd[@]}"})
+    for w in "${inputs[@]}"; do
+      each=()
+      for k in "${cmd[@]}"; do each+=("${k//"$repl"/$w}"); done
+      raw=("${each[@]}")
+      cw_end=${#raw[@]}
+      cw_judge "${each[@]}"
+      parallel_job "${each[@]}"
+      seg_cds_keep "$ncds"
+    done
+    CW_DONE=1
+    return 0
+  fi
+  raw=("${raw[0]}" ${rest[@]+"${rest[@]}"})
+  cw_end=1
+  cw_judge "${raw[0]}"
+  seg_cds_keep "$ncds"
+  CW_DONE=1
+  return 0
+}
+# seg_cds_keep <n>: SEG_CDS back to its first n directory changes.
+seg_cds_keep() {
+  SEG_CDS=(${SEG_CDS[@]+"${SEG_CDS[@]:0:$1}"})
+  return 0
+}
+# parallel_job <word>...: one command parallel runs, with its input in place, judged as the shell
+# parallel hands it to reads it when it holds several (`'cd {} && git push …'`): one by one, a cd
+# in one counting for the git commands after it in the job, and for nothing after the job (the
+# caller drops it). The job split at the operators that stand as words of their own.
+parallel_job() {
+  local w part="" text="$*"
+  local -a toks=()
+  case "$text" in
+    \'*\' | \"*\") text="${text:1:${#text}-2}" ;;
+  esac
+  [[ "$text" == *'&&'* || "$text" == *'||'* || "$text" == *';'* || "$text" == *'|'* ]] || return 0
+  words_of "$text"
+  toks=(${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"})
+  for w in ${toks[@]+"${toks[@]}"}; do
+    case "$w" in
+      '&&' | '||' | ';' | '|')
+        parallel_job_part "$part"
+        part=""
+        ;;
+      *';')
+        parallel_job_part "$part ${w%;}"
+        part=""
+        ;;
+      *) part+=" $w" ;;
+    esac
+  done
+  parallel_job_part "$part"
+}
+parallel_job_part() {
+  local part="${1# }"
+  [ -n "$part" ] || return 0
+  # Each part is judged as a segment of its own, so the judge's time limit holds here too (#302: a
+  # job of 5000 parts took 6 s).
+  check_deadline
+  [ "$QUOTED" -eq 1 ] && part=$'\v'"$part"
+  CW_DEPTH=$((CW_DEPTH + 1))
+  check_segment "$part"
+  CW_DEPTH=$((CW_DEPTH - 1))
+  return 0
+}
+
+# parallel with no command, its inputs after ::: in raw: each input is a command, as the shell
+# reads the word (`parallel ::: 'gh pr merge 5 --admin'`, `parallel ::: git\ push\ …`), and with
+# several groups of inputs parallel joins one word of each into the command, so all of them
+# together are judged as one too.
+parallel_commands() {
+  local w groups=0
+  local -a words=()
+  egress_words "${raw[*]}"
+  for w in ${EGRESS_WORDS[@]+"${EGRESS_WORDS[@]}"}; do
+    w="${w//$'\x1e'/}"
+    w="${w//$'\x1f'/\$}"
+    case "$w" in
+      ::: | :::+)
+        groups=$((groups + 1))
+        continue
+        ;;
+      :::: | ::::+) deny_parallel_input ;;
+    esac
+    words+=("$w")
+  done
+  for w in ${words[@]+"${words[@]}"}; do check_segment "$w"; done
+  [ "$groups" -le 1 ] || check_segment "${words[*]}"
+  return 0
+}
+
+# Is parallel asked about itself (--version, --help, --citation…), so it runs nothing? Reads tok.
+parallel_info_only() {
+  local w
+  for w in "${tok[@]}"; do
+    case "$w" in
+      --version | -V | --help | -h | --citation | --bibtex | --number-of-* | --minversion* | --max-line-length-allowed | --record-env | --embed) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+deny_parallel_input() {
+  deny "parallel with no command runs the lines it reads (from stdin, or from the files after ::::) as commands, which the guard cannot read" \
+    "write the command after parallel's options (parallel <command> ::: <inputs>), or run the commands one by one"
+}
+
+SEG_XARGS=0
+SEG_REPL=""
 check_segment() {
-  local seg="$1" PARTIAL=0
-  local -a raw=() tok=()
-  local t acc
+  local seg="$1" PARTIAL=0 QUOTED=0 cw_end=1
+  local -a raw=() tok=() pre_raw=()
+  local t
+  # The text of a quoted span (see splitSegments): marked with a leading vertical tab.
+  case "$seg" in
+    $'\v'*)
+      QUOTED=1
+      seg="${seg:1}"
+      ;;
+  esac
   # Half a command, cut at a substitution (see splitSegments): marked with a leading TAB.
   case "$seg" in
     $'\t'*)
       PARTIAL=1
-      seg="${seg#$'\t'}"
+      seg="${seg:1}"
       ;;
   esac
 
   # Simple whitespace tokenization: quotes are NOT interpreted (tripwire); they
   # are only stripped from the ends of each token.
-  read -r -a raw <<<"$seg" || true
+  words_of "$seg"
+  raw=(${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"})
   if [ "${#raw[@]}" -eq 0 ]; then return 0; fi
+  # One quote off each end, tested first: `${t#\"}` and `${t%\"}` take time quadratic in the length of
+  # the word, even when there is nothing to take off (a word of 400 KB took seconds).
   for t in "${raw[@]}"; do
-    t="${t#\"}"
-    t="${t%\"}"
-    t="${t#\'}"
-    t="${t%\'}"
+    [[ "$t" == \"* ]] && t="${t:1}"
+    [[ "$t" == *\" ]] && t="${t:0:${#t}-1}"
+    [[ "$t" == \'* ]] && t="${t:1}"
+    [[ "$t" == *\' ]] && t="${t:0:${#t}-1}"
     tok+=("$t")
   done
 
   # A previous segment's git options must not leak into this one.
   GIT_GLOBALS=()
 
-  # Skip inert prefixes: env assignments, wrappers and shell keywords (do/then/…
-  # appear as segment heads when loops/conditionals are split by ';'). A group `{ … }`, a
-  # negation `!` and `coproc` too: until 2026-09-30 `{ git push origin main; }` and
-  # `! git push origin main` made `{` / `!` the command word, which no rule looked at.
-  local start=0
-  while [ "$start" -lt "${#tok[@]}" ]; do
-    t="${tok[start]}"
-    if [[ "$t" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-      # A quoted value with blanks spans several tokens: all of them are the assignment. Taking
-      # the second half for the command word made `X="a b" git push origin main` a command
-      # named `b"`, which no rule looked at (found 2026-09-30).
-      acc="${raw[start]}"
-      start=$((start + 1))
-      while quote_open "$acc" && [ "$start" -lt "${#tok[@]}" ]; do
-        acc+=" ${raw[start]}"
-        start=$((start + 1))
-      done
-      continue
-    fi
-    case "$t" in
-      env)
-        # env's own options come before the command it runs, and two of them take a
-        # value in the next token. Stopping at the first option made `env -C <dir>
-        # git push ...` a segment whose command was "-C": no rule looked at it.
-        start=$((start + 1))
-        while [ "$start" -lt "${#tok[@]}" ]; do
-          case "${tok[start]}" in
-            -u | -C | --unset | --chdir) start=$((start + 2)) ;;
-            -*) start=$((start + 1)) ;;
-            *) break ;;
-          esac
-        done
-        continue
-        ;;
-      sudo | command | exec | nohup | time | do | then | else | elif | if | while | until | '{' | '!' | coproc)
-        start=$((start + 1))
-        continue
+  # Skip what is not the command word: assignments, shell keywords (do/then/… appear as segment
+  # heads when loops and conditionals are split by ';'), a group `{ … }`, a negation `!`, `coproc`
+  # and the wrappers with their options (see prefix_end).
+  PFX_W=("${tok[@]}")
+  PFX_RAW=("${raw[@]}")
+  prefix_end
+  SEG_XARGS=$PFX_XARGS
+  SEG_REPL=$PFX_REPL
+  # Before the command word is cut out: an assignment can be the whole segment.
+  check_ci_identity_prefix
+  if [ "$PFX_END" -ge "${#tok[@]}" ]; then
+    [ "$PFX_PARALLEL" -eq 1 ] && [ "$QUOTED" -eq 0 ] && ! parallel_info_only && deny_parallel_input
+    return 0
+  fi
+  pre_raw=("${raw[@]:0:PFX_END}")
+  tok=("${tok[@]:PFX_END}")
+  raw=("${raw[@]:PFX_END}")
+
+  # The command word as the shell reads it, and parallel's inputs (see cw_read and
+  # parallel_inputs), on a segment that is certainly a command: not on a quoted span, which may be
+  # data (see splitSegments).
+  # Past CW_DEPTH_MAX readings, behind eval (`eval eval eval \\\\\\\\git …`: each eval takes one
+  # layer of backslashes off), a command word that still holds what the shell reads again is not
+  # read as written, which would be a way around every rule: it is denied.
+  if [ "$QUOTED" -eq 0 ] && [ "$CW_DEPTH" -ge "$CW_DEPTH_MAX" ] && [[ " ${pre_raw[*]-} " == *" eval "* ]]; then
+    case "${raw[0]}" in
+      *[\\\'\"\$\`\{]*)
+        deny "the command word '${raw[0]}' is read through more layers of quoting or expansion than the guard follows (${CW_DEPTH_MAX})" \
+          "write the program's name plainly, once"
         ;;
     esac
-    break
-  done
-  if [ "$start" -ge "${#tok[@]}" ]; then return 0; fi
-  tok=("${tok[@]:start}")
+  fi
+  if [ "$QUOTED" -eq 0 ] && [ "$CW_DEPTH" -lt "$CW_DEPTH_MAX" ]; then
+    if [ "$PFX_PARALLEL" -eq 1 ]; then
+      parallel_inputs
+      [ "$CW_DONE" -eq 0 ] || return 0
+    fi
+    case "${raw[0]}" in
+      *[\\\'\"\$\`\{\*\?\[]*)
+        cw_read
+        [ "$CW_DONE" -eq 0 ] || return 0
+        ;;
+    esac
+  fi
 
   local cmd0="${tok[0]}"
-  cmd0="${cmd0##*/}" # in case it is invoked with an absolute path (/usr/bin/curl)
+  base_name "$cmd0" # in case it is invoked with an absolute path (/usr/bin/curl)
+  cmd0="$BASE_NAME"
+
+  # Where the next git command runs (see command_git_dir): every directory change, in order, as
+  # "<position>\t<scopes>\t<cd|pushd|popd>\t<target>" (see SEG_POS_O). One in a quoted span that may
+  # be data (`echo "cd /tmp"`) stands in that span's own scope, so it moves only what the span holds.
+  case "$cmd0" in
+    cd | pushd)
+      local target="" k
+      for ((k = 1; k < ${#tok[@]}; k++)); do
+        case "${tok[k]}" in
+          --) target="${tok[k + 1]-}"; break ;;
+          -L | -P | -e | -@) ;;
+          *) target="${tok[k]}"; break ;;
+        esac
+      done
+      # `cd` alone goes home (`pushd` alone swaps the top two of the stack: not followed); a
+      # target that is cut (half a command) cannot be followed.
+      if [ "$k" -ge "${#tok[@]}" ]; then
+        target="~"
+        [ "$cmd0" = pushd ] && target=""
+      fi
+      [ "$PARTIAL" -eq 1 ] && target=""
+      SEG_CDS+=("${SEG_POS_O}"$'\t'"${SEG_POS_P}"$'\t'"${cmd0}"$'\t'"${target}")
+      ;;
+    popd)
+      # `popd +N`, `popd -n`… do not return to the top of the stack: not followed.
+      if [ "${#tok[@]}" -gt 1 ]; then
+        SEG_CDS+=("${SEG_POS_O}"$'\t'"${SEG_POS_P}"$'\tcd\t')
+      else
+        SEG_CDS+=("${SEG_POS_O}"$'\t'"${SEG_POS_P}"$'\tpopd\t')
+      fi
+      ;;
+  esac
 
   # Redirections into a generated tree: apply to any command.
   check_generated_redirect "$seg"
@@ -1657,6 +5086,11 @@ check_segment() {
     git) check_git ;;
     gh) check_gh ;;
     curl | wget) check_egress ;;
+    find) check_find_exec ;;
+    pr-merge.sh | pr_merge.py | source | . | bash | sh | dash | zsh | ksh | ash | mksh | python | python[0-9]*)
+      check_mwg_merge
+      ;;
+    export | declare | typeset | readonly | local | let | printf | read) check_ci_identity_builtin ;;
   esac
 
   case "$cmd0" in
@@ -1670,6 +5104,34 @@ check_segment() {
   esac
 
   return 0
+}
+
+# judge_segments <the extractor's output>: each segment judged in turn. A position line ("\x01<o>
+# <p>", see "Where each segment stands" in EXTRACT_JS) sets where the segments after it stand. Only
+# this loop reads them, and only in their exact shape: a segment never starts with the mark (the
+# extractor puts a blank in front of one that does), and check_segment, which also judges what a
+# segment runs later (a `gh alias set` expansion, parallel's inputs, a command word read again), never
+# reads one, so no text inside a command can stand for one (found 2026-10-03, verifying this change).
+SEG_POS_RE='^([0-9]+(\.[0-9]+)*|!)\ (/[0-9.qhvc/]*)$'
+judge_segments() {
+  local line
+  local -a lines=()
+  if [ "$1" = "${SEGMENTS:-}" ]; then
+    segment_lines
+    lines=(${SEGMENT_LINES[@]+"${SEGMENT_LINES[@]}"})
+  else
+    lines_of "$1"
+    lines=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
+  fi
+  for line in ${lines[@]+"${lines[@]}"}; do
+    check_deadline
+    if [[ "$line" == $'\x01'* ]] && [[ "${line#$'\x01'}" =~ $SEG_POS_RE ]]; then
+      SEG_POS_O="${BASH_REMATCH[1]}"
+      SEG_POS_P="${BASH_REMATCH[3]}"
+      continue
+    fi
+    check_segment "$line"
+  done
 }
 
 # --- Command extraction from the harness JSON -------------------------------
@@ -1733,7 +5195,7 @@ const CONTAINERS = new Set(["docker", "podman", "nerdctl", "kubectl", "lxc", "in
 const RESERVED = new Set(["!", "if", "then", "else", "elif", "do", "while", "until", "{", "coproc", "time", "--"]);
 // Flags that TAKE A VALUE, per wrapper: the value is not the command word.
 const VALUE_FLAGS = {
-  sudo: new Set(["-u", "-g", "-h", "-p", "-C", "-U", "-r", "-t", "-T", "-D", "-R"]),
+  sudo: new Set(["-u", "-g", "-h", "-p", "-a", "-c", "-C", "-U", "-r", "-t", "-T", "-D", "-R"]),
   doas: new Set(["-u", "-C"]),
   runuser: new Set(["-u", "-g", "-G", "-c", "-s", "--shell", "--user", "--group", "--command"]),
   su: new Set(["-c", "-s", "-g", "-G", "--command", "--shell", "--group", "--supp-group"]),
@@ -2087,14 +5549,29 @@ function outputSubstitutions(stage) {
   return inner;
 }
 
-// Does text produced at position `at` of the line (a heredoc body) reach a shell as commands?
-function feedsAShell(line, at, depth) {
+// Does text produced at position `at` of the line (a heredoc body) reach a shell as commands, and
+// which one? null: it does not. "here": the stage that owns it is `.`/`source` reading stdin, alone
+// in its pipeline, so the body runs in this very shell and a cd in it stays (see analyzableTexts).
+// "frame": it reaches one through the output of the substitution around it (`eval "$(cat <<EOF…)"`),
+// whose consumer decides. "shell": a shell of its own (`bash <<EOF`, `cat <<EOF | sh`, `ssh host`).
+function heredocFeed(line, at) {
   const { stages, idx, frame } = pipelineAround(line, at);
   for (let k = idx; k < stages.length; k++) {
-    if (wordsFeedShell(tokenize(stages[k]), 0)) return true;
-    for (const inner of outputSubstitutions(stages[k])) if (anyFeedsShell(inner, 1)) return true;
+    const words = tokenize(stages[k]);
+    if (wordsFeedShell(words, 0)) return stages.length === 1 && runsHere(words) ? "here" : "shell";
+    for (const inner of outputSubstitutions(stages[k])) if (anyFeedsShell(inner, 1)) return "shell";
   }
-  return frame ? outputFeedsShell(line, frame, depth) : false;
+  return frame && outputFeedsShell(line, frame, 0) ? "frame" : null;
+}
+
+// Does this simple command run its script in the shell that reads it, not in a process of its own:
+// eval, `.` and source, also behind `command` or `builtin`?
+function runsHere(words) {
+  let i = 0;
+  while (i < words.length && ((RESERVED.has(words[i].text) && !words[i].quoted) || (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i].text) && !words[i].qstart))) i++;
+  while (i < words.length && !words[i].quoted && (words[i].text === "command" || words[i].text === "builtin")) i++;
+  const w = words[i];
+  return !!w && !w.hasExpansion && (w.text === "eval" || w.text === "." || w.text === "source");
 }
 
 // Does the OUTPUT of a frame reach a shell as commands? For `$(`/backticks the enclosing command
@@ -2127,11 +5604,63 @@ function consumesScript(words) {
   return name === "eval" || name === "." || name === "source" || SHELLS.has(name);
 }
 
-// Returns the text with every heredoc body removed, plus the bodies that feed a shell.
+// Is the quoted word that starts after `head` (the words of its command written before it) a
+// script the shell runs, rather than an argument that may be data? It is when it is the -c string
+// of a shell (`bash -c '…'`, `sudo -u x sh -lc "…"`, `xargs -I{} sh -c '…'`, `find … -exec sh -c
+// '…'`), the first word of eval, the command an ssh destination runs (`ssh host '…'`), or su's or
+// runuser's -c. A shell named by an expansion counts as one (`"$SHELL" -c '…'`). It says which:
+// "eval" (the script runs in this shell, so a cd in it stays), "shell" (in a process of its own), or
+// false.
+// Called for every quoted span, so it reads a bounded part of the head and the extractor stays
+// linear: the -c and its shell are in the head's last SCRIPT_HEAD characters, and eval, ssh, su and
+// the wrappers in front of them are a head no longer than that.
+const SCRIPT_HEAD = 1024;
+function scriptSpan(head) {
+  const short = head.length <= SCRIPT_HEAD;
+  const words = tokenize(short ? head : head.slice(-SCRIPT_HEAD));
+  if (!words.length) return false;
+  let c = words.length - 1;
+  if (c > 0 && words[c].text === "--" && !words[c].quoted) c--;                         // bash -c -- '…'
+  const last = words[c];
+  if (!last.quoted && /^-[A-Za-z]*c[A-Za-z]*$/.test(last.text)) {
+    let j = c - 1;
+    while (j >= 0) {
+      const t = words[j].text;
+      if (/^([-+][A-Za-z]+|--[A-Za-z][-A-Za-z]*)$/.test(t)) { j--; continue; }            // -l, +x, --norc
+      if (j >= 1 && /^[-+][A-Za-z]*[oO]$/.test(words[j - 1].text)) { j -= 2; continue; }   // -o pipefail
+      break;
+    }
+    const w = j >= 0 ? words[j] : null;
+    if (w && (SHELLS.has(basename(w.text)) || (w.hasExpansion && (w.text === "" || basename(w.text).startsWith("$"))))) return "shell";
+  }
+  if (!short) return false;
+  let i = 0;
+  while (i < words.length && ((RESERVED.has(words[i].text) && !words[i].quoted) || (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i].text) && !words[i].qstart))) i++;
+  let rest = words.slice(i);
+  for (let d = 0; d < 12 && rest.length; d++) {
+    const name = basename(rest[0].text);
+    if (name === "eval") return rest.length === 1 && "eval";
+    if (name === "ssh") return skipFlags("ssh", rest.slice(1)).length === 1 && "shell";
+    if (name === "su" || name === "runuser") return (last.text === "-c" || last.text === "--command") && "shell";
+    if (name === "sudo" || name === "doas" || WRAPPERS.has(name)) {
+      let r = skipFlags(name, rest.slice(1));
+      if (name === "env") { while (r.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(r[0].text) && !r[0].qstart) r = r.slice(1); }
+      if (name === "timeout" || name === "chroot" || name === "flock") r = r.slice(1);
+      rest = r;
+      continue;
+    }
+    break;
+  }
+  return false;
+}
+
+// Returns the text with every heredoc body removed, plus the bodies that feed a shell, and where
+// each operator whose body was removed stands in the text returned (see shellScopes).
 function splitHeredocs(src) {
   const opRe = /(?<!<)<<(?!<)-?\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1/;
   let out = "";
   const bodies = [];
+  const handled = [];   // where, in `out`, each operator whose body was taken out stands
   let rest = src;
   for (;;) {
     const m = opRe.exec(rest);
@@ -2145,6 +5674,8 @@ function splitHeredocs(src) {
     if (eol === -1) { out += rest; break; }
     let line = rest.slice(lineStart, eol).replace(/\\\n/g, " ");
     const at = m.index - lineStart - (rest.slice(lineStart, m.index).match(/\\\n/g) || []).length;
+    const opAt = out.length + m.index;   // where the operator stands in `out` (see analyzableTexts)
+    handled.push(opAt);
     out += rest.slice(0, eol + 1);
     const tail = rest.slice(eol + 1);
     const endRe = new RegExp("^\\t*" + m[2] + "[ \\t]*\\r?$", "m");
@@ -2162,27 +5693,479 @@ function splitHeredocs(src) {
     } else if (openAtEnd(line)) {
       forced = true;
     }
-    const shellFed = forced || feedsAShell(line, at, 0);
+    const how = forced ? "shell" : heredocFeed(line, at);
+    const shellFed = how !== null;
     if (!em) {
       // Unterminated heredoc: the rest is its body. Dropped (conservative) unless it feeds a
       // shell — then it is code that WILL run, and it is analyzed.
-      if (shellFed) bodies.push(tail);
+      if (shellFed) bodies.push({ text: tail, at: opAt, how });
       break;
     }
-    if (shellFed) bodies.push(tail.slice(0, em.index));
+    if (shellFed) bodies.push({ text: tail.slice(0, em.index), at: opAt, how });
     rest = tail.slice(em.index + em[0].length);
   }
-  return { out, bodies };
+  return { out, bodies, handled };
 }
+
+// --- Where each segment stands ------------------------------------------------------------------
+// The directory a git command runs in is the session's, moved by every cd/pushd/popd before it
+// (command_git_dir in the shell). A cd inside a subshell holds only there: in
+// `(cd ../other && git pull); git push --force-with-lease` the push runs where the session stands,
+// and in `x=$(cd ../other && pwd)` the cd never leaves the substitution. The segments arrive as a
+// flat list, so until 2026-10-03 every cd counted for every later command, and a cd in a closed
+// subshell moved the push after it, both ways: a lease to develop passed, and one to the agent's own
+// branch was denied. Neither the order of the segments nor their text says which subshell a cd was
+// in, so each segment is sent with its position, on a line of its own before it (only when it
+// changes): "\x01<o> <p>". The segments go out in the order of their positions, so a cd reaches the
+// shell before every command it stands in front of (an eval's script is read after the words
+// around it, and a heredoc body after the whole text that holds it).
+//   - <p>: the scopes around it, outermost first, as "/<id>/<id>/…/": the subshells `( … )`,
+//     `$( … )`, backticks, `<( … )` and `>( … )` as the shell reads them (shellScopes); not
+//     `{ … }`, which runs in this shell. A script span (`bash -c '…'`, ssh's) and a heredoc body fed
+//     to a shell (`bash <<EOF`) run in a process of their own: a scope of their own ("q", "h") inside
+//     the ones around them. eval's script and a heredoc read by `.`/`source` run in this shell: no
+//     scope of their own, so their cd stays, as it does. A quoted span that may be data
+//     (`echo "cd x && git push"`, a --body) is a scope of its own too ("v"): its cd moves what it
+//     holds and nothing outside it. So is a comment ("c"), which the shell does not run.
+//   - <o>: where it starts, as dot-separated offsets: one per heredoc level (a body's segments
+//     come after its operator's position in the text that holds it). The segments of a span or a
+//     substitution body share the span's or the body's position, in their own order.
+// A cd counts for a git command when its scope encloses the command's (or is the same) and it
+// stands before it. A pipeline stage, `&` and a subshell inside a `bash -c` script are not read as
+// scopes: a cd there counts as before.
+// A text whose scopes cannot be read (nested past SCOPE_DEPTH_MAX) is sent with "\x01! /" in front
+// and no other position: the shell then denies a git command whose directory a cd may have moved.
+
+// The scopes of a text, as the shell reads them: { frames: [{ kind, s, e, cmd }], comments: [[a,
+// b]] }. A frame is a subshell: kind "(", "$(", "`", "<(" or ">(", s where it opens, e where it closes
+// (the text's end when it does not), cmd where the simple command that holds it starts; in the
+// order they open (an outer one before the ones inside it). A comment runs from its `#` to the end
+// of its line. lex (above) reads `(` and `)` wherever it meets them, which serves the rules it
+// feeds, but not this: a comment (`# (`), the `)` that ends a case pattern, `${x:-(}`, `$(( … ))`,
+// `(( … ))`, `a=( … )`, `@( … )` and `[[ ( … ) ]]` are not subshells, and read as ones they moved a
+// cd in or out of the subshell around it (found 2026-10-03, verifying this change: a lease to
+// develop passed). A heredoc whose body is still in the text (splitHeredocs did not take it out: a
+// delimiter like 'E-F' or \EOF) is data up to its terminator line: a comment, for this purpose, and
+// a `)` in it closes nothing. handled: the positions of the operators whose body splitHeredocs took
+// out. Throws past SCOPE_DEPTH_MAX levels of nesting, or past SCOPE_STEPS_MAX steps (see scopesOf).
+const SCOPE_DEPTH_MAX = 400;
+let SCOPE_STEPS = 0;
+let SCOPE_STEPS_MAX = Infinity;
+const CMD_KEYWORDS = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "time", "coproc"]);
+function shellScopes(text, depth0 = 0, handled = []) {
+  const n = text.length;
+  const frames = [];
+  const comments = [];
+  let depth = depth0;
+  let curCmd = 0;
+  const done = new Set(handled);
+  let pending = [];   // heredocs whose body starts at the next newline: [{ delim, strip }]
+  // Where an arithmetic reading (`$((`, `((`) was tried and did not close with `))`: read again from
+  // there, it is a subshell at once. Without it each unclosed `$((` inside another was read twice,
+  // the inner ones twice per outer reading: 2^n readings for n levels (found 2026-10-03, verifying
+  // #299: 34 levels, some 140 bytes, ran past the hook's timeout, and a hook that times out lets
+  // the command run).
+  const arithFailed = new Set();
+  const step = () => { if (++SCOPE_STEPS > SCOPE_STEPS_MAX) throw new Error("scopes too costly to read"); };
+  // Past the newline at j: the bodies of the heredocs pending, each up to its terminator line (the
+  // delimiter alone on its line, as bash reads it: tabs before it only with <<-), or to the end of
+  // the text.
+  const nl = (j) => {
+    j++;
+    for (const h of pending) {
+      const from = j;
+      const endRe = new RegExp("^" + (h.strip ? "\t*" : "") + h.delim.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$");
+      let found = false;
+      while (j < n && !found) {
+        step();
+        let e = text.indexOf("\n", j);
+        if (e === -1) e = n;
+        found = endRe.test(text.slice(j, e));
+        j = Math.min(n, e + 1);
+      }
+      comments.push([from, j]);
+    }
+    pending = [];
+    return j;
+  };
+  const isMeta = (c) => c === undefined || isSpace(c) || c === ";" || c === "&" || c === "|" || c === "(" || c === ")" || c === "<" || c === ">";
+  const enter = () => { step(); if (++depth > SCOPE_DEPTH_MAX) throw new Error("scopes nested too deep"); };
+  const sq = (i) => { const j = text.indexOf("'", i + 1); return j === -1 ? n : j + 1; };
+  const ansi = (i) => {
+    let j = i + 2;
+    while (j < n && text[j] !== "'") j += text[j] === "\\" ? 2 : 1;
+    return Math.min(n, j + 1);
+  };
+  const comment = (i) => {
+    let j = text.indexOf("\n", i);
+    if (j === -1) j = n;
+    comments.push([i, j]);
+    return j;
+  };
+  // Each reader takes the index of what it reads and returns the index past it.
+  function dq(i) {
+    enter();
+    let j = i + 1;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === "\\") { j += 2; continue; }
+      if (c === '"') { depth--; return j + 1; }
+      if (c === "$") { j = dollar(j, true); continue; }
+      if (c === "`") { j = tick(j); continue; }
+      j++;
+    }
+    depth--;
+    return n;
+  }
+  function dollar(i, inDq) {
+    const nx = text[i + 1];
+    if (nx === "(") {
+      if (text[i + 2] === "(" && !arithFailed.has(i + 3)) {
+        const mark = [frames.length, comments.length, pending.slice()];
+        const a = arith(i + 3);
+        if (a !== -1) return a;
+        arithFailed.add(i + 3);
+        frames.length = mark[0];
+        comments.length = mark[1];
+        pending = mark[2];
+      }
+      return sub("$(", i, i + 2);
+    }
+    if (nx === "{") return param(i + 2, inDq);
+    if (!inDq && nx === "'") return ansi(i);
+    if (!inDq && nx === '"') return dq(i + 1);
+    return i + 1;
+  }
+  function sub(kind, s, from) {
+    const f = { kind, s, e: n, cmd: curCmd };
+    frames.push(f);
+    const saved = curCmd;
+    const j = list(from, ")");
+    curCmd = saved;
+    f.e = j;
+    return j < n ? j + 1 : n;
+  }
+  // A backtick substitution ends at the first backtick no backslash escapes; what it holds is
+  // read on its own.
+  function tick(i) {
+    let j = i + 1;
+    while (j < n && text[j] !== "`") j += text[j] === "\\" ? 2 : 1;
+    const e = Math.min(j, n);
+    frames.push({ kind: "`", s: i, e, cmd: curCmd });
+    const inner = shellScopes(text.slice(i + 1, e), depth + 1, [...done].filter((h) => h > i && h < e).map((h) => h - i - 1));
+    for (const g of inner.frames) frames.push({ kind: g.kind, s: g.s + i + 1, e: g.e + i + 1, cmd: g.cmd + i + 1 });
+    for (const [a, b] of inner.comments) comments.push([a + i + 1, b + i + 1]);
+    return j < n ? j + 1 : n;
+  }
+  function param(i, inDq) {
+    enter();
+    let j = i;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === "\\") { j += 2; continue; }
+      if (c === "}") { depth--; return j + 1; }
+      if (c === "$") { j = dollar(j, inDq); continue; }
+      if (c === "`") { j = tick(j); continue; }
+      if (c === '"') { j = dq(j); continue; }
+      if (c === "'" && !inDq) { j = sq(j); continue; }
+      j++;
+    }
+    depth--;
+    return n;
+  }
+  // The inside of `$((` or `((`: past the `))` that closes it, or -1 when a `)` closes it alone
+  // (then it was `$( (` or `( (`).
+  function arith(i) {
+    enter();
+    let j = i, d = 0;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === "\\") { j += 2; continue; }
+      if (c === "(") { d++; j++; continue; }
+      if (c === ")") {
+        if (d > 0) { d--; j++; continue; }
+        depth--;
+        return text[j + 1] === ")" ? j + 2 : -1;
+      }
+      if (c === "$") { j = dollar(j, false); continue; }
+      if (c === "`") { j = tick(j); continue; }
+      if (c === '"') { j = dq(j); continue; }
+      if (c === "'") { j = sq(j); continue; }
+      j++;
+    }
+    depth--;
+    return -1;
+  }
+  // A pattern group `@( … )` and its kin, from its `(`.
+  function group(i) {
+    enter();
+    let j = i + 1, d = 1;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === "\\") { j += 2; continue; }
+      if (c === "(") { d++; j++; continue; }
+      if (c === ")") { if (--d === 0) { depth--; return j + 1; } j++; continue; }
+      if (c === "'") { j = sq(j); continue; }
+      if (c === '"') { j = dq(j); continue; }
+      if (c === "$") { j = dollar(j, false); continue; }
+      if (c === "`") { j = tick(j); continue; }
+      j++;
+    }
+    depth--;
+    return n;
+  }
+  // The values of an array assignment `a=( … )`, from its `(`.
+  function arrayList(i) {
+    enter();
+    let j = i + 1;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === "\n") { j = nl(j); continue; }
+      if (isSpace(c)) { j++; continue; }
+      if (c === "\\" && text[j + 1] === "\n") { j += 2; continue; }
+      if (c === ")") { depth--; return j + 1; }
+      if (c === "#") { j = comment(j); continue; }
+      const k = word(j);
+      j = k > j ? k : j + 1;
+    }
+    depth--;
+    return n;
+  }
+  function word(i) {
+    let j = i;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === "\\") { j += 2; continue; }
+      if (isMeta(c)) {
+        if (c === "(" && j > i) {
+          if ("@!?*+".includes(text[j - 1])) { j = group(j); continue; }
+          if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=$/.test(text.slice(i, j))) { j = arrayList(j); continue; }
+        }
+        break;
+      }
+      if (c === "'") { j = sq(j); continue; }
+      if (c === '"') { j = dq(j); continue; }
+      if (c === "$") { j = dollar(j, false); continue; }
+      if (c === "`") { j = tick(j); continue; }
+      j++;
+    }
+    return Math.min(j, n);
+  }
+  function blanks(j, newlines) {
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (newlines && c === "\n") { j = nl(j); continue; }
+      if (c === " " || c === "\t" || c === "\r") { j++; continue; }
+      if (c === "\\" && text[j + 1] === "\n") { j += 2; continue; }
+      if (newlines && c === "#") { j = comment(j); continue; }
+      break;
+    }
+    return j;
+  }
+  // `case <word> in <pattern>) <commands> ;; … esac`, from past `case`. A `)` that does not belong
+  // to it (a frame around the case closes there) is left for the caller.
+  function caseStmt(i) {
+    enter();
+    let j = blanks(i, true);
+    const k = word(j);
+    j = blanks(k > j ? k : j + 1, true);
+    if (/^in(?=[\s;&|()<>]|$)/.test(text.slice(j, j + 3))) j += 2;
+    while (j < n) {
+      step();
+      j = blanks(j, true);
+      if (j >= n) break;
+      if (/^esac(?=[\s;&|()<>]|$)/.test(text.slice(j, j + 5))) { depth--; return j + 4; }
+      if (text[j] === ")") { depth--; return j; }
+      if (text[j] === "(") j++;
+      while (j < n) {
+        step();
+        j = blanks(j, false);
+        const c = text[j];
+        if (c === ")") { j++; break; }
+        if (c === "\n") { j = nl(j); continue; }
+        if (c === "|") { j++; continue; }
+        const w = word(j);
+        j = w > j ? w : j + 1;
+      }
+      const t = list(j, "case");
+      if (t >= n) break;
+      if (text[t] === ";") { j = t + (text[t + 1] === ";" && text[t + 2] === "&" ? 3 : 2); continue; }
+      depth--;
+      return text[t] === ")" ? t : t + 4;
+    }
+    depth--;
+    return n;
+  }
+  // `[[ … ]]`, from past `[[`: its parentheses group, they are no subshell.
+  function dbracket(i) {
+    enter();
+    let j = i;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === "\n") { j = nl(j); continue; }
+      if (isSpace(c)) { j++; continue; }
+      if (c === "\\" && text[j + 1] === "\n") { j += 2; continue; }
+      if (c === "]" && text[j + 1] === "]" && isMeta(text[j + 2])) { depth--; return j + 2; }
+      if ("()<>&|!;".includes(c)) { j++; continue; }
+      const k = word(j);
+      j = k > j ? k : j + 1;
+    }
+    depth--;
+    return n;
+  }
+  // A list of commands, up to the `)` that closes its frame (end ")"), up to `;;`, `;&`, `;;&` or
+  // `esac` (end "case"), or to the end of the text: returns where it stops.
+  function list(i, end) {
+    enter();
+    let j = i, cmdPos = true;
+    while (j < n) {
+      step();
+      const c = text[j];
+      if (c === " " || c === "\t" || c === "\r") { j++; continue; }
+      if (c === "\\" && text[j + 1] === "\n") { j += 2; continue; }
+      if (c === "\n") { j = nl(j); cmdPos = true; continue; }
+      if (c === "#") { j = comment(j); continue; }
+      if (c === ")") {
+        if (end) { depth--; return j; }
+        j++;
+        continue;
+      }
+      if (c === ";") {
+        if (text[j + 1] === ";" || text[j + 1] === "&") {
+          if (end === "case") { depth--; return j; }
+          j += text[j + 1] === ";" && text[j + 2] === "&" ? 3 : 2;
+        } else j++;
+        cmdPos = true;
+        continue;
+      }
+      if (c === "&" || c === "|") {
+        if (c === "&" && text[j + 1] === ">") { j = word(blanks(j + (text[j + 2] === ">" ? 3 : 2), false)); continue; }
+        j += text[j + 1] === c || (c === "|" && text[j + 1] === "&") ? 2 : 1;
+        cmdPos = true;
+        continue;
+      }
+      if (c === "<" || c === ">") {
+        if (text[j + 1] === "(") { j = sub(c + "(", j, j + 2); continue; }
+        if (c === "<" && text[j + 1] === "<" && text[j + 2] !== "<") {
+          // A heredoc: its delimiter, quotes and backslashes taken out; its body comes after the
+          // next newline, unless splitHeredocs already took it out.
+          const strip = text[j + 2] === "-";
+          const k = blanks(j + (strip ? 3 : 2), false);
+          const w = word(k);
+          if (!done.has(j) && w > k) pending.push({ strip, delim: text.slice(k, w).replace(/\\(.)/g, "$1").replace(/['"]/g, "") });
+          j = w;
+          continue;
+        }
+        let k = j + 1;
+        while (k < n && "<>&|-".includes(text[k])) k++;
+        j = word(blanks(k, false));
+        continue;
+      }
+      if (c === "(") {
+        if (cmdPos && text[j + 1] === "(" && !arithFailed.has(j + 2)) {
+          const mark = [frames.length, comments.length, pending.slice()];
+          const a = arith(j + 2);
+          if (a !== -1) { j = a; cmdPos = false; continue; }
+          arithFailed.add(j + 2);
+          frames.length = mark[0];
+          comments.length = mark[1];
+          pending = mark[2];
+        }
+        if (!cmdPos) {
+          const k = blanks(j + 1, false);
+          if (text[k] === ")") { j = k + 1; cmdPos = true; continue; }   // `name ()`: a function
+        }
+        curCmd = j;
+        j = sub("(", j, j + 1);
+        cmdPos = false;
+        continue;
+      }
+      if (cmdPos) curCmd = j;
+      const k = word(j);
+      if (k === j) { j++; continue; }
+      const w = text.slice(j, k);
+      j = k;
+      if (/^[0-9]+$/.test(w) && (text[k] === "<" || text[k] === ">")) continue;   // 2>&1
+      if (cmdPos) {
+        if (w === "case") { j = caseStmt(k); cmdPos = false; continue; }
+        if (w === "[[") { j = dbracket(k); cmdPos = false; continue; }
+        if (end === "case" && w === "esac") { depth--; return k - 4; }
+        if (CMD_KEYWORDS.has(w)) continue;
+        if (/^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/.test(w)) continue;
+      }
+      cmdPos = false;
+    }
+    depth--;
+    return n;
+  }
+  list(0, null);
+  return { frames, comments };
+}
+// shellScopes, or null when the text is nested past what it reads or costs more to read than
+// SCOPE_STEPS_MAX steps: 64 per character, where a real command takes fewer than 2 (measured over
+// the 86,105 real commands of the 31 days to 2026-10-03: 1.53 at most, on a text of 20 characters or
+// more), so a reading that has gone pathological stops in a fraction of a second, and its text is
+// unreadable like one nested too deep.
+function scopesOf(text, handled = []) {
+  SCOPE_STEPS = 0;
+  SCOPE_STEPS_MAX = 64 * text.length + 100000;
+  try {
+    return shellScopes(text, 0, handled);
+  } catch (e) {
+    return null;
+  }
+}
+// The context { o, p } of position o of a text that stands at base ({ o, p } of the text itself),
+// with extra appended to the scopes. sc: the text's shellScopes.
+function ctxAt(sc, base, o, extra = "") {
+  let p = base.p;
+  for (const f of sc.frames) if (f.s < o && o < f.e) p += base.o + f.s + "/";
+  for (const [a, b] of sc.comments) if (a <= o && o < b) { p += "c" + base.o + a + "/"; break; }
+  return { o: base.o + o, p: p + extra };
+}
+// The innermost frame of sc around position o, or null.
+function frameAround(sc, o) {
+  let in_ = null;
+  for (const f of sc.frames) if (f.s < o && o < f.e && (!in_ || f.s > in_.s)) in_ = f;
+  return in_;
+}
+let SCOPES_UNREADABLE = false;
+const NO_SCOPES = { frames: [], comments: [] };
 
 // Every text the rules must see: the command with heredoc bodies removed, then each body that
 // feeds a shell, recursively (depth-capped: a pathological nesting must not hang the hook —
 // and past the cap the body is emitted WHOLE rather than dropped, so depth is never a bypass).
-function analyzableTexts(src, depth) {
-  if (depth >= 64) return [src];
-  const { out, bodies } = splitHeredocs(src);
-  const texts = [out];
-  for (const b of bodies) for (const t of analyzableTexts(b, depth + 1)) texts.push(t);
+// Each one as { text, p, o }: where it stands (see "Where each segment stands" above). A body fed
+// to a shell (`bash <<EOF`) runs in it: a scope of its own, inside the frames around its operator.
+// One `.`/`source` reads runs in this shell, and so does one whose substitution eval, `.` or source
+// reads (`eval "$(cat <<EOF…)"`): in the scope of that command.
+function analyzableTexts(src, depth, base = { p: "/", o: "" }) {
+  if (depth >= 64) return [{ text: src, p: base.p, o: base.o, handled: [] }];
+  const { out, bodies, handled } = splitHeredocs(src);
+  const texts = [{ text: out, p: base.p, o: base.o, handled }];
+  let sc = NO_SCOPES;
+  if (bodies.length) {
+    sc = scopesOf(out, handled);
+    if (!sc) { SCOPES_UNREADABLE = true; sc = NO_SCOPES; }
+  }
+  for (const b of bodies) {
+    const c = ctxAt(sc, base, b.at);
+    let p = c.p + "h" + c.o + "/";
+    if (b.how === "here") p = c.p;
+    else if (b.how === "frame") {
+      const f = frameAround(sc, b.at);
+      if (f && f.kind !== "(" && runsHere(tokenize(out.slice(f.cmd, f.s)))) p = ctxAt(sc, base, f.s).p;
+    }
+    for (const t of analyzableTexts(b.text, depth + 1, { p, o: c.o + "." })) texts.push(t);
+  }
   return texts;
 }
 
@@ -2220,7 +6203,12 @@ function analyzableTexts(src, depth) {
 // the whole command skip it and read the masked twin instead (see maskSubstitutions below): the
 // same command with the substitution replaced by a placeholder, which the caller always emits
 // when there is a substitution. A quoted span re-split below has no masked twin of its own, so
-// its segments are never marked and every rule reads them as before.
+// its segments are never marked PARTIAL and every rule reads them as before.
+//
+// They carry another mark instead, a leading vertical tab (QUOTED in check_segment): the text of a
+// quoted span may be a command (`bash -c "…"`) or data (`grep -E 'pr-merge\.sh merge|x'`), and the
+// guard cannot tell which. Every rule reads it as before. What reads the command word the way the
+// shell does (see cw_read) reads only the segments that are certainly commands.
 //
 // The twin masks only the OUTERMOST substitutions (`spans`, from substSpans), so a half that lies
 // INSIDE one is not in the twin at all: in
@@ -2229,12 +6217,14 @@ function analyzableTexts(src, depth) {
 // left that merge judged by nobody (found 2026-09-30, verifying this change: a PR whose base is
 // the protected branch merged by the agent). So a half is marked only when no substitution span
 // overlaps it; one inside a substitution is read by every rule, as before this mark existed.
-function splitSegments(str, top = true, spans = []) {
+function splitSegments(str, top = true, spans = [], code = top, info = null) {
   const out = [];
   const inner = [];
+  let qAt = 0;      // where the current quoted span opens in str
   let cur = "";
   let buf = "";     // text inside the current quoted span
   let q = null;     // null | "'" | '"'
+  let qHead = "";   // the segment as it stood when the current quoted span opened
   let cutLeft = false;   // this segment starts right after a substitution closed
   const frames = [];     // unquoted "$(" and "(" still open, to tell which one a ")" closes
   let tick = false;      // inside a backtick substitution
@@ -2243,7 +6233,10 @@ function splitSegments(str, top = true, spans = []) {
   const insideSubst = (a, b) => spans.some(([s, e]) => a < e && s < b);
   const push = (cutRight = false) => {
     const t = cur.trim();
-    if (t) out.push(top && (cutLeft || cutRight) && !insideSubst(from, i) ? "\t" + t : t);
+    if (t) {
+      out.push(top && (cutLeft || cutRight) && !insideSubst(from, i) ? "\t" + t : t);
+      if (info) info.push({ at: from, kind: null });
+    }
     cur = "";
     cutLeft = false;
     from = i + 1;
@@ -2251,7 +6244,12 @@ function splitSegments(str, top = true, spans = []) {
   const openSubst = () => { push(true); };
   const closeSubst = () => { push(); cutLeft = true; };
   const backtick = () => { tick = !tick; if (tick) openSubst(); else closeSubst(); };
-  const closeQuote = () => { const t = buf.trim(); if (t) inner.push(t); buf = ""; q = null; };
+  const closeQuote = () => {
+    const t = buf.trim();
+    if (t) inner.push({ t, qc: q, script: code && scriptSpan(qHead), at: qAt });
+    buf = "";
+    q = null;
+  };
   for (; i < str.length; i++) {
     const c = str[i];
     const next = str[i + 1];
@@ -2276,7 +6274,7 @@ function splitSegments(str, top = true, spans = []) {
     // recognising it. Joining first is what lets every rule read the whole command.
     if (c === "\\" && next === "\n") { cur += " "; i++; continue; }
     if (c === "\\" && next) { cur += c + next; i++; continue; }
-    if (c === "'" || c === '"') { q = c; cur += c; buf = ""; continue; }
+    if (c === "'" || c === '"') { q = c; qHead = cur; qAt = i; cur += c; buf = ""; continue; }
     if (c === "$" && next === "(") { frames.push("$"); openSubst(); i++; continue; }
     if (c === "`") { backtick(); continue; }
     if (c === "|" || c === "&") {
@@ -2291,14 +6289,82 @@ function splitSegments(str, top = true, spans = []) {
   }
   push();
   // An unterminated quote leaves text in buf; analyze it rather than drop it.
-  if (buf.trim()) inner.push(buf.trim());
+  if (buf.trim()) inner.push({ t: buf.trim(), qc: q, script: code && scriptSpan(qHead), at: qAt });
   // The quoted spans are re-split with the same rules, so an operator inside a quoted
   // command still separates the commands it joins.
-  for (const t of inner) {
+  // A span that is certainly a script (scriptSpan: `bash -c '…'`, `eval "…"`, `ssh host '…'`) of a
+  // text that is certainly a command is re-split as the shell will read it, unmarked: its own
+  // quoting level taken off (inside "…", \" \\ \$ and \` are the characters themselves), so the
+  // command word in it is read the way the shell reads it (see cw_read), and so are the bodies of
+  // its substitutions. Every rule reads those segments as it read the marked ones, so the marked
+  // reading is kept only when it is a different text (a "…" span with escapes in it).
+  for (const { t, qc, script, at } of inner) {
     if (t === str.trim()) continue; // no progress: would recurse forever
-    for (const s of splitSegments(t, false)) out.push(s);
+    const u = script && qc === '"' ? t.replace(/\\([\\"$`])/g, "$1") : t;
+    const asCode = script && u !== str.trim();
+    if (!asCode || u !== t) {
+      for (const s of splitSegments(t, false)) {
+        out.push(s[0] === "\v" ? s : "\v" + s);
+        if (info) info.push({ at, kind: "quoted" });
+      }
+    }
+    if (asCode) {
+      const mine = splitSegments(u, false, [], true);
+      addBodies(mine, u);
+      for (const s of mine) {
+        out.push(s);
+        if (info) info.push({ at, kind: s[0] === "\v" ? script + "-quoted" : script });
+      }
+    }
   }
   return out;
+}
+
+// The body of every command substitution lex sees in a text that is a command (`$(…)`, backticks,
+// `<(…)`, `>(…)`), and the bodies inside those, in order. A body is a command wherever it stands:
+// in `x="$(cd d && git push --force)"` splitSegments meets it inside a double-quoted span, which
+// may be data (\v), and the command word the shell reads there went unread (found 2026-10-02,
+// verifying this change). So each body is ALSO split on its own as a command, unmarked.
+// addBodies <segments of text> <text>: the segments of text's substitution bodies added to them;
+// one that is already there marked as a quoted span (\v) takes its place, since every rule reads it
+// as before and the command word is read too; one already there unmarked is not added again. Only
+// the commands of a body: a quoted span inside it (a jq filter, a node -e program) was already read
+// as one with the text around it, and read again on its own it is data judged as commands (three
+// real commands of the 31 days to 2026-10-02 were denied that way while this was written).
+// With ctxs (one per segment) and ctxOf (a body's offset in text -> its context), a body segment
+// gets the context of its body, which runs in a subshell (see "Where each segment stands").
+function addBodies(segs, text, ctxs = null, ctxOf = null) {
+  const at = new Map();
+  segs.forEach((s, k) => { if (!at.has(s)) at.set(s, k); });
+  for (const { body, off } of substBodies(text, 0, [], 0)) {
+    const c = ctxOf ? ctxOf(off) : null;
+    for (const s of splitSegments(body, false, [], true)) {
+      if (s[0] === "\v" || at.has(s)) continue;
+      const k = at.get("\v" + s);
+      if (k !== undefined) {
+        segs[k] = s;
+        if (ctxs) ctxs[k] = c;
+        at.delete("\v" + s);
+        at.set(s, k);
+      } else {
+        at.set(s, segs.length);
+        segs.push(s);
+        if (ctxs) ctxs.push(c);
+      }
+    }
+  }
+}
+function substBodies(text, depth, acc, base = 0) {
+  if (depth > 16) return acc;
+  for (const [a, b] of substSpans(text)) {
+    const open = text[a] === "`" ? 1 : 2;
+    const close = b - a > open && text[b - 1] === (open === 1 ? "`" : ")") ? 1 : 0;
+    const body = text.slice(a + open, b - close);
+    if (!body.trim()) continue;
+    acc.push({ body, off: base + a + open });
+    substBodies(body, depth + 1, acc, base + a + open);
+  }
+  return acc;
 }
 
 // A command whose argument holds a command or process substitution is still ONE command, but
@@ -2331,11 +6397,40 @@ function maskSubstitutions(text, spans = substSpans(text)) {
   return out + text.slice(k);
 }
 
-for (const text of analyzableTexts(cmd, 0)) {
+// Every segment of every text with where it stands, sent in the order of their positions.
+const all = [];
+for (const tx of analyzableTexts(cmd, 0)) {
+  const text = tx.text;
   const spans = substSpans(text);
-  let segs = splitSegments(text, true, spans);
+  let sc = scopesOf(text, tx.handled);
+  if (!sc) { SCOPES_UNREADABLE = true; sc = NO_SCOPES; }
+  // The context of a position of text, for a segment of that kind (see splitSegments): a script a
+  // shell of its own runs (`bash -c '…'`) is a scope of its own, and so is a quoted span that may be
+  // data, inside the script or not.
+  const ctxOf = (o, kind = null) => {
+    let extra = "";
+    if (kind === "shell" || kind === "shell-quoted") extra += "q" + tx.o + o + "/";
+    if (kind === "quoted" || kind === "shell-quoted" || kind === "eval-quoted") extra += "v" + tx.o + o + "/";
+    return ctxAt(sc, tx, o, extra);
+  };
+  const info = [];
+  let segs = splitSegments(text, true, spans, true, info);
+  const ctxs = info.map((e) => ctxOf(e.at, e.kind));
   const masked = maskSubstitutions(text, spans);
-  let twin = masked !== text ? splitSegments(masked) : [];
+  const tinfo = [];
+  let twin = masked !== text ? splitSegments(masked, true, [], true, tinfo) : [];
+  // The twin's positions are the masked text's: each one is read back as the original's.
+  const unmask = (m) => {
+    let shift = 0;
+    for (const [a, b] of spans) {
+      const ma = a - shift;
+      if (m < ma) break;
+      if (m < ma + SUBST_PLACEHOLDER.length) return a;
+      shift += b - a - SUBST_PLACEHOLDER.length;
+    }
+    return m + shift;
+  };
+  const tctxs = tinfo.map((e) => ctxOf(unmask(e.at), e.kind));
   // A half may be skipped only if the twin reads every command WHOLE. No twin (nothing to mask)
   // cannot; nor can a twin that is itself cut at a substitution lex did not see as one (an
   // unquoted `${X:-$(…)}`, which lex skips): its half of the command would be skipped twice and
@@ -2345,28 +6440,296 @@ for (const text of analyzableTexts(cmd, 0)) {
     twin = twin.map((s) => s.replace(/^\t/, ""));
   }
   const have = new Set(segs);
-  for (const s of twin) if (!have.has(s)) { have.add(s); segs.push(s); }
-  for (const seg of segs) {
-    // One segment, one line. The shell reads this back with `while read -r`, so a segment
-    // carrying a literal newline (only possible from inside a quoted span) would arrive as two
-    // segments and each half would be matched on its own. Collapsing to a space keeps the
-    // segment whole; the quoted span is still re-split on its own by the `inner` pass above, so
-    // nothing that used to be caught stops being caught.
-    process.stdout.write(seg.replace(/\n/g, " ") + "\n");
+  twin.forEach((s, k) => {
+    if (have.has(s)) return;
+    have.add(s);
+    segs.push(s);
+    ctxs.push(tctxs[k]);
+  });
+  addBodies(segs, text, ctxs, (o) => ctxOf(o));
+  segs.forEach((seg, k) => all.push({ seg, ctx: ctxs[k] || { o: tx.o + "0", p: tx.p } }));
+}
+// In the order of their positions (stable: the segments of one position keep theirs), unless a
+// text's scopes could not be read: then in the order they were made, behind "\x01! /".
+const posCmp = (a, b) => {
+  const x = a.split("."), y = b.split(".");
+  for (let k = 0; k < x.length && k < y.length; k++) if (Number(x[k]) !== Number(y[k])) return Number(x[k]) - Number(y[k]);
+  return x.length - y.length;
+};
+if (SCOPES_UNREADABLE) process.stdout.write("\x01! /\n");
+else all.sort((a, b) => posCmp(a.ctx.o, b.ctx.o));
+let lastCtx = "";
+for (const { seg, ctx } of all) {
+  // Where the segment stands, on a line of its own when it changes (see SEG_POS in the shell).
+  const c = "\x01" + ctx.o + " " + ctx.p;
+  if (!SCOPES_UNREADABLE && c !== lastCtx) {
+    process.stdout.write(c + "\n");
+    lastCtx = c;
   }
+  // One segment, one line. The shell reads this back with `while read -r`, so a segment
+  // carrying a literal newline (only possible from inside a quoted span) would arrive as two
+  // segments and each half would be matched on its own. Collapsing to a space keeps the
+  // segment whole; the quoted span is still re-split on its own by the `inner` pass above, so
+  // nothing that used to be caught stops being caught.
+  // A segment of the command that starts with the position mark is sent behind a blank: only
+  // the extractor writes position lines (and only the shell's main loop reads them).
+  process.stdout.write((seg[0] === "\x01" ? " " + seg : seg).replace(/\n/g, " ") + "\n");
+}
+JS
+# Past 64 KiB bash writes a heredoc to a temporary file before reading it. Where it cannot (a full
+# /tmp), the read above fails, and the guard would read no command and let every one run: it reads
+# its extractor from this file instead.
+if [ -z "${EXTRACT_JS:-}" ] && [ -r "${BASH_SOURCE[0]}" ]; then
+  EXTRACT_JS="$(awk '/^JS$/ && f { exit } f { print } /^read -r -d .. EXTRACT_JS <<.JS. / { f = 1 }' \
+    "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+fi
+
+# --- Paths no session may touch (policy: forbidden_paths) ----------------------
+# Each entry of `forbidden_paths` (`~/<dir>` or an absolute path) is out of every session of this
+# repository: a Bash command that names a path under it — in any of its spellings: `~`, `$HOME`,
+# `${HOME}` or the absolute home, with a path boundary on both sides, anywhere in the command text
+# (heredoc bodies included) — and a session whose working directory is under it are denied. The
+# same script judges the file tools when the repository wires it for them as well
+# (`Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob`): their path, resolved from the session's
+# directory with symlinks followed, and a Glob pattern rooted in it. Empty (the default): no rule.
+# Prints "<what touched it>\t<the entry>" for the first hit, nothing otherwise. TEST-ONLY override:
+# BASH_GUARD_HOME (the home `~` stands for).
+read -r -d '' FORBID_JS <<'JS' || true
+const fs = require("fs");
+const path = require("path");
+let d;
+try { d = JSON.parse(fs.readFileSync(0, "utf8")); } catch (e) { process.exit(0); }
+if (!d || typeof d !== "object") process.exit(0);
+const home = process.argv[1] || "";
+const entries = process.argv.slice(2);
+const tool = typeof d.tool_name === "string" ? d.tool_name : "";
+const input = d.tool_input && typeof d.tool_input === "object" ? d.tool_input : {};
+const cwd = typeof d.cwd === "string" && d.cwd ? d.cwd : process.cwd();
+function expand(p) {
+  if (!home) return p.startsWith("~") || p.startsWith("$HOME") || p.startsWith("${HOME}") ? null : p;
+  if (p === "~" || p === "$HOME" || p === "${HOME}") return home;
+  for (const pre of ["~/", "$HOME/", "${HOME}/"]) if (p.startsWith(pre)) return path.join(home, p.slice(pre.length));
+  return p;
+}
+// Absolute and normalised, with the symlinks of its longest existing ancestor resolved.
+function real(p) {
+  let abs = path.resolve(cwd, p);
+  const rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(abs), ...rest); } catch (e) {}
+    const parent = path.dirname(abs);
+    if (parent === abs) return path.resolve(cwd, p);
+    rest.unshift(path.basename(abs));
+    abs = parent;
+  }
+}
+const homeReal = home ? real(home) : "";
+const roots = [];
+for (const e of entries) {
+  const x = expand(e);
+  if (!x || !path.isAbsolute(x)) continue;
+  const r = real(x);
+  if (r === "/" || (homeReal && r === homeReal)) continue;
+  roots.push({ entry: e, abs: path.resolve(x), real: r });
+}
+if (!roots.length) process.exit(0);
+const under = (p, root) => p === root || p.startsWith(root.endsWith("/") ? root : root + "/");
+function hit(p) {
+  if (typeof p !== "string" || !p) return null;
+  const x = expand(p);
+  if (x === null) return null;
+  const r = real(x);
+  return roots.find((o) => under(r, o.real) || under(path.resolve(cwd, x), o.abs)) || null;
+}
+function report(what, root) { process.stdout.write(what.replace(/[\t\n\r]/g, " ") + "\t" + root.entry); process.exit(0); }
+let h = hit(cwd);
+if (h) report("a session whose working directory is " + cwd, h);
+if (["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"].includes(tool)) {
+  for (const k of ["file_path", "notebook_path"]) { h = hit(input[k]); if (h) report(tool + " on " + input[k], h); }
+  process.exit(0);
+}
+if (tool === "Grep" || tool === "Glob") {
+  h = hit(input.path);
+  if (h) report(tool + " in " + input.path, h);
+  const g = typeof input.pattern === "string" ? input.pattern : "";
+  if (tool === "Glob" && /^(\/|~|\$HOME|\$\{HOME\})/.test(g)) {
+    const fixed = g.split(/[*?[{]/)[0];
+    h = hit(fixed || "/");
+    if (h) report("Glob " + g, h);
+  }
+  process.exit(0);
+}
+const cmd = typeof input.command === "string" ? input.command : "";
+if (tool !== "Bash" || !cmd) process.exit(0);
+const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const homes = [...new Set([home, homeReal].filter(Boolean))];
+for (const o of roots) {
+  const spell = new Set();
+  for (const p of new Set([o.abs, o.real])) {
+    spell.add(esc(p));
+    for (const hh of homes) {
+      if (p.startsWith(hh + "/")) {
+        const rel = esc(p.slice(hh.length + 1));
+        for (const pre of ["~", "\\$HOME", "\\$\\{HOME\\}", ...homes.map(esc)]) spell.add(pre + "/" + rel);
+      }
+    }
+  }
+  const re = new RegExp("(^|[^A-Za-z0-9_./-])(?:" + [...spell].join("|") + ")(?=/|$|[^A-Za-z0-9_.-])", "m");
+  // As written, and as the shell reads it once quotes and backslashes are gone (~/"dir", \~/dir).
+  if (re.test(cmd) || re.test(cmd.replace(/["'\\]/g, ""))) report("the command", o);
 }
 JS
 
-SEGMENTS="$(node -e "$EXTRACT_JS" 2>/dev/null || true)"
-if [ -z "$SEGMENTS" ]; then
-  # Fail-open: no extractable command means nothing to evaluate (see header).
+check_forbidden_paths() {
+  local out what entry
+  [ "${#FORBIDDEN_PATHS[@]}" -gt 0 ] || return 0
+  out="$(printf '%s' "$INPUT" | node -e "$FORBID_JS" "${BASH_GUARD_HOME:-${HOME:-}}" "${FORBIDDEN_PATHS[@]}" 2>/dev/null || true)"
+  [ -n "$out" ] || return 0
+  what="${out%%$'\t'*}"
+  entry="${out#*$'\t'}"
+  deny "${what} touches ${entry}, which this repository's guard.policy.json keeps out of every session (forbidden_paths)" \
+    "leave it alone and use synthetic fixtures; if you only need to MENTION the path in a text, write that file with the Write/Edit tool"
+}
+
+# The hook input, read once: the extractor reads it, and so may the rules that need another
+# field of it (the session's directory, the path of a file tool).
+# The guard's time limit, GUARD_SECONDS from its start, under the smallest hook timeout of the fleet
+# (15 s): a hook that runs past the harness's timeout lets the command run. The extractor runs under
+# it (coreutils timeout, where there is one): one stuck on a command it read pathologically was a way
+# to that (found 2026-10-03, verifying #299: 34 nested `$((`, and the node left behind kept a CPU
+# busy for hours after the hook was killed). Judging stops there too (GUARD_DEADLINE). A command the
+# guard cannot read and judge in time is denied, not let through, and so is one it fails on (see the
+# supervisor below). TEST-ONLY override: BASH_GUARD_SECONDS.
+INPUT="$(cat)"
+GUARD_SECONDS=10
+[[ "${BASH_GUARD_SECONDS:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && GUARD_SECONDS="$BASH_GUARD_SECONDS"
+GUARD_DEADLINE="${GUARD_SECONDS%.*}"
+
+# guard_judge: read the command and judge it. Exits 0 (allow) or 2 (deny, with its reason on stderr);
+# run by the supervisor below, which decides what any other ending means.
+guard_judge() {
+  local rc=0
+  [ -n "${EXTRACT_JS:-}" ] || deny "the guard could not load its command reader, and a command it cannot read is not let through" \
+    "check that this guard's file is readable and whole (scripts/hooks/bash-guard.sh)"
+  # The input goes to the extractor through a pipe, not a here-string: past 64 KiB bash writes a
+  # here-string to a temporary file, and with /tmp full the extractor read nothing and every such
+  # command ran (found 2026-10-03, third verification round of #299: a file written with a heredoc
+  # of 70 KB, then `git push --force`).
+  if command -v timeout >/dev/null 2>&1; then
+    SEGMENTS="$(printf '%s' "$INPUT" | timeout -k 2 "$GUARD_SECONDS" node -e "$EXTRACT_JS" 2>/dev/null)" || rc=$?
+  else
+    SEGMENTS="$(printf '%s' "$INPUT" | node -e "$EXTRACT_JS" 2>/dev/null)" || rc=$?
+  fi
+  case "$rc" in
+    0) ;;
+    124 | 137)
+      deny "the guard could not read this command within ${GUARD_SECONDS} s, and a command it cannot read is not let through" \
+        "split it into shorter commands, with less nesting"
+      ;;
+    # No node (timeout's 127 and 126, like the shell's): nothing can read the command (see header).
+    126 | 127) SEGMENTS="" ;;
+    *)
+      deny "the guard's command reader failed on this command (exit ${rc}), and a command it cannot read is not let through" \
+        "split it into shorter commands"
+      ;;
+  esac
+  if [ -z "$SEGMENTS" ]; then
+    # No Bash command to read: only forbidden_paths can apply (a file tool wired to this guard).
+    # Otherwise fail-open: nothing to evaluate (see header).
+    load_policy
+    check_forbidden_paths
+    GUARD_ALLOWED=1
+    exit 0
+  fi
+
+  load_policy
+  check_forbidden_paths
+
+  judge_segments "$SEGMENTS"
+  # A deny past the deadline inside a substitution (`dst="$(push_head_branch)"`) may not have stopped it.
+  check_deadline
+
+  GUARD_ALLOWED=1
   exit 0
+}
+
+# guard_kill_tree <pid>: stops <pid> and every process under it, then kills them all. Stopped first,
+# and the tree walked again, so that none forks a process the walk would miss.
+guard_kill_tree() {
+  local all=" $1 " table k more
+  local -a t=()
+  [ -n "$1" ] || return 0
+  kill -STOP "$1" 2>/dev/null || true
+  set -f
+  for _ in 1 2 3; do
+    table="$(ps -A -o pid= -o ppid= 2>/dev/null)" || table=""
+    # shellcheck disable=SC2206 # "<pid> <ppid>" pairs, every line of them; globbing is off
+    t=($table)
+    more=1
+    while [ "$more" -eq 1 ]; do
+      more=0
+      for ((k = 0; k + 1 < ${#t[@]}; k += 2)); do
+        [[ "$all" == *" ${t[k+1]} "* && "$all" != *" ${t[k]} "* ]] || continue
+        all+="${t[k]} "
+        kill -STOP "${t[k]}" 2>/dev/null || true
+        more=1
+      done
+    done
+  done
+  # shellcheck disable=SC2086 # one pid per word
+  kill -KILL $all 2>/dev/null || true
+}
+
+# --- The supervisor ------------------------------------------------------------
+# The guard judges in a child process and this one waits for its verdict, GUARD_SECONDS and one more
+# at most. The limit inside the judge (check_deadline) is only looked at between segments, and a
+# single segment could keep it busy for minutes: 6,000 `$()` in front of a `git push --force`, the
+# command word read a character at a time, or a word of 1 MB (found 2026-10-03, third verification
+# round of #299). Past that second, or if the judge dies without a verdict, this process stops
+# it and everything it started, and denies. And any ending of the judge other than allow (0) or deny
+# (2) is a failure of the guard (bash stops a script under `set -e` with exit 1, for instance when it
+# cannot write a here-string to a full /tmp): denied too. Claude Code blocks only on exit 2, so a
+# crash used to let the command run; now only a missing node does (see header).
+case "$GUARD_SECONDS" in
+  *.*) GUARD_WAIT="$((10#${GUARD_SECONDS%%.*} + 1)).${GUARD_SECONDS#*.}" ;;
+  *) GUARD_WAIT="$((10#$GUARD_SECONDS + 1))" ;;
+esac
+# The bash 3.2 of macOS waits whole seconds only: the next one up.
+[ "${BASH_VERSINFO[0]}" -ge 4 ] || [[ "$GUARD_WAIT" != *.* ]] || GUARD_WAIT="$((10#${GUARD_WAIT%%.*} + 1))"
+# Killed itself (the harness gives up on the hook), it takes the judge and what the judge started along.
+GUARD_JUDGE_PID=""
+trap '[ -z "$GUARD_JUDGE_PID" ] || guard_kill_tree "$GUARD_JUDGE_PID"; exit 143' TERM INT HUP
+# The judge writes its exit status on fd 9 as it ends (its EXIT trap, guard_verdict), and keeps this
+# hook's stdout (fd 7 meanwhile; /dev/null when the hook has none).
+# guard_verdict <exit status>: an allow (0) counts only where guard_judge allows (GUARD_ALLOWED). The
+# bash 3.2 of macOS shows 0 to the EXIT trap of a script an error stopped (`${v,,}`, an empty array
+# under `set -u`), so that a failure would read as an allow.
+GUARD_ALLOWED=0
+guard_verdict() {
+  local rc="$1"
+  [ "$rc" -ne 0 ] || [ "$GUARD_ALLOWED" -eq 1 ] || rc=1
+  printf '%s\n' "$rc" >&9
+}
+{ exec 7>&1; } 2>/dev/null || exec 7>/dev/null
+exec 8< <(exec 9>&1 1>&7 7>&-; GUARD_SUPERVISED=1; trap 'guard_verdict "$?"' EXIT; guard_judge)
+GUARD_JUDGE_PID="${!:-}"
+exec 7>&-
+GUARD_RC=""
+GUARD_READ=0
+read -r -t "$GUARD_WAIT" -u 8 GUARD_RC || GUARD_READ=$?
+case "$GUARD_READ:$GUARD_RC" in
+  0:0) exit 0 ;;
+  0:2) exit 2 ;;
+  0:*)
+    deny "the guard failed while judging this command (exit ${GUARD_RC}), and a command it cannot judge is not let through" \
+      "split it into shorter commands"
+    ;;
+esac
+guard_kill_tree "$GUARD_JUDGE_PID"
+# Out of time: read says so above 128; the bash 3.2 of macOS says 1, as at the end of the input.
+if [ "$GUARD_READ" -gt 128 ] || [ "$SECONDS" -ge "$GUARD_DEADLINE" ]; then
+  deny "the guard could not judge this command within ${GUARD_SECONDS} s, and a command it cannot judge is not let through" \
+    "split it into shorter commands"
 fi
-
-load_policy
-
-while IFS= read -r SEGMENT; do
-  check_segment "$SEGMENT"
-done <<<"$SEGMENTS"
-
-exit 0
+deny "the guard stopped before judging this command, and a command it cannot judge is not let through" \
+  "split it into shorter commands"
