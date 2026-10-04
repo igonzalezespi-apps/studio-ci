@@ -774,14 +774,22 @@ on the code); never in the self-test.
 
    The push CI of the integration branch must never cancel or replace a run: every pushed commit
    needs its own verdict, or a red cannot be tied to one merge. `cancel-in-progress: false` is not
-   enough — GitHub still cancels a *pending* run of the same group when a third one arrives — so
-   give each push its own group:
+   enough — GitHub still cancels a *pending* run of the same group when a third one arrives. On a
+   pull request, cancel only what a new commit made stale: grouping every PR event by ref lets a
+   `reopened` (or `labeled`, `edited`) run cancel the one still running on the same head, and the
+   head is left with a `cancelled` check. studio-ci's own `ci.yml` uses this block (the same rule
+   as the job-level group of `security.yml`):
 
    ```yaml
    concurrency:
-     group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
-     cancel-in-progress: ${{ github.event_name != 'push' }}
+     group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+     cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
    ```
+
+   `opened` and `synchronize` share one group per PR and cancel the older run, which by then
+   belongs to a commit that is no longer the head. Every other event — `reopened`, `labeled`,
+   `edited`, each push to the integration branch — gets a group of its own run: it neither cancels
+   nor is cancelled, and GitHub never drops it while pending.
 
    In a **private** repo the plan/assess jobs run where `runs-on` says, and they do not start at
    all on a GitHub-hosted image unless the caller passes `allow-hosted: true` (billed minutes: with
