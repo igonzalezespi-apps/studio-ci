@@ -11,8 +11,11 @@
 # `claude-plugins`: con un unico ejecutor registrado, `version-gate` estuvo encolado detras de
 # `tests` mas de quince minutos.
 #
-# SIN `concurrency` a proposito: `opened` y `labeled` disparan dos runs casi a la vez, y cancelar
-# el primero fabrica un check rojo que no corresponde a ningun fallo.
+# `opened` y `labeled` disparan dos runs casi a la vez sobre el MISMO commit, y cancelar el primero
+# fabricaria un check rojo que no corresponde a ningun fallo. Por eso `labeled`, `unlabeled`, `edited`
+# y `reopened` caen en un grupo propio de su ejecucion y nunca cancelan ni son cancelados; solo
+# `opened`/`synchronize` comparten grupo por PR y cancelan la run de un commit ya superado.
+# `concurrency.test.sh` evalua estas expresiones evento a evento.
 name: PR TL;DR
 
 on:
@@ -21,6 +24,10 @@ on:
 
 permissions:
   pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
 
 jobs:
   check-pr-tldr:
