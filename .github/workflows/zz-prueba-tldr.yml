@@ -1,0 +1,15 @@
+# PRUEBA TEMPORAL: no se mergea.
+name: zz-prueba-tldr
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+concurrency:
+  group: zz-tldr-${{ github.event.action == 'synchronize' && format('pr-{0}', github.event.pull_request.number) || format('pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha || github.sha) }}
+  cancel-in-progress: ${{ github.event.action == 'synchronize' }}
+permissions:
+  contents: read
+jobs:
+  espera:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "evento=${{ github.event.action }} sha=${{ github.event.pull_request.head.sha }}"; sleep 120

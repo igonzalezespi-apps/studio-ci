@@ -1,0 +1,16 @@
+# PRUEBA TEMPORAL: no se mergea.
+name: zz-prueba-guard
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha)) || (github.event_name == 'push' && github.sha) || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  espera:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "evento=${{ github.event.action }} sha=${{ github.event.pull_request.head.sha }}"; sleep 120
