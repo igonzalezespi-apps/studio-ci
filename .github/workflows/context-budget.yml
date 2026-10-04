@@ -17,9 +17,12 @@
 #
 # Escucha `labeled`/`unlabeled` porque la aprobacion de un exceso de presupuesto va por etiqueta
 # (`presupuesto-contexto-aprobado`). Por eso vive en su propio workflow y no en ci.yml: alli una
-# etiqueta relanzaria tambien las suites, y su `concurrency` cancelaria el run de `opened` al
-# llegar el de `labeled`, que es un check rojo que no corresponde a ningun fallo. SIN `concurrency`,
-# como pr-tldr.yml. `ubuntu-latest` fijo, NUNCA `vars.RUNNER_TARGET`: este repo es publico.
+# etiqueta relanzaria tambien las suites. SIN `concurrency`: cada evento de la PR corre su run
+# entera y ninguna cancela a otra. ci.yml y pr-tldr.yml si la llevan desde el 2026-10-04:
+# `opened`/`synchronize` comparten grupo por PR y cancelan (lo cancelado es un commit que ya no es
+# la cabeza), y cualquier otro evento va a un grupo propio de su run, que ni cancela ni lo cancelan.
+# Esa forma no se ha traido aqui. `ubuntu-latest` fijo, NUNCA `vars.RUNNER_TARGET`: este repo es
+# publico.
 name: context-budget
 
 on:
