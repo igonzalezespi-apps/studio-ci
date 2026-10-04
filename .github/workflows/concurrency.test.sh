@@ -14,6 +14,9 @@
 #   2. `opened` y `synchronize` de una PR comparten grupo y cancelan: lo cancelado es un commit viejo;
 #   3. push, schedule y workflow_dispatch no cancelan nunca;
 #   4. el heartbeat no cancela nunca, y en una PR su grupo es solo suyo.
+#   5. los workflows propios con `concurrency` de primer nivel (ci, guard-selftest,
+#      detect-changes-selftest, pr-title-lint, pr-tldr) cumplen 1-3, y dos push a develop/main no
+#      comparten grupo: cada commit de la rama principal tiene su CI.
 #
 # Y despues MUTA los ficheros (las dos "simplificaciones" que reintroducen el fallo) y exige que la
 # suite los rechace: un test que no puede fallar no protege nada.
@@ -170,6 +173,8 @@ SIN_CODIGO = ["labeled", "unlabeled", "edited", "reopened", "ready_for_review"]
 CODIGO = ["opened", "synchronize"]
 
 def concurrencia(doc):
+    if doc.get("concurrency"):
+        return doc["concurrency"]
     (job,) = doc["jobs"].values()
     return job["concurrency"]
 
@@ -217,6 +222,17 @@ def reglas_heartbeat(doc):
     if g1 != g2: fallos.append("heartbeat: schedule y workflow_dispatch no comparten grupo (dos pings a la vez)")
     return fallos
 
+def reglas_workflow(doc):
+    """Un workflow propio (no reutilizable) con `concurrency` de primer nivel: las reglas de security
+    y, ademas, dos push a la misma rama no comparten grupo (GitHub descartaria el pendiente)."""
+    fallos = reglas_security(doc)
+    c = doc["concurrency"]
+    for rama in ("refs/heads/develop", "refs/heads/main"):
+        g1, _ = calcula(c, ctx("push", ref=rama, run=10))
+        g2, _ = calcula(c, ctx("push", ref=rama, run=11))
+        if g1 == g2: fallos.append(f"push a {rama}: dos commits comparten grupo ({g1}); el pendiente se descarta")
+    return fallos
+
 def carga(p):
     with open(p, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
@@ -226,9 +242,15 @@ if __name__ == "__main__":
     doc = carga(fichero)
     on = doc.get("on", doc.get(True))
     fallos = []
-    if list((on or {}).keys()) != ["workflow_call"]:
-        fallos.append(f"`on` debe ser solo workflow_call, es {list((on or {}).keys())}")
-    fallos += reglas_security(doc) if modo == "security" else reglas_heartbeat(doc)
+    if modo == "workflow":
+        if not doc.get("concurrency"):
+            fallos.append("sin `concurrency` de primer nivel")
+        else:
+            fallos += reglas_workflow(doc)
+    else:
+        if list((on or {}).keys()) != ["workflow_call"]:
+            fallos.append(f"`on` debe ser solo workflow_call, es {list((on or {}).keys())}")
+        fallos += reglas_security(doc) if modo == "security" else reglas_heartbeat(doc)
     for f in fallos:
         print(f"    - {f}")
     sys.exit(1 if fallos else 0)
@@ -266,6 +288,11 @@ PY
 echo "== los ficheros reales =="
 comprueba security  "$HERE/security.yml"           "security.yml cumple las reglas de concurrencia" 0
 comprueba heartbeat "$HERE/renovate-heartbeat.yml" "renovate-heartbeat.yml cumple las reglas de concurrencia" 0
+# Los workflows propios con `concurrency` de primer nivel: solo cancelan lo que un commit nuevo dejo
+# viejo, y nunca un push a develop/main.
+for wf in ci guard-selftest detect-changes-selftest pr-title-lint pr-tldr; do
+  comprueba workflow "$HERE/$wf.yml" "$wf.yml cumple las reglas de concurrencia" 0
+done
 
 echo "== mutantes: cada uno debe romper la suite =="
 muta() { # muta <origen> <destino> <python que transforma el doc>
@@ -292,6 +319,24 @@ muta "$HERE/renovate-heartbeat.yml" "$TMP/m6.yml" 'c["cancel-in-progress"] = Tru
 comprueba heartbeat "$TMP/m6.yml" "mutante: heartbeat que cancela" 1
 muta "$HERE/security.yml" "$TMP/m7.yml" 'doc["on"] = {"workflow_call": doc.pop(True)["workflow_call"], "pull_request": None}'
 comprueba security "$TMP/m7.yml" "mutante: el reutilizable tambien se dispara solo" 1
+
+mutaw() { # mutaw <origen> <destino> <python que transforma el doc>: concurrency de primer nivel
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+c = doc.get("concurrency") or {}
+exec(sys.argv[3])
+open(sys.argv[2], "w").write(yaml.safe_dump(doc, sort_keys=False))
+PY
+}
+mutaw "$HERE/ci.yml" "$TMP/w1.yml" 'c["group"] = "${{ github.workflow }}-${{ github.ref }}"; c["cancel-in-progress"] = "${{ github.ref != \x27refs/heads/main\x27 }}"'
+comprueba workflow "$TMP/w1.yml" "mutante: el grupo por ref de antes (cancela develop y el mismo commit)" 1
+mutaw "$HERE/pr-tldr.yml" "$TMP/w2.yml" 'c["cancel-in-progress"] = True'
+comprueba workflow "$TMP/w2.yml" "mutante: workflow que cancela en cualquier evento" 1
+mutaw "$HERE/ci.yml" "$TMP/w3.yml" 'c["group"] = c["group"].replace("format(\x27run-{0}-{1}\x27, github.run_id, github.run_attempt)", "github.ref")'
+comprueba workflow "$TMP/w3.yml" "mutante: push y eventos sin codigo agrupados por ref" 1
+mutaw "$HERE/pr-tldr.yml" "$TMP/w4.yml" 'doc.pop("concurrency")'
+comprueba workflow "$TMP/w4.yml" "mutante: workflow sin concurrency" 1
 
 echo
 echo "concurrency.test.sh: $PASS ok, $FAIL fallos"
