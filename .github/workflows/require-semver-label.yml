@@ -28,7 +28,14 @@ name: Require semver label
 on:
   pull_request:
     branches: [main, develop]
-    types: [opened, labeled, unlabeled, synchronize]
+    # `reopened` desde el 2026-10-04, porque cerrar y reabrir una PR es como se relanzan sus
+    # checks: por ejemplo, cuando la abre un workflow con `GITHUB_TOKEN` y las runs de esos eventos
+    # acaban en `failure` sin ningun job. Los demas workflows de PR de este repo ya escuchan
+    # `reopened`; este no, y su check se quedaba en rojo hasta quitar y volver a poner la etiqueta
+    # a mano (medido el 2026-10-03 en otros repos del estudio). Un `reopened` no trae codigo: cae
+    # en el grupo de su commit (ver `concurrency`) y lee las etiquetas en vivo, como cualquier otra
+    # run.
+    types: [opened, reopened, labeled, unlabeled, synchronize]
 
 concurrency:
   # `cancel-in-progress: false` NO esta puesto por poner el valor por defecto: ES el arreglo.
