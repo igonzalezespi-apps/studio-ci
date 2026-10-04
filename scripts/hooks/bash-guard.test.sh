@@ -1038,6 +1038,11 @@ push_real deny "$OTRO" "(cd $PROJ; git push origin main)"
 push_real deny "$OTRO" "pushd $PROJ && git push origin main"
 push_real deny "$OTRO" "GIT_DIR=$PROJ/.git git push origin main"
 push_real deny "$OTRO" "env -C $PROJ git push origin main"
+# A wrapper changes nothing about where a push lands, unless it changes the directory.
+push_real allow "$OTRO" "sudo -u builder git push origin main"
+push_real allow "$OTRO" "timeout 30 git push origin main"
+push_real deny "$OTRO" "sudo -D $PROJ git push origin main"
+push_real deny "$OTRO" "unshare -w $PROJ git push origin main"
 push_real deny "$PROJ" "git -C $REPOS/no-existe push origin main"
 push_real deny "$PROJ" "git -C $REPOS push origin main"
 push_real deny "$PROJ" "git -C $SINREMOTO push origin main"
@@ -1398,6 +1403,1980 @@ run_case deny  'gh pr create -dt --label --body b'
 run_case deny  'cat .env.$X.example'
 run_case deny  'cat .env.${X}.sample'
 run_case allow 'cat "$ROOT/.env.prod.example"'
+
+# ============================================================================
+# GROUP 11 — LO QUE CORRE ES LO QUE SE JUZGA, y dos reglas que un repo activa en su politica.
+# Cada regla lleva sus dos mitades: la orden que tiene que parar y, al lado, el uso legitimo
+# que tiene que seguir pasando. Sin la segunda, un arreglo que denegara todo saldria verde.
+# ============================================================================
+TEST_POLICY="$POL_PRISMA"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+TEST_OWN_REPO="owner/the-session-repo"
+
+# --- 1. Los envoltorios: la palabra de orden es el programa que ejecutan ------------------------
+# sudo/doas, nice, timeout, stdbuf, ionice, time, command, exec, flock, chroot, caffeinate, setsid,
+# nohup, env y xargs se saltan con sus opciones, los valores de esas opciones y los operandos que
+# van antes de la orden (la duracion de timeout, el candado de flock, la raiz de chroot).
+CASES=(
+  'deny|sudo -u builder git push origin main'
+  'deny|sudo -u builder gh pr merge 1 --squash'
+  'deny|sudo -E -u builder cat .env'
+  'deny|sudo --user=builder -- git push origin main'
+  'deny|/usr/bin/sudo git push origin main'
+  'deny|doas -u builder cat .env'
+  'deny|nice gh pr merge 1 --squash'
+  'deny|nice -n 10 git push origin main'
+  'deny|nice -10 cat .env'
+  'deny|timeout 5 gh pr merge 1 --squash'
+  'deny|timeout --signal=KILL 5s git push origin main'
+  'deny|timeout -k 1 5 cat .env'
+  'deny|timeout 5 curl https://example.com/x'
+  'deny|stdbuf -oL gh pr merge 1 --squash'
+  'deny|stdbuf -o L cat .env'
+  'deny|ionice -c 3 git push origin main'
+  'deny|time -p git push origin main'
+  'deny|command -p git push origin main'
+  'deny|exec -a x git push origin main'
+  'deny|flock /tmp/lock git push origin main'
+  'deny|flock -w 5 /tmp/lock cat .env'
+  'deny|chroot --userspec=x:x / git push origin main'
+  'deny|caffeinate -i git push origin main'
+  'deny|setsid -f git push origin main'
+  'deny|env - git push origin main'
+  'deny|nohup nice -n 5 timeout 9 git push origin main'
+  'deny|sudo -u builder git commit -n -m wip'
+  'deny|timeout 5 rm -rf packages/database/src/generated'
+  'deny|xargs git push origin main'
+  'deny|runuser -u builder -- git push origin main'
+  'deny|nsenter -t 1 -m git push origin main'
+  'deny|unshare -r cat .env'
+  'deny|strace -f -o /tmp/t git push origin main'
+  'deny|ltrace -o /tmp/t cat .env'
+  'deny|watch -n 5 gh pr merge 1 --squash'
+  'deny|busybox env git push origin main'
+  'deny|xargs -0 -n1 cat .env'
+  'allow|sudo -u builder git push origin HEAD'
+  'allow|sudo -u postgres psql -c "select 1"'
+  'allow|nice -n 10 pnpm test'
+  'allow|timeout 5 git push origin HEAD'
+  'allow|timeout 60 pnpm vitest run'
+  'allow|timeout 5 curl http://localhost:3001/health'
+  'allow|stdbuf -oL git log --oneline'
+  'allow|time -p pnpm build'
+  'allow|command -v gh'
+  'allow|flock /tmp/lock pnpm build'
+  'allow|nohup pnpm dev'
+  'allow|sudo -u builder cat .env.example'
+  'allow|find . -name "*.ts" | xargs grep -l TODO'
+  'allow|git branch --merged | grep -v main | xargs git branch -d'
+  # Un valor o un operando entre comillas con blancos es UNA palabra, aunque ocupe varios tokens:
+  # tomar su segunda mitad por la orden dejaba pasar lo que va detras.
+  'deny|sudo -u "build er" git push origin main'
+  'deny|sudo -u "build er" gh pr merge 1 --squash'
+  'deny|sudo --prompt="clave de %u" git push origin main'
+  'deny|flock "/tmp/mi candado" git push origin main'
+  'deny|timeout -s "KILL" "5" cat .env'
+  'deny|env -u "A B" git push origin main'
+  'deny|sudo -c clase git push origin main'
+  'deny|sudo -a tipo cat .env'
+  'deny|builtin command git push origin main'
+  'allow|sudo -u "build er" git push origin HEAD'
+  'allow|flock "/tmp/mi candado" pnpm build'
+  'allow|sudo -c clase pnpm test'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# Lo que xargs anade (de stdin, al final o en su cadena de reemplazo) es un valor que el shell
+# rellena despues: el PR de un merge y el destino de curl no se pueden leer.
+run_case deny  'echo 1 | xargs -I{} gh pr merge {} --squash'
+run_case deny  'gh pr list -q ".[].number" --json number | xargs -n1 gh pr merge --squash'
+run_case deny  'cat urls.txt | xargs curl -s'
+run_case deny  'cat hosts.txt | xargs -I{} curl -s {}'
+run_case deny  'cat hosts.txt | xargs -i curl -s https://{}/x'
+run_case allow 'seq 3 | xargs -I{} curl -s http://localhost:3001/item/{}'
+run_case allow 'seq 3 | xargs -I % curl -s -o out-%.json http://localhost:3001/item/%'
+# Paridad de los dos lectores: todo envoltorio que el extractor (node) desenvuelve para saber si un
+# heredoc llega a un shell lo desenvuelve tambien el que elige la palabra de orden (bash).
+total=$((total + 1))
+wrap_missing="$(node -e '
+  const s = require("fs").readFileSync(process.argv[1], "utf8");
+  const m = s.match(/const WRAPPERS = new Set\(\[([\s\S]*?)\]\)/);
+  const names = m ? [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]).concat(["sudo", "doas"]) : ["<no WRAPPERS set>"];
+  const at = s.indexOf("wrapper_grammar() {");
+  const body = at < 0 ? "" : s.slice(at, s.indexOf("\n}\n", at));
+  const labels = new Set([...body.matchAll(/^\s+([a-z| -]+)\)/gm)].flatMap((x) => x[1].split("|").map((t) => t.trim())));
+  process.stdout.write(names.filter((n) => !labels.has(n)).join(" "));
+' "$GUARD")"
+if [ -z "$wrap_missing" ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1)); printf 'FAIL  wrappers the heredoc reader knows and wrapper_grammar does not: %s\n' "$wrap_missing"; fi
+# Con la politica de producto (merge a develop permitido), los dos lados de un envoltorio.
+TEST_POLICY="$POL_PRODUCT"; TEST_PATH_PREFIX="$TMP/bin"
+run_case allow 'timeout 60 gh pr merge 123 --repo owner/by-number --squash'
+run_case deny  'timeout 60 gh pr merge 456 --repo owner/by-number --squash'
+run_case allow 'sudo -u builder gh pr merge 123 --repo owner/by-number --squash'
+run_case deny  'nice -n 5 gh pr merge 456 --repo owner/by-number --squash'
+run_case allow 'sudo -u builder gh pr create --title t --body b --label semver:patch'
+run_case deny  'sudo -u builder gh pr create --title t --body b'
+run_case deny  'echo 123 | xargs gh pr merge --repo owner/by-number --squash'
+run_case deny  'echo x | xargs gh pr merge 123 --repo owner/by-number --squash'
+TEST_POLICY="$POL_PRISMA"; TEST_PATH_PREFIX=""
+
+# --- 2. git branch -d/-D de una rama de larga vida ---------------------------------------------
+CASES=(
+  'deny|git branch -D main'
+  'deny|git branch -d main'
+  'deny|git branch --delete --force main'
+  'deny|git branch -D feature/x main'
+  'deny|git branch -D -- main'
+  'deny|git branch -df develop'
+  'deny|git branch -D master'
+  'deny|git -C ../otro branch -D main'
+  'deny|git branch -dr origin/main'
+  'deny|git branch -d -r origin/develop'
+  'allow|git branch -D feature/123-old'
+  'allow|git branch -d fix/x chore/y'
+  'allow|git branch -dr origin/feature/x'
+  'allow|git branch --merged main'
+  'allow|git branch -vv'
+  'allow|git branch -u origin/main'
+  'allow|git branch --set-upstream-to origin/main'
+  'allow|git branch main-backup main'
+  'allow|git branch -m old new'
+  'allow|git branch -f main origin/main'
+  'allow|git branch -D "$B"'
+  'deny|git branch -D ma\in'
+  'deny|git branch -D "main"'
+  'deny|git branch -D m{a,}in'
+  'deny|git update-ref -d refs/heads/main'
+  'deny|git update-ref --delete refs/heads/develop'
+  'allow|git update-ref -d refs/heads/feature/x'
+  'allow|git update-ref refs/heads/feature/x HEAD'
+  'allow|git update-ref -d refs/remotes/origin/feature/x'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# La rama de integracion y las long_lived_branches de la politica cuentan tambien.
+POL_LONG="$TMP/long-lived.json"
+cat > "$POL_LONG" <<'JSON'
+{ "protected_branch": "trunk-x", "integration_branch": "integ-x", "long_lived_branches": ["release/stable"] }
+JSON
+TEST_POLICY="$POL_LONG"
+run_case deny  'git branch -D trunk-x'
+run_case deny  'git branch -D integ-x'
+run_case deny  'git branch -D release/stable'
+run_case allow 'git branch -D release/old'
+TEST_POLICY="$POL_PRISMA"
+
+# --- 2b. git push: el `+` de una refspec, el borrado en el remoto y el lease hacia una rama larga --
+# Reglas sobre el agente, como la del push forzado: valen hacia cualquier repositorio.
+#   - Un `+` delante de una refspec fuerza esa rama como --force, y ademas anula --force-with-lease
+#     (medido con git 2.43: con el lease caducado, `--force-with-lease origin +HEAD:x` machaca x).
+#   - Borrar en el remoto una rama de larga vida (la lista de `git branch -D`): --delete, -d o el
+#     origen vacio `:<rama>`, en cada forma en que git nombra la rama (refs/heads/, heads/).
+#   - --force-with-lease solo hacia ramas propias; HEAD es la rama donde corre el git de verdad.
+#   - `:` sola, un patron que alcanza una rama larga y --prune empujan o borran todas las ramas.
+# Al lado, lo que hacen las limpiezas y los rebases: borrar una rama de trabajo terminada y el
+# push con lease a la propia.
+TEST_POLICY="$POL_PRODUCT"
+CASES=(
+  'deny|git push origin +HEAD'
+  'deny|git push origin +HEAD:feature/x'
+  'deny|git push origin +HEAD:develop'
+  'deny|git push origin +feature/x'
+  "deny|git push origin '+HEAD:feature/x'"
+  'deny|git push origin \+HEAD:feature/x'
+  'deny|git push origin "+refs/heads/feature/x:refs/heads/feature/x"'
+  'deny|git push --force-with-lease origin +HEAD:feature/x'
+  'deny|git push -u origin HEAD:feature/x +HEAD:feature/y'
+  'deny|git push origin +:feature/x'
+  'allow|git push origin HEAD:feature/x'
+  'allow|git push origin HEAD:feature/c++-bindings'
+  'allow|git push --force-with-lease origin HEAD:feature/x'
+  'allow|git push --force-with-lease origin feature/x'
+  'allow|git push --force-with-lease'
+  'allow|git push --force-with-lease --force-if-includes origin HEAD'
+  'allow|git push --force-with-lease=feature/x:abc123 origin feature/x'
+  'deny|git push origin --delete develop'
+  'deny|git push origin :develop'
+  'deny|git push origin -d develop'
+  'deny|git push -d origin develop'
+  'deny|git push -qd origin develop'
+  'deny|git push --delete origin main'
+  'deny|git push origin --delete master'
+  'deny|git push origin --delete trunk'
+  'deny|git push origin :refs/heads/develop'
+  'deny|git push origin --delete refs/heads/develop'
+  'deny|git push origin :heads/develop'
+  'deny|git push origin --del develop'
+  'deny|git push origin --delete feature/x develop'
+  'deny|git push origin :feature/x :develop'
+  'deny|git push origin :{feature/x,develop}'
+  'deny|git push origin --delete "develop"'
+  'deny|git push origin --delete dev\elop'
+  'allow|git push origin --delete feature/123-old'
+  'allow|git push origin --delete fix/x chore/y'
+  'allow|git push -d origin docs/z'
+  'allow|git push origin :feature/123-old'
+  'allow|git push -q origin :refs/heads/tmp-noop'
+  'allow|git push origin --delete develop-backup'
+  'allow|git push origin --delete "$B"'
+  'allow|git push -odeploy.force origin feature/x'
+  'allow|git push -uo ci.skip origin HEAD'
+  'deny|git push --force-with-lease origin develop'
+  'deny|git push --force-with-lease origin HEAD:develop'
+  'deny|git push --force-with-lease origin HEAD:refs/heads/main'
+  'deny|git push --force-with-lease=develop:abc123 origin HEAD:develop'
+  'deny|git push --force-with-l origin develop'
+  'allow|git push origin HEAD:develop'
+  'deny|git push origin :'
+  "deny|git push origin 'refs/heads/*:refs/heads/*'"
+  "deny|git push origin 'refs/heads/*'"
+  "deny|git push origin 'refs/*:refs/*'"
+  "deny|git push origin 'HEAD:refs/heads/*'"
+  "allow|git push origin 'refs/tags/*'"
+  "allow|git push origin 'refs/heads/feature/*'"
+  'allow|git push --tags origin'
+  'allow|git push --follow-tags origin HEAD'
+  "deny|git push --prune origin 'refs/heads/*:refs/heads/*'"
+  'deny|git push --prune origin HEAD'
+  'deny|git push --pru origin HEAD'
+  'allow|git fetch --prune origin'
+  'allow|git remote prune origin'
+  # git acepta cualquier prefijo inequivoco de una opcion larga.
+  'deny|git push --no-verif origin HEAD'
+  'deny|git push --al origin'
+  'deny|git push --mirr origin'
+  'deny|git push --forc origin feature/x'
+  'allow|git push --dry-run origin HEAD'
+  'allow|git push --atomic origin HEAD'
+  'allow|git push --set-upstream origin feature/x'
+  'allow|git push --no-thin origin HEAD'
+  # `heads/<rama>` y `@` (HEAD) son la misma rama para git.
+  'deny|git push origin HEAD:heads/main'
+  'allow|git push origin HEAD:heads/feature/x'
+  # $'…' y $"…" tambien son comillas para el shell.
+  "deny|git push origin \$'+HEAD:feature/x'"
+  "deny|git push origin --delete \$'develop'"
+  'deny|git push origin $":develop"'
+  "allow|git push origin \$'feature/x'"
+  # Lo que el guard no expande (los escapes de $'…' y una secuencia {a..b}) no se lee: se niega.
+  "deny|git push origin :\$'\\x64'evelop"
+  "deny|git push origin --delete \$'\\x64evelop'"
+  'deny|git push origin :develo{p..p}'
+  'allow|git push origin feature/{a,b}'
+  'allow|git push origin HEAD@{1}:feature/x'
+  # El id de objeto nulo como origen borra el destino, como el origen vacio (medido con git 2.43).
+  'deny|git push origin 0000000000000000000000000000000000000000:develop'
+  'deny|git push origin 0000000000000000000000000000000000000000:refs/heads/develop'
+  'deny|git push origin 0000000000000000000000000000000000000000000000000000000000000000:develop'
+  'allow|git push origin 0000000000000000000000000000000000000000:feature/x'
+  # Opciones globales de git con el valor en la palabra siguiente: no son el subcomando.
+  'deny|git --attr-source HEAD push --force origin feature/x'
+  'deny|git --attr-source HEAD push origin +HEAD:feature/x'
+  'deny|git --config-env core.x=HOME push origin --delete develop'
+  'allow|git --attr-source HEAD push origin HEAD:feature/x'
+  # El valor de una opcion global entre comillas, con espacios, es una sola palabra: su segunda
+  # mitad no es el subcomando (antes ninguna regla de git leia la orden, tampoco --force).
+  'deny|git -c user.name="Foo Bar" push --force origin feature/x'
+  "deny|git -c 'user.name=Foo Bar' push origin :develop"
+  'deny|git -C "/tmp/a b" push origin +HEAD:feature/x'
+  'deny|git -C /tmp/a\ b push origin --delete develop'
+  'deny|git -c user.name="Foo Bar" commit --no-verify -m x'
+  'allow|git -c user.name="Foo Bar" push origin HEAD:feature/x'
+  'allow|git -c user.name="Foo Bar" -c user.email=x commit -m "a b"'
+  # La configuracion que la orden se pone con -c: mirror es --mirror, push da las refspecs si la
+  # linea no trae ninguna, y push.default=matching empuja entonces como `:`.
+  'deny|git -c remote.origin.mirror=true push origin'
+  'deny|git -c remote.origin.mirror push origin'
+  'deny|git -c Remote.Origin.Mirror=YES push origin'
+  "deny|git -c 'remote.origin.push=+refs/heads/*:refs/heads/*' push origin"
+  'deny|git -c remote.origin.push=:refs/heads/develop push origin'
+  'deny|git -c remote.origin.push=HEAD:develop push --force-with-lease origin'
+  'deny|git -c push.default=matching push --force-with-lease origin'
+  'deny|git -c push.default=matching push'
+  'allow|git -c remote.origin.mirror=false push origin HEAD'
+  'allow|git -c remote.origin.push=HEAD:feature/x push origin'
+  "allow|git -c 'remote.origin.push=refs/heads/*:refs/heads/*' push origin feature/x"
+  'allow|git -c push.default=matching push origin HEAD'
+  'allow|git -c push.default=current push --force-with-lease'
+  'allow|git -c push.autoSetupRemote=true push -u origin HEAD'
+  # send-pack es la fontaneria de push: las mismas refspecs, --force, --all y --mirror.
+  'deny|git send-pack --force origin HEAD:feature/x'
+  'deny|git send-pack origin +HEAD:feature/x'
+  'deny|git send-pack origin :refs/heads/develop'
+  'deny|git send-pack --mirror origin'
+  'allow|git send-pack origin HEAD:feature/x'
+  # eval sin comillas es un envoltorio desde #287: la orden que corre se lee como las demas.
+  'deny|eval git push origin :develop'
+  'deny|eval git push origin +HEAD:feature/x'
+  'allow|eval git push origin --delete fix/x'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+run_case deny  'git push origin @' main
+run_case allow 'git push origin @'
+run_case deny  'git push --force-with-lease' develop
+run_case deny  'git push --force-with-lease origin HEAD' develop
+run_case deny  'git push --force-with-lease origin @' develop
+run_case allow 'git push --force-with-lease origin HEAD:feature/x' develop
+run_case allow 'git push origin HEAD' develop
+# Unas llaves que pasan de lo que lee brace_words (64 palabras, 2048 caracteres) dejarian refspecs
+# sin leer, y `:develop` podia ir la ultima: se niegan, como un .env. Unas pocas se leen y pasan.
+printf -v MUCHAS 'fix/b%d,' {1..70}
+printf -v LARGA '%2100s' ''
+LARGA="${LARGA// /x}"
+run_case deny  "git push origin :{${MUCHAS}develop}"
+run_case deny  "git push origin --delete {${MUCHAS}develop}"
+run_case deny  "git push origin :{fix/${LARGA},develop}"
+run_case allow 'git push origin --delete {fix/b1,fix/b2,chore/b3}'
+run_case allow "git push origin --delete fix/${LARGA}"
+# Las ramas largas de la politica cuentan igual que el suelo.
+TEST_POLICY="$POL_LONG"
+run_case deny  'git push origin --delete integ-x'
+run_case deny  'git push origin :release/stable'
+run_case deny  'git push --force-with-lease origin HEAD:trunk-x'
+run_case deny  "git push origin 'refs/heads/release/*'"
+run_case allow 'git push origin --delete release/old'
+run_case allow 'git push --force-with-lease origin HEAD:release/old'
+TEST_POLICY="$POL_PRISMA"
+# Con repositorios de verdad: la regla vale tambien hacia otro repositorio, y el HEAD del lease es
+# la rama del directorio donde corre el git (cd y -C incluidos), no la de la sesion.
+INTEG="$REPOS/integracion"
+if ! {
+  git_h init -q "$INTEG" && git_h -C "$INTEG" commit -q --allow-empty -m init &&
+    git_h -C "$INTEG" branch -q -m develop
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the repository of section 2b" >&2
+  exit 1
+fi
+push_real deny  "$OTRO" "git push origin --delete develop"
+push_real deny  "$OTRO" "git push origin :main"
+push_real deny  "$OTRO" "git push origin +HEAD:feature/x"
+push_real allow "$OTRO" "git push origin --delete feature/x"
+push_real allow "$OTRO" "git push origin main"
+push_real deny  "$INTEG" "git push --force-with-lease origin HEAD"
+push_real deny  "$INTEG" "git push --force-with-lease"
+push_real deny  "$WT" "cd $INTEG && git push --force-with-lease origin HEAD"
+push_real deny  "$WT" "git -C $INTEG push --force-with-lease origin HEAD"
+push_real allow "$INTEG" "cd $WT && git push --force-with-lease origin HEAD"
+push_real allow "$INTEG" "git -C $WT push --force-with-lease origin HEAD"
+push_real allow "$WT" "git push --force-with-lease origin HEAD"
+push_real allow "$INTEG" 'cd "$W" && git push --force-with-lease origin HEAD'
+
+# --- 3. .env: los ficheros que abre el shell ---------------------------------------------------
+# Tras quitar comillas y barras, una palabra con llaves cuenta como cada palabra que genera, y un
+# comodin que alcanza un .env real cuenta como ese .env.
+CASES=(
+  'deny|cat .env{,.example}'
+  'deny|cat .env{.example,}'
+  'deny|cat apps/api/.env{,.example}'
+  'deny|head {.env,README.md}'
+  'deny|grep KEY .e{n,}v'
+  'deny|cat .env{,.local}.bak'
+  'deny|cat .e*'
+  'deny|cat .??*'
+  'deny|grep KEY .en?'
+  'deny|tail .[e]nv'
+  'deny|cat ".env"*'
+  'deny|cat \.env'
+  "deny|cat '.env'"
+  "deny|cat \$'.env'"
+  'allow|cat .env{.example,.sample}'
+  'allow|cat .env.{prod,local}.example'
+  'allow|cat {README,CHANGELOG}.md'
+  'allow|grep -rn KEY src/{api,worker}'
+  'allow|cat .e*.example'
+  'allow|cat .*rc'
+  'allow|head .github/*.yml'
+  "allow|awk '{print \$1}' notes.txt"
+  "allow|sed -n '/{/,/}/p' config.json"
+  'deny|cat \.e*'
+  # A quoted pattern is not a glob and keeps its backslashes: these are searches, not dumps.
+  "allow|grep -n '\.env' src/config.ts"
+  "allow|grep -rn '\.env.example\|verify-setup' docs"
+  "allow|grep -E '^.github/workflows/.*\.test' files.txt"
+  "allow|sed 's/.*//' notes.txt"
+  "allow|grep -n '.*al' notes.txt"
+  "allow|awk '{sub(/.*/, \"\")} 1' notes.txt"
+  "allow|grep -c '.*\[bot\]' log.txt"
+  "allow|grep -cE 'snapshot .* saved' backup.log"
+  "allow|grep -E \"processed .* in [0-9]\" backup.log"
+  "allow|grep -n 'see \.env for the values' README.md"
+  'deny|grep -c KEY .e* backup.log'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 4. gh api graphql: la consulta va escrita en la orden ---------------------------------
+# Las mutaciones que mergean se leen en el texto de la orden, asi que una consulta que no esta en
+# el (fichero, stdin, una sustitucion, cortada, o una variable fuera de una consulta de lectura) se
+# deniega. Una variable dentro de `{...}` o `query ...` (el numero de una issue en un bucle) pasa.
+CASES=(
+  'deny|gh api graphql -F query=@q.graphql'
+  'deny|gh api graphql --field query=@q.graphql'
+  'deny|gh api graphql -Fquery=@q.graphql'
+  'deny|gh api graphql --field=query=@q.graphql'
+  'deny|gh api -X POST graphql -F query=@q.graphql'
+  'deny|gh api graphql --input body.json'
+  'deny|gh api graphql -f query="$(cat q.graphql)"'
+  'deny|gh api graphql -f query=`cat q.graphql`'
+  'deny|gh api graphql -f query="$Q"'
+  'deny|gh api graphql -f query=${Q}'
+  'deny|gh api graphql -f query='
+  "deny|bash -c 'gh api graphql -f query=\"\$(cat q.graphql)\"'"
+  "deny|gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {pullRequestId: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { enqueuePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { mergeBranch(input: {repositoryId: \"x\", base: \"main\", head: \"f\"}) { clientMutationId } }'"
+  "allow|gh api graphql -f query='query { viewer { login } }'"
+  "allow|gh api graphql -f query='query(\$o: String!) { repository(owner: \$o, name: \"r\") { id } }' -F o=owner"
+  "allow|gh api graphql -F body=@notes.md -f query='mutation(\$b: String!) { addComment(input: {subjectId: \"x\", body: \$b}) { clientMutationId } }'"
+  'allow|gh api graphql -f query="query { repository(owner: \"$OWNER\", name: \"r\") { id } }"'
+  'allow|for n in 1 2; do gh api graphql -f query="{repository(owner:\"o\",name:\"r\"){issue(number:$n){title}}}" --jq .data; done'
+  'deny|gh api graphql -f query="{issue(id:$(cat id.txt)){title}}"'
+  "deny|bash -c 'gh api graphql -f query=\"{issue(id:\$(cat id.txt)){title}}\"'"
+  'deny|gh api graphql -f query="mutation { addComment(input: {subjectId: \"$ID\", body: \"x\"}) { clientMutationId } }"'
+  "deny|gh api graphql -f query='{ viewer { login }'"
+  "deny|gh api graphql -f query=\"mutation { merge\${X}PullRequest(input: {}) { clientMutationId } }\""
+  "allow|gh api graphql -f query='query(\$o: String!) { repository(owner: \$o, name: \"r\") { id } }' -F o=\"\$OWNER\""
+  'allow|gh api graphql -f query="query(\$o: String!) { repository(owner: \$o, name: \"r\") { id } }" -F o=owner'
+  "allow|gh api graphql --paginate -f query='query { viewer { login } }' --jq .data"
+  "allow|gh api -H 'Accept: x' graphql -f query='query { viewer { login } }'"
+  'allow|gh api graphql -f query=@literal-text-not-a-file'
+  'allow|gh api repos/owner/repo/pulls --input body.json'
+  'allow|gh api -X GET repos/owner/repo/pulls'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+run_case deny  $'gh api graphql -F query=@- <<\'EOF\'\nmutation { x }\nEOF\n'
+
+# --- 5. Una etiqueta vacia no es una etiqueta ---------------------------------------------------
+CASES=(
+  'deny|gh pr create --label "" --title t --body b'
+  "deny|gh pr create -l '' --title t --body b"
+  'deny|gh pr create --label= --title t --body b'
+  'deny|gh pr create --label " , " --title t --body b'
+  'deny|gh pr create --title t --body b --label'
+  'deny|gh pr create -dl "" --title t --body b'
+  'allow|gh pr create --label "" --label semver:patch --title t --body b'
+  'allow|gh pr create --label "$L" --title t --body b'
+  'allow|gh pr create -l semver:none --title t --body b'
+  'allow|gh pr create -dl semver:none --title t --body b'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 6. Una tarea, un worktree (politica: one_worktree_per_task) ---------------------------------
+# Repos de verdad: el propio (el que vendoriza el guard), un worktree enlazado suyo, un repo
+# vecino, uno dentro del propio y un clon en otro sitio. La sesion esta donde dice `cwd`.
+WTL="$TMP/wt-lab"
+WT_P="$WTL/proyectos"
+WT_S="$WT_P/propio"
+WT_W="$WT_S/.claude/worktrees/tarea"
+wt_git() { git_h "$@" >/dev/null 2>&1; }
+wt_repo() { wt_git init "$1" && echo x > "$1/README.md" && wt_git -C "$1" add README.md && wt_git -C "$1" commit -m init && wt_git -C "$1" branch feature; }
+mkdir -p "$WT_P" "$WTL/scratch"
+wt_repo "$WT_S"; wt_repo "$WT_S/sub/prod"; wt_repo "$WT_P/otro"
+wt_git -C "$WT_S" worktree add -b tarea "$WT_W"
+wt_git clone "$WT_S" "$WTL/scratch/clon"
+WT_S="$(cd "$WT_S" && pwd -P)"; WT_W="$(cd "$WT_W" && pwd -P)"; WT_P="$(cd "$WT_P" && pwd -P)"; WTL="$(cd "$WTL" && pwd -P)"
+POL_WT="$TMP/one-worktree.json"
+cat > "$POL_WT" <<'JSON'
+{ "agent_may_merge": false, "protected_branch": "main", "integration_branch": "develop", "one_worktree_per_task": true }
+JSON
+
+# input_with <tool> <tool_input JSON> <cwd>: the hook input, with the session's directory.
+input_with() {
+  node -e '
+    process.stdout.write(JSON.stringify({
+      session_id: "test-session", hook_event_name: "PreToolUse", cwd: process.argv[3],
+      tool_name: process.argv[1], tool_input: JSON.parse(process.argv[2]),
+    }));
+  ' "$1" "$2" "$3"
+}
+bash_input() { node -e 'process.stdout.write(JSON.stringify({ command: process.argv[1] }))' "$1"; }
+
+# wt_case <allow|deny> <session cwd> <command> [policy]: the guard protects the repository WT_S.
+wt_case() {
+  local expected="$1" cwd="$2" cmd="$3" pol="${4:-$POL_WT}" out rc want
+  total=$((total + 1))
+  out="$(input_with Bash "$(bash_input "$cmd")" "$cwd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR BASH_GUARD_BRANCH=feature/999-pr-branch \
+    BASH_GUARD_POLICY="$pol" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$WT_W" \
+    PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected=%s (exit %d), got exit %d  [cwd=%s]  ::  %s\n' "$expected" "$want" "$rc" "$cwd" "$cmd"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+wt_case deny  "$WT_S" 'git checkout feature'
+wt_case deny  "$WT_S" 'git switch feature'
+wt_case deny  "$WT_S" 'git checkout -b nueva'
+wt_case deny  "$WT_S" 'git switch -c nueva'
+wt_case deny  "$WT_S" 'git switch -'
+wt_case deny  "$WT_S" 'git checkout --detach'
+wt_case deny  "$WT_S" 'git fetch && git checkout feature'
+wt_case deny  "$WT_S" 'GIT_TRACE=1 git checkout feature'
+wt_case deny  "$WT_S" 'sudo -u builder git checkout feature'
+wt_case deny  "$WT_S/sub" 'git -C .. checkout feature'
+wt_case deny  "$WT_W" "cd $WT_S && git checkout feature"
+wt_case deny  "$WT_W" "(cd $WT_S && git checkout feature)"
+wt_case deny  "$WT_W" "git -C $WT_S switch feature"
+wt_case deny  "$WT_W" 'git -C ../../.. checkout feature'
+wt_case deny  "$WT_W" "git -C $WT_S/sub/prod checkout feature"
+wt_case deny  "$WT_W" "cd $WT_P/otro && git switch feature"
+wt_case allow "$WT_S" 'git checkout -- README.md'
+wt_case allow "$WT_S" 'git checkout HEAD -- README.md'
+wt_case allow "$WT_S" 'git checkout README.md'
+wt_case allow "$WT_S" 'git checkout -p'
+wt_case allow "$WT_S" 'git checkout --help'
+wt_case allow "$WT_S" 'git switch -h'
+wt_case allow "$WT_S" 'git worktree add .claude/worktrees/x -b x origin/develop'
+wt_case allow "$WT_S" 'git status && git fetch origin'
+wt_case allow "$WT_W" 'git switch feature'
+wt_case allow "$WT_W" 'git checkout -b otra'
+wt_case allow "$WT_S" "cd $WT_W && git checkout -b otra"
+wt_case allow "$WT_W" "cd $WTL/scratch/clon && git checkout feature"
+wt_case allow "$WT_W" "cd $WTL && git checkout feature"
+# `cd -` vuelve al directorio de antes y `popd` al que dejo el ultimo `pushd`: la orden corre ahi.
+wt_case deny  "$WT_S" "cd $WT_W && cd - && git switch feature"
+wt_case deny  "$WT_S" "pushd $WT_W && popd && git switch feature"
+wt_case deny  "$WT_W" "cd $WTL && cd $WT_S && cd $WTL && cd - && git checkout feature"
+wt_case allow "$WT_S" "cd $WT_W && cd - && cd - && git switch feature"
+wt_case allow "$WT_S" "pushd $WTL && pushd $WT_W && popd && popd && cd $WT_W && git switch feature"
+# Sin la clave (o en false) no hay regla: un repo la activa en su politica.
+wt_case allow "$WT_S" 'git checkout feature' "$POL_PRISMA"
+wt_case allow "$WT_S" 'git switch -c nueva' "$POL_PRISMA"
+
+# --- 7. Rutas que ninguna sesion toca (politica: forbidden_paths) ------------------------------
+# Un home de pega con la carpeta vetada, una con nombre parecido y un enlace a la vetada.
+FH="$TMP/home-falso"
+mkdir -p "$FH/privado" "$FH/privados" "$FH/proyectos/repo"
+echo s > "$FH/privado/notas.md"
+ln -s "$FH/privado" "$FH/proyectos/repo/atajo"
+FH="$(cd "$FH" && pwd -P)"
+FREPO="$FH/proyectos/repo"
+POL_FP="$TMP/forbidden.json"
+cat > "$POL_FP" <<'JSON'
+{ "agent_may_merge": false, "protected_branch": "main", "forbidden_paths": ["~/privado"] }
+JSON
+
+# fp_case <allow|deny> <tool> <tool_input JSON> [cwd] [policy]
+fp_case() {
+  local expected="$1" tool="$2" ti="$3" cwd="${4:-$FREPO}" pol="${5:-$POL_FP}" out rc want
+  total=$((total + 1))
+  out="$(input_with "$tool" "$ti" "$cwd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+    BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$pol" \
+    BASH_GUARD_HOME="$FH" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
+    PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected=%s (exit %d), got exit %d  [%s cwd=%s]  ::  %s\n' "$expected" "$want" "$rc" "$tool" "$cwd" "$ti"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+fpath() { node -e 'process.stdout.write(JSON.stringify({ file_path: process.argv[1] }))' "$1"; }
+# shellcheck disable=SC2016 # the `$HOME` spellings must reach the guard literally
+{
+  fp_case deny  Bash "$(bash_input 'cat ~/privado/notas.md')"
+  fp_case deny  Bash "$(bash_input 'ls $HOME/privado')"
+  fp_case deny  Bash "$(bash_input 'ls ${HOME}/privado/')"
+  fp_case deny  Bash "$(bash_input "cat $FH/privado/notas.md")"
+  fp_case deny  Bash "$(bash_input 'sudo -u x tar czf /tmp/x.tgz ~/privado')"
+  fp_case deny  Bash "$(bash_input 'cat ~/"privado"/notas.md')"
+  fp_case deny  Bash "$(bash_input $'cat > notas.md <<\'EOF\'\nver ~/privado/notas.md\nEOF\n')"
+  fp_case deny  Bash "$(bash_input 'ls')" "$FH/privado"
+  fp_case allow Bash "$(bash_input 'ls ~/privados')"
+  fp_case allow Bash "$(bash_input 'grep -rn privado docs/')"
+  fp_case allow Bash "$(bash_input 'echo docs/privado/x')"
+  fp_case allow Bash "$(bash_input 'git status')"
+}
+# A long command naming the path on its first line only.
+FP_LONG='cat ~/privado/notas.md'
+for fp_i in $(seq 1 400); do FP_LONG+=$'\n'"echo linea-$fp_i"; done
+fp_case deny  Bash "$(bash_input "$FP_LONG")"
+fp_case deny  Read "$(fpath "$FH/privado/notas.md")"
+# shellcheck disable=SC2088 # the literal tilde is the input under test
+fp_case deny  Read "$(fpath '~/privado/notas.md')"
+fp_case deny  Read "$(fpath '../../privado/notas.md')"
+fp_case deny  Read "$(fpath 'atajo/notas.md')"
+fp_case deny  Write "$(node -e 'process.stdout.write(JSON.stringify({ file_path: process.argv[1], content: "x" }))' "$FH/privado/n.md")"
+fp_case deny  Edit "$(node -e 'process.stdout.write(JSON.stringify({ file_path: process.argv[1], old_string: "a", new_string: "b" }))' "$FH/privado/notas.md")"
+fp_case deny  NotebookEdit "$(node -e 'process.stdout.write(JSON.stringify({ notebook_path: process.argv[1] }))' "$FH/privado/n.ipynb")"
+fp_case deny  Grep "$(node -e 'process.stdout.write(JSON.stringify({ pattern: "x", path: process.argv[1] }))' "$FH/privado")"
+fp_case deny  Glob "$(node -e 'process.stdout.write(JSON.stringify({ pattern: process.argv[1] + "/**/*.md" }))' "$FH/privado")"
+fp_case deny  Read "$(fpath "$FREPO/README.md")" "$FH/privado"
+fp_case allow Read "$(fpath "$FH/privados/x")"
+fp_case allow Read "$(fpath "$FREPO/README.md")"
+fp_case allow Grep "$(node -e 'process.stdout.write(JSON.stringify({ pattern: "privado", path: process.argv[1] }))' "$FREPO")"
+fp_case allow Glob '{"pattern":"**/*.md"}'
+fp_case allow WebFetch '{"url":"https://example.com"}'
+# Sin la clave no hay regla.
+fp_case allow Read "$(fpath "$FH/privado/notas.md")" "$FREPO" "$POL_PRISMA"
+fp_case allow Bash "$(bash_input 'cat ~/privado/notas.md')" "$FREPO" "$POL_PRISMA"
+
+# ============================================================================
+# GROUP 12 — EL MERGE ES COSA DE GITHUB ACTIONS Y `revision-humana` SOLO LA QUITA UN HUMANO.
+# merge-when-green mergea desde un job de Actions con el token de una App; una sesion lee su
+# decision y, si su politica deja mergear al agente, mergea con `gh pr merge`. En sesion, sea cual
+# sea la politica: nada de
+# `gh pr merge --admin`, nada de `pr-merge.sh merge`, nada de dar valor a GITHUB_ACTIONS o
+# MWG_WRITE_TOKEN_KIND, y `revision-humana` no se quita. Cada regla lleva al lado su uso legitimo:
+# el merge normal, `decide`, leer la variable, poner la etiqueta, leerla y quitar cualquier otra.
+# La politica es la de producto (el agente PUEDE mergear a develop): lo que se deniega aqui no lo
+# deniega la regla de merge de siempre.
+# ============================================================================
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE="develop"; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+TEST_OWN_REPO="owner/the-session-repo"
+
+# --- 1. gh pr merge --admin: mergea por encima de la proteccion y de los checks obligatorios ------
+CASES=(
+  'deny|gh pr merge 123 --admin --squash'
+  'deny|gh pr merge --admin 123 --squash'
+  'deny|gh pr merge 123 --squash --admin=true'
+  'deny|gh pr merge 123 --squash --admin=1'
+  'deny|gh pr merge 123 --squash --admin=$ADMIN'
+  'deny|gh pr merge 123 --squash --delete-branch --body "$(cat b.md)" --admin'
+  'deny|timeout 60 gh pr merge 123 --admin'
+  "deny|bash -c 'gh pr merge 123 --squash --admin'"
+  'deny|eval gh pr merge 123 --squash --admin'
+  # Un alias de gh corre su expansion mas tarde, sin que el guard la vea: se juzga al definirlo, y
+  # --admin no lo tiene ningun otro comando de gh, asi que tambien cuenta tras un alias (`gh pm`).
+  "deny|gh alias set pm 'pr merge --admin'"
+  "deny|gh alias set --shell pm 'gh pr merge \"\$1\" --admin'"
+  "deny|gh alias set pm '!gh pr merge \"\$1\" --squash --admin'"
+  'deny|gh pm 123 --admin'
+  # Una expansion que llega por stdin o que rellena el shell no se puede juzgar al definirla, y
+  # `gh alias import` define alias desde un fichero o stdin: se deniegan.
+  'deny|gh alias set pm -'
+  "deny|echo 'pr merge --admin' | gh alias set pm -"
+  'deny|gh alias set pm "pr merge $X"'
+  'deny|gh alias import aliases.yml'
+  # La expansion de llaves hace varias palabras de una: cada una cuenta.
+  'deny|gh pr merge 5 --squash --{admin,delete-branch}'
+  'deny|gh pr merge 5 {--admin,--squash}'
+  'deny|gh pr merge 5 --squash --{admin=true,delete-branch}'
+  # La API de merge, con la ruta como la enruta GitHub (query y fragmento fuera) y sin comillas.
+  "deny|gh api -X PUT 'repos/owner/name/pulls/5/merge?x=1'"
+  'deny|gh api -X PUT "repos/owner/name/pulls/5/me"rge'
+  "deny|gh api -X POST 'repos/owner/name/merges?x' -f base=develop -f head=x"
+  "deny|gh api graphql -f query='mutation { mergePull''Request(input: {}) { clientMutationId } }'"
+  # El merge normal sigue pasando: solo sobra --admin.
+  'allow|gh pr merge 123 --squash'
+  'allow|gh pr merge 123 --squash --delete-branch'
+  'allow|gh pr merge 123 --squash --admin=false'
+  'allow|gh pr merge 123 --repo owner/the-session-repo --squash --body "$(cat b.md)"'
+  # --admin como VALOR de otra opcion no es la opcion.
+  'allow|gh pr merge 123 --subject --admin --squash'
+  # Definir y usar alias sin --admin pasa.
+  "allow|gh alias set pm 'pr merge --squash'"
+  "allow|gh alias set co 'pr checkout'"
+  'allow|gh alias set pv "pr view \$1 --json labels"'
+  'allow|gh pr merge 5 --squash --{delete-branch,auto}'
+  'allow|gh pr merge 5 --squash --subject "{--admin,x}"'
+  'allow|gh alias list'
+  'allow|gh alias delete pm'
+  'allow|gh co 123'
+  # Un script que mergea por dentro sin --admin: la sesion solo ve el script, y pasa.
+  'allow|bash scripts/merge-if-green.sh owner/the-session-repo 123 squash'
+  'allow|scripts/merge-if-green.sh owner/the-session-repo 123'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 2. pr-merge.sh merge: el paso de merge del job, nunca en sesion ------------------------------
+CASES=(
+  'deny|merge-when-green/pr-merge.sh merge --repo owner/name --pr 5 --sha abc'
+  'deny|./pr-merge.sh merge --repo owner/name --pr 5 --sha abc'
+  'deny|"$CI"/merge-when-green/pr-merge.sh merge --repo owner/name --pr 5'
+  'deny|bash merge-when-green/pr-merge.sh merge --repo owner/name --pr 5'
+  'deny|bash -x -o pipefail merge-when-green/pr-merge.sh merge --repo owner/name --pr 5'
+  # Un grupo de opciones que acaba en o toma la palabra siguiente como nombre (`-euo pipefail`).
+  'deny|bash -euo pipefail merge-when-green/pr-merge.sh merge --repo owner/name --pr 5'
+  'deny|sh ./pr-merge.sh merge --repo owner/name'
+  'deny|python3 merge-when-green/pr_merge.py merge --repo owner/name --pr 5'
+  'deny|python3 -u -X dev merge-when-green/pr_merge.py merge --repo owner/name'
+  # Con -m el modulo es el script: pr_merge, desde su directorio o con su paquete delante.
+  'deny|python3 -m pr_merge merge --repo owner/name --pr 5'
+  'deny|python3 -um merge_when_green.pr_merge merge --repo owner/name'
+  'deny|python3 -mpr_merge $SUB'
+  'deny|source merge-when-green/pr-merge.sh merge'
+  'deny|./pr-merge.sh "merge" --repo owner/name'
+  'deny|timeout 600 ./pr-merge.sh merge --repo owner/name'
+  "deny|bash -c './pr-merge.sh merge --repo owner/name'"
+  'deny|eval ./pr-merge.sh merge --repo owner/name'
+  # Un subcomando que rellena el shell puede ser merge.
+  'deny|./pr-merge.sh $SUB --repo owner/name'
+  'deny|./pr-merge.sh "$(echo merge)" --repo owner/name'
+  'deny|echo merge | xargs ./pr-merge.sh'
+  # El script que lee de stdin o de un descriptor es este si la orden lo nombra.
+  'deny|bash -s merge --repo owner/name < merge-when-green/pr-merge.sh'
+  'deny|cat merge-when-green/pr-merge.sh | bash -s merge --repo owner/name'
+  'deny|bash /dev/stdin merge < merge-when-green/pr-merge.sh'
+  'deny|bash <(cat merge-when-green/pr-merge.sh) merge --repo owner/name'
+  'deny|python3 - merge < merge-when-green/pr_merge.py'
+  'deny|S=merge-when-green/pr-merge.sh; bash "$S" merge --repo owner/name'
+  "deny|bash ./pr-merge''.sh merge --repo owner/name"
+  'deny|./pr-merge.sh {merge,x} --repo owner/name'
+  # Leer la decision, barrer en seco, la ayuda, leer el script y su suite: pasan.
+  'allow|merge-when-green/pr-merge.sh decide --repo owner/name --pr 5 --json'
+  'allow|bash merge-when-green/pr-merge.sh decide --repo owner/name --pr 5'
+  'allow|bash -euo pipefail merge-when-green/pr-merge.sh decide --repo owner/name --pr 5'
+  'allow|python3 -m pr_merge decide --repo owner/name --pr 5'
+  'allow|python3 merge-when-green/pr_merge.py --help'
+  'allow|./pr-merge.sh sweep --repo owner/name --mode dry --plan /tmp/plan.json'
+  'allow|echo 5 | xargs ./pr-merge.sh decide --repo owner/name --pr'
+  'allow|cat merge-when-green/pr-merge.sh'
+  'allow|grep -n merge merge-when-green/pr_merge.py'
+  'allow|bash merge-when-green/merge-when-green.test.sh'
+  "allow|bash -c 'grep -n merge pr-merge.sh'"
+  "allow|python3 -c 'import sys; print(sys.argv)' pr_merge.py merge"
+  # Con -c lo que sigue es la orden y su $0: aqui pr-merge.sh corre sin subcomando; y python no
+  # encuentra un modulo llamado pr_merge.py (el de arriba es pr_merge).
+  'allow|bash -c ./pr-merge.sh merge'
+  'allow|python3 -m pr_merge.py merge'
+  # Otro script con un subcomando merge no es este.
+  'allow|bash scripts/sync.sh merge --repo owner/name'
+  'allow|bash -s decide --repo owner/name --pr 5 < merge-when-green/pr-merge.sh'
+  'allow|cat install.sh | bash -s -- merge'
+  'allow|bash "$SCRIPT" merge --repo owner/name'
+  'allow|./pr-merge.sh {decide,merge} --repo owner/name'
+  'allow|python3 tools/pr_tool.py merge'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 3. GITHUB_ACTIONS y MWG_WRITE_TOKEN_KIND: la sesion no les da valor ---------------------------
+CASES=(
+  'deny|GITHUB_ACTIONS=true ./pr-merge.sh decide --repo owner/name --pr 5'
+  'deny|GITHUB_ACTIONS=true MWG_WRITE_TOKEN_KIND=app python3 run.py'
+  'deny|MWG_WRITE_TOKEN_KIND=app bash run.sh'
+  'deny|GITHUB_ACTIONS= pnpm test'
+  'deny|GITHUB_ACTIONS=true'
+  'deny|GITHUB_ACTIONS+=true'
+  'deny|X=1 GITHUB_ACTIONS="t r" run'
+  'deny|export GITHUB_ACTIONS=true'
+  'deny|export MWG_WRITE_TOKEN_KIND=app; ./run.sh'
+  'deny|export GITHUB_ACTIONS'
+  'deny|env GITHUB_ACTIONS=true pnpm test'
+  'deny|env -i PATH=/usr/bin GITHUB_ACTIONS=true pnpm test'
+  'deny|sudo -u builder GITHUB_ACTIONS=true pnpm test'
+  'deny|declare -x GITHUB_ACTIONS=true'
+  'deny|declare -gx MWG_WRITE_TOKEN_KIND'
+  'deny|typeset -x GITHUB_ACTIONS'
+  'deny|readonly GITHUB_ACTIONS=true'
+  'deny|local MWG_WRITE_TOKEN_KIND=app'
+  'deny|let GITHUB_ACTIONS=1'
+  'deny|printf -v GITHUB_ACTIONS %s true'
+  'deny|read -r MWG_WRITE_TOKEN_KIND <<< app'
+  'deny|: "${GITHUB_ACTIONS:=true}"'
+  "deny|bash -c 'GITHUB_ACTIONS=true ./run.sh'"
+  'deny|for i in 1; do GITHUB_ACTIONS=true ./run.sh; done'
+  'deny|eval GITHUB_ACTIONS=true'
+  # Un alias de shell (`!` delante) es una orden de shell: se juzga como tal al definirlo.
+  "deny|gh alias set ci '!GITHUB_ACTIONS=true ./run.sh'"
+  'deny|read -t 5 -p x MWG_WRITE_TOKEN_KIND'
+  # Lo que ven export, declare y env es la palabra sin comillas.
+  'deny|export "GITHUB_ACTIONS"=true'
+  "deny|export GITHUB_ACT''IONS=true"
+  'deny|env "GITHUB_ACTIONS"=true ./run.sh'
+  'deny|declare -x "MWG_WRITE_TOKEN_KIND"=app'
+  'deny|export {GITHUB_ACTIONS,X}=true'
+  'deny|env {GITHUB_ACTIONS,X}=true ./run.sh'
+  'deny|read {GITHUB_ACTIONS,x} <<< "true y"'
+  'deny|printf -v {GITHUB_ACTIONS,x} true'
+  # Una referencia por nombre (-n) a una de las dos la pone con otro nombre.
+  'deny|declare -n r=GITHUB_ACTIONS'
+  'deny|local -n r="MWG_WRITE_TOKEN_KIND"'
+  # Leerla, comprobarla, buscarla, quitarla y cualquier otra variable: pasan.
+  'allow|echo "$GITHUB_ACTIONS"'
+  'allow|[ "${GITHUB_ACTIONS:-}" = true ] && echo ci'
+  'allow|grep -rn GITHUB_ACTIONS merge-when-green/'
+  'allow|grep -n "GITHUB_ACTIONS\|MWG_WRITE_TOKEN_KIND" merge-when-green/pr_merge.py'
+  'allow|env -u GITHUB_ACTIONS bash run.sh'
+  'allow|unset GITHUB_ACTIONS MWG_WRITE_TOKEN_KIND'
+  'allow|export -n GITHUB_ACTIONS'
+  'allow|declare -p GITHUB_ACTIONS'
+  'allow|CI=true GH_REPO=owner/name pnpm test'
+  'allow|export GH_REPO=owner/name'
+  'allow|export "FOO"=bar'
+  'allow|export {FOO,BAR}=1'
+  'allow|declare -n ref=OTHER_VAR'
+  'allow|local -n list=GITHUB_ACTIONS_LIST'
+  'allow|IFS= read -r line'
+  # Lo que lee read de un here-string, o el texto de su -p, es dato, no el nombre.
+  'allow|read -r line <<< "GITHUB_ACTIONS"'
+  'allow|read -p GITHUB_ACTIONS line'
+  "allow|python3 -c \"import os; env=dict(os.environ, GITHUB_ACTIONS='true')\""
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 4. revision-humana no se quita: ni con gh, ni por la API ---------------------------------------
+CASES=(
+  'deny|gh pr edit 5 --remove-label revision-humana'
+  'deny|gh pr edit 5 --repo owner/name --remove-label=revision-humana'
+  'deny|gh pr edit 5 --remove-label "semver:patch,revision-humana"'
+  'deny|gh pr edit 5 --remove-label semver:patch --remove-label Revision-Humana'
+  "deny|gh pr edit 5 --remove-label '\"revision-humana\"'"
+  'deny|gh pr edit 5 --body-file /tmp/b.md --remove-label revision-humana'
+  'deny|gh pr edit 5 --body "$(cat b.md)" --remove-label revision-humana'
+  'deny|gh pr --remove-label revision-humana edit 5'
+  'deny|gh issue edit 7 --remove-label revision-humana'
+  'deny|sudo -u builder gh pr edit 5 --remove-label revision-humana'
+  # Una etiqueta que rellena el shell puede ser revision-humana.
+  'deny|gh pr edit 5 --remove-label "$L"'
+  'deny|gh pr edit 5 --remove-label "semver:$X"'
+  'deny|gh pr edit 5 --remove-label={revision-humana,x}'
+  'deny|gh pr edit 5 --remove-label {revision,x}-humana'
+  'deny|gh pr edit 5 --{remove-label=revision-humana,title=x}'
+  'deny|echo revision-humana | xargs gh pr edit 5 --remove-label'
+  # La etiqueta misma.
+  'deny|gh label delete revision-humana --yes'
+  'deny|gh label edit revision-humana --name otra'
+  'deny|gh label edit -d "x" REVISION-HUMANA'
+  # REST: quitar una, quitarlas todas, sustituirlas, borrar o renombrar la etiqueta.
+  'deny|gh api -X DELETE repos/owner/name/issues/5/labels/revision-humana'
+  'deny|gh api --method DELETE /repos/owner/name/issues/5/labels/revision-humana'
+  'deny|gh api -XDELETE https://api.github.com/repos/owner/name/issues/5/labels/revision%2Dhumana'
+  'deny|gh api --method=delete repos/{owner}/{repo}/issues/5/labels/Revision-Humana'
+  'deny|gh api -X DELETE repos/owner/name/issues/5/labels/x/../revision-humana'
+  'deny|gh api -X DELETE "repos/owner/name/issues/5/labels/$L"'
+  'deny|gh api -X "$M" repos/owner/name/issues/5/labels/revision-humana'
+  'deny|gh api -X DELETE repos/owner/name/issues/5/labels'
+  "deny|gh api -X PUT repos/owner/name/issues/5/labels -f 'labels[]=semver:patch'"
+  "deny|gh api -X PATCH repos/owner/name/issues/5 -f 'labels[]=semver:patch'"
+  # GitHub toma POST por PATCH en la issue y en la etiqueta (medido 01-10), y gh manda POST si hay
+  # campos y no hay -X.
+  "deny|gh api -X POST repos/owner/name/issues/5 -f 'labels[]=semver:patch'"
+  "deny|gh api repos/owner/name/issues/5 -f 'labels[]=semver:patch'"
+  'deny|gh api repos/owner/name/labels/revision-humana -f new_name=otra'
+  # Un cuerpo por --input que se ve en la orden y nombra labels.
+  "deny|echo '{\"labels\":[]}' | gh api -X PATCH repos/owner/name/issues/5 --input -"
+  'deny|gh api -X DELETE repos/owner/name/labels/revision-humana'
+  'deny|gh api -X PATCH repos/owner/name/labels/revision-humana -f new_name=otra'
+  # GraphQL: las mutaciones nombran las etiquetas por id; no se sabe cual es.
+  "deny|gh api graphql -f query='mutation { removeLabelsFromLabelable(input: {labelableId: \"x\", labelIds: [\"y\"]}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { clearLabelsFromLabelable(input: {labelableId: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { updatePullRequest(input: {pullRequestId: \"x\", labelIds: []}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { deleteLabel(input: {id: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { removeLabels''FromLabelable(input: {labelableId: \"x\", labelIds: [\"y\"]}) { clientMutationId } }'"
+  "deny|gh api /graphql -f query='mutation { deleteLabel(input: {id: \"x\"}) { clientMutationId } }'"
+  "deny|gh api https://ghe.example.com/api/graphql -f query='mutation { deleteLabel(input: {id: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { updatePullRequest(input: {pullRequestId: \"x\", label''Ids: []}) { clientMutationId } }'"
+  "deny|gh api \"\$EP\" -f query='mutation { deleteLabel(input: {id: \"x\"}) { clientMutationId } }'"
+  # labelIds antes de la mutacion que lo usa.
+  "deny|gh api graphql -F input[labelIds][]= -F input[pullRequestId]=x -f query='mutation(\$input: UpdatePullRequestInput!){updatePullRequest(input:\$input){clientMutationId}}'"
+  # Por un alias, o por eval.
+  "deny|gh alias set rl 'pr edit --remove-label'"
+  "deny|gh alias set rl 'issue edit \$1 --remove-label revision-humana'"
+  'deny|gh rl 5 --remove-label revision-humana'
+  'deny|eval gh pr edit 5 --remove-label revision-humana'
+  # Ponerla, leerla, filtrar por ella y quitar cualquier otra: pasan.
+  'allow|gh pr edit 5 --add-label revision-humana'
+  'allow|gh pr edit 5 --remove-label semver:minor --add-label semver:patch'
+  'allow|gh issue edit 7 --remove-label "decisión socios"'
+  'allow|gh pr edit 5 --remove-label revision-humanas'
+  'allow|gh pr edit 5 --remove-label={semver:patch,riesgo:2}'
+  'allow|gh pr edit 5 --title "--remove-label revision-humana" --add-label semver:none'
+  "allow|gh pr view 5 --json labels --jq '.labels[].name'"
+  'allow|gh pr list --label revision-humana'
+  'allow|gh search prs --owner owner --label revision-humana --state open'
+  'allow|gh label list --search revision'
+  'allow|gh label create revision-humana --color B60205 --description "Un humano debe leerla"'
+  'allow|gh label delete riesgo:9 --yes'
+  'allow|gh label edit semver:none --description x'
+  'allow|gh api repos/owner/name/issues/5/labels'
+  'allow|gh api repos/owner/name/labels/revision-humana --jq .name'
+  "allow|gh api repos/owner/name/labels --paginate --jq '.[].name'"
+  "allow|gh api -X POST repos/owner/name/issues/5/labels -f 'labels[]=revision-humana'"
+  'allow|gh api -X DELETE repos/owner/name/issues/5/labels/semver:patch'
+  'allow|gh api -X DELETE repos/owner/name/issues/5/labels/semver%3Apatch'
+  'allow|gh api -X DELETE repos/owner/name/labels/riesgo:9'
+  'allow|gh api -X PATCH repos/owner/name/issues/5 -f title=x'
+  'allow|gh api repos/owner/name/issues/5 -f state=closed'
+  'allow|gh api -X PATCH repos/owner/name/issues/531 -F milestone=null'
+  'allow|gh api -X PATCH repos/owner/name/issues/comments/123 -f body=x'
+  "allow|echo '{\"milestone\":null}' | gh api -X PATCH repos/owner/name/issues/531 --input -"
+  "allow|gh api graphql -f query='mutation { addLabelsToLabelable(input: {labelableId: \"x\", labelIds: [\"y\"]}) { clientMutationId } }'"
+  # Una mutacion solo viaja a GraphQL: nombrarla en otra orden no cuenta.
+  'allow|grep -rn deleteLabel src/ && gh api repos/owner/name/pulls/5'
+  "allow|gh api graphql -f query='query { repository(owner: \"o\", name: \"n\") { label(name: \"revision-humana\") { id } } }'"
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# El cuerpo en un heredoc: el guard no lo lee como orden, pero si ve que nombra labels.
+run_case deny $'gh api -X PATCH repos/owner/name/issues/5 --input - <<\'EOF\'\n{"labels": ["semver:patch"]}\nEOF'
+run_case allow $'gh api -X PATCH repos/owner/name/issues/531 --input - <<\'EOF\'\n{"milestone": null}\nEOF'
+run_case deny $'gh alias import - <<\'EOF\'\nrl: pr edit --remove-label revision-humana\nEOF'
+run_case allow $'python3 - merge <<\'PY\'\nimport sys; print(sys.argv)\nPY'
+run_case allow $'grep -n merge merge-when-green/pr-merge.sh; python3 - "$1" <<\'PY\'\nprint(1)\nPY'
+
+# --- 5. Bajo cualquier politica, y con el motivo que dice que hacer --------------------------------
+TEST_POLICY="$POL_PRISMA"; TEST_PR_BASE=""
+run_case deny 'GITHUB_ACTIONS=true ./run.sh'
+run_case deny './pr-merge.sh merge --repo owner/name --pr 5'
+run_case deny 'gh pr edit 5 --remove-label revision-humana'
+run_case allow 'gh pr edit 5 --add-label revision-humana'
+TEST_POLICY="$POL_PRODUCT"
+msg_case 'merge without --admin' 'gh pr merge 123 --admin --squash'
+msg_case 'decide --repo' './pr-merge.sh merge --repo owner/name --pr 5'
+msg_case 'write the subcommand' './pr-merge.sh $SUB'
+msg_case 'env -u GITHUB_ACTIONS' 'export GITHUB_ACTIONS=true'
+msg_case 'only a human takes it off' 'gh pr edit 5 --remove-label revision-humana'
+msg_case 'cannot read' 'gh pr edit 5 --remove-label "$L"'
+msg_case 'only a human takes it off' 'gh api -X DELETE repos/owner/name/issues/5/labels/revision-humana'
+
+# ============================================================================
+# GROUP 13 — LA PALABRA DE ORDEN COMO LA LEE EL SHELL, Y LAS RAMAS LARGAS POR LA API.
+# La palabra de orden se juzga como la lee el shell: sin comillas ni barras, con las llaves
+# expandidas y, si es un parametro, con el valor que le da la propia orden. Lo que no se puede leer
+# se juzga como lo que puede ser (nada, git, gh o un lector). find -exec, parallel y ssh ejecutan la
+# orden que llevan detras: se juzga esa orden. Y borrar o mover una rama de larga vida con gh api
+# es lo mismo que hacerlo con git push. Cada regla lleva al lado el uso real que sigue pasando.
+# ============================================================================
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+TEST_OWN_REPO="owner/the-session-repo"
+
+# --- 1. Comillas, barras y llaves en la palabra de orden ---------------------------------------
+CASES=(
+  'deny|\git push origin main'
+  'deny|\gh pr merge 5 --admin'
+  "deny|g''h pr merge 5 --admin"
+  'deny|gi""t push --force origin feature/x'
+  'deny|"g"it push --force origin feature/x'
+  "deny|'git' push --force origin feature/x"
+  'deny|/usr/bin/\git push origin main'
+  'deny|\sudo -u builder git push origin main'
+  "deny|s''udo -u builder gh pr merge 5 --admin"
+  'deny|\cat .env'
+  "deny|c''at .env"
+  'deny|{gh,pr} merge 5 --admin'
+  'deny|{g..g}h pr merge 5 --admin'
+  'deny|{,} git push origin main'
+  'deny|{git,push} --force origin feature/x'
+  'deny|\cd /tmp && \gh pr merge 5 --admin'
+  'allow|\git status'
+  'allow|\gh pr view 5'
+  "allow|g''h pr view 5"
+  'allow|"git" push origin HEAD'
+  'allow|\git push origin HEAD'
+  'allow|{gh,} pr view 5'
+  'allow|\ls -la'
+  # Una palabra vacia entre comillas no es un programa: el shell no encuentra nada que ejecutar.
+  'allow|"" git push origin main'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# Unas llaves con mas palabras de las que el guard lee no se juzgan a ciegas.
+run_case deny "{$(printf 'x%d,' $(seq 1 70))gh} pr merge 5 --admin"
+run_case deny $'bash <<\'EOF\'\n\\gh pr merge 5 --admin\nEOF'
+
+# --- 2. Un parametro o una sustitucion como palabra de orden -------------------------------------
+# Con un valor literal en la misma orden, se juzga cada valor que le da. Sin el, se juzga lo que
+# puede ser: nada (o un envoltorio), git, gh o un lector.
+CASES=(
+  'deny|G=gh; $G pr merge 5 --admin'
+  'deny|G=gh; ${G} pr merge 5 --admin'
+  'deny|G=gh; "$G" pr merge 5 --admin'
+  'deny|G=gh && "${G}" pr merge 5 --admin'
+  'deny|export G="git -C /tmp"; $G push --force origin feature/x'
+  'deny|local G=git; $G push origin main'
+  'deny|for G in git gh; do $G push origin main; done'
+  'deny|G=gh; G=git; $G push origin main'
+  'deny|C=cat; $C .env'
+  'deny|$G pr merge 5 --admin'
+  'deny|$G push origin main'
+  'deny|"$@" pr merge 5 --admin'
+  'deny|$1 commit --no-verify -m wip'
+  'deny|${G:-gh} pr merge 5 --admin'
+  "deny|\$'\\x67h' pr merge 5 --admin"
+  'deny|$(command -v gh) pr merge 5 --admin'
+  'deny|`command -v gh` pr merge 5 --admin'
+  'deny|G=$(command -v gh); $G pr merge 5 --admin'
+  'deny|read -r G <<<gh; $G pr merge 5 --admin'
+  'deny|$X git push origin main'
+  'deny|$X cat .env'
+  'deny|$X .env'
+  'deny|./$d push --force origin feature/x'
+  'allow|G=gh; $G pr view 5'
+  'allow|G="git -C /tmp"; $G status'
+  'allow|P="npx -y prettier --print-width 100"; $P --write docs/x.md'
+  'allow|OS=/tmp/node_modules/.bin/openspec; $OS validate x --strict'
+  'allow|for s in dash busybox; do $s -c true; done'
+  'allow|run() { "$@" >/dev/null 2>&1 || true; }; run pnpm test'
+  'allow|S="python3 $R/tool.py"; $S "$1"'
+  'allow|$G show origin/develop:README.md'
+  'allow|$EDITOR notes.md'
+  'allow|"$W/scripts/run.sh" push origin main'
+  'allow|$(git rev-parse --show-toplevel)/scripts/check.sh --strict'
+  'allow|B=$(ls node_modules/.bin/openspec); timeout 300 $B validate --changes --strict'
+  # Un trozo entre comillas puede ser datos: su palabra de orden se sigue leyendo tal cual.
+  'allow|echo "$f merged into main"'
+  "allow|grep -nE 'pr-merge\\.sh merge|--admin' plugins/x.sh"
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+msg_case "'\$G' is 'gh' in this command" 'G=gh; $G pr merge 5 --admin'
+msg_case 'filled in by the shell' '$(command -v gh) pr merge 5 --admin'
+msg_case 'give the name a literal value' '$G pr merge 5 --admin'
+
+# --- 3. find -exec, parallel y ssh: la orden que ejecutan ----------------------------------------
+CASES=(
+  'deny|find . -maxdepth 0 -exec gh pr merge 5 --admin \;'
+  "deny|find . -exec git push origin main ';'"
+  'deny|find . -name x -execdir git push --force origin feature/x {} +'
+  'deny|find . -name x -ok gh pr merge 5 --admin \;'
+  'deny|find . -name x -okdir cat .env \;'
+  'deny|find . -name x -print -exec true \; -exec git push origin main \;'
+  'deny|sudo find / -name x -exec \gh pr merge 5 --admin \;'
+  'allow|find . -name own-security-phrases.txt -exec cat {} \;'
+  "allow|find . -name '*.md' -exec cat {} + | wc -l"
+  'allow|find . -type f -exec grep -l TODO {} +'
+  "allow|find /tmp -name '*.log' -delete"
+  'allow|find . -name x -exec git status \;'
+  'deny|parallel git push origin ::: main'
+  'deny|parallel -j 4 gh pr merge --admin ::: 5 6'
+  'deny|echo 5 | parallel gh pr merge --admin'
+  'deny|cat cmds.txt | parallel'
+  'deny|parallel -j4 < cmds.txt'
+  'deny|parallel :::: cmds.txt'
+  'deny|parallel ::: "gh pr merge 5 --admin"'
+  'allow|parallel gzip ::: a.log b.log'
+  'allow|parallel git push origin ::: feature/a feature/b'
+  'allow|parallel --version'
+  "allow|parallel -j2 'echo {}' ::: a b"
+  'allow|grep -nE "cpu|parallel|cores" warn.log'
+  'deny|ssh host git push origin main'
+  'deny|ssh -p 2222 -o BatchMode=yes deploy@host gh pr merge 5 --admin'
+  'deny|ssh host cat /srv/app/.env'
+  'deny|timeout 15 ssh -o ConnectTimeout=8 host \git push --force origin feature/x'
+  'deny|ssh host -o BatchMode=yes -p 2222 git push origin main'
+  "deny|ssh host 'git push --force origin feature/x'"
+  'allow|ssh -o BatchMode=yes host docker ps'
+  'allow|ssh host hostname'
+  "allow|ssh host 'systemctl status app --no-pager'"
+  'allow|ssh host'
+  'allow|timeout 15 ssh -o ConnectTimeout=8 host cat /etc/hostname'
+  'allow|ssh host -p 2222 uptime'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 4. gh api: borrar o mover una rama de larga vida --------------------------------------------
+# DELETE, PATCH, PUT y POST (el que gh manda cuando hay campos) sobre git/refs/heads/<rama larga>, y
+# las mutaciones GraphQL que borran o mueven refs. Al lado, lo que hacen las limpiezas reales:
+# borrar una rama de trabajo terminada, mover con force la propia y crear una rama o una etiqueta.
+CASES=(
+  'deny|gh api -X DELETE repos/o/r/git/refs/heads/develop'
+  'deny|gh api --method DELETE repos/o/r/git/refs/heads/main'
+  'deny|gh api -X PATCH repos/o/r/git/refs/heads/develop -F force=true -f sha=abc'
+  'deny|gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=abc'
+  'deny|gh api repos/o/r/git/refs/heads/develop -F sha=abc -F force=true'
+  'deny|gh api -X POST repos/o/r/git/refs/heads/develop -f sha=abc -F force=true'
+  'deny|gh api -XDELETE /repos/o/r/git/refs/heads/dev%65lop'
+  'deny|gh api -X "$M" repos/o/r/git/refs/heads/main'
+  'deny|gh api https://api.github.com/repos/o/r/git/refs/heads/develop -X DELETE'
+  'deny|gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/develop'
+  'deny|gh api -X DELETE repos/o/r/git/refs/heads/master'
+  'deny|G=gh; $G api -X DELETE repos/o/r/git/refs/heads/develop'
+  "deny|gh api graphql -f query='mutation { deleteRef(input: {refId: \"R\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { updateRef(input: {refId: \"R\", oid: \"x\", force: true}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { updateRefs(input: {repositoryId: \"x\", refUpdates: [{name: \"refs/heads/develop\", afterOid: \"y\", force: true}]}) { clientMutationId } }'"
+  'allow|gh api repos/o/r/git/refs/heads/develop'
+  'allow|gh api repos/o/r/git/refs/heads/main --jq .object.sha'
+  'allow|gh api -X DELETE repos/o/r/git/refs/heads/feat/x'
+  'allow|gh api -X DELETE repos/o/r/git/refs/heads/$b'
+  "allow|gh api -X PATCH repos/o/r/git/refs/heads/ci/x --input - --jq '.object.sha[0:7]'"
+  'allow|gh api -X PATCH repos/o/r/git/refs/heads/fix/x -F force=true -f sha=abc'
+  'allow|gh api -X POST repos/o/r/git/refs -f ref=refs/heads/chore/x -f sha=abc'
+  'allow|gh api repos/o/r/git/refs -f ref=refs/tags/v1.0.0 -f sha=abc'
+  'allow|gh api -X DELETE repos/o/r/git/refs/tags/v1'
+  'allow|gh api -X DELETE repos/o/r/git/refs/heads/developer'
+  "allow|gh api graphql -f query='query { repository(owner: \"o\", name: \"n\") { ref(qualifiedName: \"refs/heads/develop\") { target { oid } } } }'"
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# Las ramas largas que nombra la politica cuentan tambien.
+TEST_POLICY="$POL_LONG"
+run_case deny  'gh api -X DELETE repos/o/r/git/refs/heads/integ-x'
+run_case deny  'gh api -X PATCH repos/o/r/git/refs/heads/release/stable -F force=true -f sha=abc'
+run_case allow 'gh api -X DELETE repos/o/r/git/refs/heads/release/old'
+TEST_POLICY="$POL_PRODUCT"
+msg_case "long-lived branch 'develop'" 'gh api -X DELETE repos/o/r/git/refs/heads/develop'
+
+# --- 5. Las secuencias entre llaves: {a..b} se expande como en el shell -------------------------
+CASES=(
+  'deny|cat .e{n..n}v'
+  'deny|cat .e{n..n..0}v'
+  'deny|cat .env.{a..c}'
+  'deny|head -5 .{d..f}nv'
+  'deny|cat .e{m..o}v'
+  'deny|export GITHUB_ACTION{S..S}=true'
+  "deny|cat {1..99999999}.env"
+  'allow|cat notes.{1..3}.md'
+  'allow|ls file{01..03}.txt'
+  'allow|cat .env.example{,}'
+  'allow|export X{1..2}=1'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 6. Lo que encontro la verificacion adversarial (2026-10-02) ---------------------------------
+# Un patron en el nombre del programa, el cuerpo de una sustitucion entre comillas dobles, el
+# guion de bash -c / eval / ssh, find con -exec escrito entre comillas, parallel sin orden, los
+# valores que dan set --, eval, declare -n, NAME[i]= y ${NAME:=}, mas capas de las que el guard
+# lee, y tres puertas mas de la API: renombrar la rama, escribir un fichero con contents y
+# createCommitOnBranch. Al lado, el uso real que sigue pasando.
+CASES=(
+  'deny|/usr/bin/gi[t] push origin main'
+  'deny|/usr/bin/g?t push --force origin feature/x'
+  'deny|/usr/bin/g[h] pr merge 5 --admin'
+  'deny|x="$(cd /tmp && \git push --force origin feature/x)"'
+  'deny|echo "$(\git push origin main)"'
+  'deny|x="$(cd /tmp && $G pr merge 5 --admin)"'
+  "deny|bash -c '\\git push origin main'"
+  "deny|sudo -u builder bash -lc 'G=gh; \$G pr merge 5 --admin'"
+  "deny|eval '\\gh pr merge 5 --admin'"
+  "deny|bash --norc -c -- '\\gh pr merge 5 --admin'"
+  "deny|\"\$SHELL\" -c '\\gh pr merge 5 --admin'"
+  'deny|sh -c "\"git\" push --force origin feature/x"'
+  "deny|ssh host 'cd /srv && \\git push --force origin feature/x'"
+  "deny|bash -c 'x=\"\$(cd /tmp && \\git push --force origin feature/x)\"'"
+  'deny|find . \-exec git push origin main \;'
+  "deny|find . -ex''ec gh pr merge 5 --admin \;"
+  'deny|\find . -exec \git push origin main \;'
+  'deny|parallel ::: git\ push\ --force\ origin\ feature/x'
+  "deny|parallel ::: gh ::: 'pr merge 5 --admin'"
+  'deny|set -- git push origin main; "$@"'
+  'deny|G=gh; eval \$G pr merge 5 --admin'
+  'deny|G=echo; eval G=gh; $G pr merge 5 --admin'
+  'deny|H=gh; declare -n G=H; $G pr merge 5 --admin'
+  'deny|G=echo; G[0]=gh; $G pr merge 5 --admin'
+  'deny|G=echo; : ${G:=gh}; $G pr merge 5 --admin'
+  'deny|G=echo; unset G; : ${G=gh}; $G pr merge 5 --admin'
+  'deny|G=g; G+=h; $G pr merge 5 --admin'
+  'deny|for G in curl; do $G https://example.com; done'
+  'deny|eval eval eval \\\\\\\\git push origin main'
+  'deny|gh api -X DELETE repos/o/r/git/refs/heads%2Fdevelop'
+  'deny|gh api -X DELETE repos/o/r/git/refs/heads/d{e..e}velop'
+  'deny|gh api -X POST repos/o/r/branches/develop/rename -f new_name=old-develop'
+  'deny|gh api repos/o/r/branches/main/rename -f new_name=x'
+  'deny|gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA=='
+  'deny|gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA== -f branch=main'
+  'deny|gh api -X DELETE repos/o/r/contents/a.md -f message=x -f sha=abc -f branch=develop'
+  'deny|gh api -X PUT repos/o/r/contents/a.md --input body.json'
+  "deny|gh api graphql -f query='mutation { createCommitOnBranch(input: {branch: {repositoryNameWithOwner: \"o/r\", branchName: \"main\"}}) { clientMutationId } }'"
+  'allow|[ -f x ] && echo y'
+  'allow|ls *.md'
+  'allow|./scripts/run-*.sh --check'
+  'allow|set -- a b; echo "$1"'
+  'allow|set -- gh pr view 5; "$@"'
+  'allow|for t in ls echo; do $t push origin main; done'
+  'allow|x="$(git rev-parse HEAD)"'
+  'allow|x="$(cd /tmp && git status --short)"'
+  "allow|bash -c 'for f in a b; do echo \"\$f\"; done'"
+  'allow|sh -c "echo \"hi\" && ls"'
+  "allow|bash -c 'grep -nE \"pr-merge\\.sh merge|x\" f'"
+  "allow|ssh host 'cat /etc/hostname'"
+  'allow|eval "$(ssh-agent -s)"'
+  "allow|parallel ::: 'echo a' 'echo b'"
+  'allow|gh api -X PUT repos/o/r/contents/a.md -f message=x -f content=eA== -f branch=feat/x'
+  'allow|gh api repos/o/r/contents/a.md --jq .content'
+  "allow|gh api 'repos/o/r/contents/a.md?ref=main'"
+  'allow|gh api -X POST repos/o/r/branches/feat/x/rename -f new_name=feat/y'
+  'allow|gh api repos/o/r/branches/main'
+  # Lo que el replay de las ordenes reales enseno a no denegar: el patron de un brazo de case llega
+  # como segmento propio, un texto entre comillas dentro de una sustitucion es datos, y un nombre
+  # entre comillas con blancos no es una ruta que cortar.
+  'allow|case "$a" in a) echo a;; *) echo other;; esac'
+  'allow|case "$a" in -*) echo flag;; [a-z]*) echo x;; esac'
+  "allow|case \"\$a\" in .* | *[{\\\"\\'\\\\]*) echo keep;; esac"
+  'allow|x="$(jq -nc --arg c "curl https://$h.$d" '"'"'{c:$c}'"'"')"'
+  "allow|x=\"\$(printf '%s' \"curl https://\$h.example\")\""
+  "allow|inp=\"\$(node -e 'process.stdout.write(\"gh pr create --title t --body x --base develop\")')\""
+  "allow|ssh host 'for f in /y/*; do echo \"\$f\"; done; ls /y/*' 2>&1"
+  'allow|\"git\" push origin main'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+msg_case 'is a pattern the shell fills in' '/usr/bin/gi[t] push origin main'
+msg_case 'more layers of quoting' 'eval eval eval \\\\\\\\git push origin main'
+msg_case 'default branch' 'gh api -X PUT repos/o/r/contents/README.md -f message=x -f content=eA=='
+TEST_POLICY="$POL_PRISMA"
+
+# ============================================================================
+# GROUP 14 — LO QUE QUEDO FUERA DE #289/#290: `no-automerge` SOLO LA QUITA UN HUMANO, LA PROTECCION
+# DE RAMA Y LAS RULESETS NO SE TOCAN POR LA API, UN CUERPO --input LEIDO DE FICHERO NO TAPA LA RUTA,
+# Y UN cd DENTRO DE UN SUBSHELL SOLO VALE AHI.
+# merge-when-green salta una PR con `no-automerge`, asi que quitarla la devuelve al merge automatico:
+# va con la misma regla que `revision-humana`. La proteccion de rama y las rulesets son lo que, en
+# GitHub, para lo que el guard no ve: escribir en ellas (borrarlas, rebajarlas o sustituirlas) es
+# cosa del dueño del repo, y la ruta basta, porque el cuerpo puede venir de un fichero que el guard
+# no lee. Y el directorio donde corre un `git push --force-with-lease` es el de la sesion movido por
+# los cd que SIGUEN valiendo en ese punto: uno dentro de `( … )` o de `$( … )` se acaba al cerrar.
+# Cada regla lleva al lado el uso legitimo que sigue pasando.
+# ============================================================================
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE="develop"; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+TEST_OWN_REPO="owner/the-session-repo"
+
+# --- 1. no-automerge no se quita: ni con gh, ni por la API, en ningun orden de opciones -----------
+CASES=(
+  'deny|gh pr edit 5 --remove-label no-automerge'
+  'deny|gh pr edit 5 --repo owner/name --remove-label no-automerge'
+  'deny|gh pr edit 5 -R owner/name --remove-label no-automerge'
+  'deny|gh pr edit --remove-label no-automerge 5 -R owner/name'
+  'deny|gh pr edit 5 --remove-label=no-automerge --repo owner/name'
+  'deny|gh -R owner/name pr edit 5 --remove-label no-automerge'
+  'deny|gh pr -R owner/name edit --remove-label=no-automerge 5'
+  'deny|gh pr edit 5 --remove-label NO-AUTOMERGE'
+  'deny|gh pr edit 5 --remove-label " no-automerge "'
+  'deny|gh pr edit 5 --remove-label "semver:patch,no-automerge"'
+  "deny|gh pr edit 5 --remove-label '\"no-automerge\"'"
+  'deny|gh pr edit 5 --remove-label semver:patch --remove-label no-automerge'
+  'deny|gh pr edit 5 --remove-label={no-automerge,x}'
+  'deny|gh pr edit 5 --remove-label no{-,}automerge'
+  'deny|gh pr edit 5 --body-file b.md --remove-label no-automerge --add-label semver:patch'
+  'deny|gh issue edit 7 --remove-label no-automerge'
+  'deny|gh issue edit 7 -R owner/name --remove-label no-automerge'
+  'deny|echo no-automerge | xargs gh pr edit 5 --remove-label'
+  'deny|eval gh pr edit 5 --remove-label no-automerge'
+  'deny|\gh pr edit 5 --remove-label no-automerge'
+  "deny|gh alias set na 'pr edit --remove-label no-automerge'"
+  'deny|gh label delete no-automerge --yes'
+  'deny|gh label edit no-automerge --name automerge-off'
+  'deny|gh api -X DELETE repos/owner/name/issues/5/labels/no-automerge'
+  'deny|gh api --method DELETE /repos/owner/name/issues/5/labels/No-Automerge'
+  'deny|gh api -X DELETE repos/owner/name/issues/5/labels/no%2Dautomerge'
+  'deny|gh api -X DELETE https://api.github.com/repos/owner/name/issues/5/labels/no-automerge'
+  'deny|gh api repos/owner/name/issues/5/labels/no-automerge -X DELETE'
+  'deny|gh api -X DELETE repos/owner/name/labels/no-automerge'
+  'deny|gh api -X PATCH repos/owner/name/labels/no-automerge -f new_name=automerge-off'
+  'deny|gh api repos/owner/name/labels/no-automerge -f new_name=automerge-off'
+  # Ponerla, leerla, filtrar por ella y quitar cualquier otra: pasan.
+  'allow|gh pr edit 5 --add-label no-automerge'
+  'allow|gh pr edit 5 -R owner/name --add-label no-automerge'
+  'allow|gh pr create --title t --body b --label semver:patch --label no-automerge'
+  'allow|gh pr list --label no-automerge'
+  'allow|gh search prs --owner owner --label no-automerge --state open'
+  "allow|gh pr view 5 --json labels --jq '.labels[].name'"
+  'allow|gh pr edit 5 --remove-label automerge'
+  'allow|gh pr edit 5 --remove-label no-automerge-old'
+  'allow|gh pr edit 5 -R owner/name --remove-label riesgo:2 --add-label riesgo:3'
+  'allow|gh label create no-automerge --color EDEDED --description "merge-when-green la salta"'
+  'allow|gh api repos/owner/name/issues/5/labels'
+  "allow|gh api -X POST repos/owner/name/issues/5/labels -f 'labels[]=no-automerge'"
+  'allow|gh api -X DELETE repos/owner/name/issues/5/labels/riesgo:2'
+  'allow|gh api repos/owner/name/labels/no-automerge --jq .name'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 2. La proteccion de rama y las rulesets: leerlas si, escribirlas no --------------------------
+# Cualquier escritura (DELETE, PUT, PATCH, POST, o un metodo que rellena el shell) en
+# branches/<rama>/protection y sus subrecursos, en las rulesets del repo o de la organizacion, y las
+# mutaciones GraphQL que hacen lo mismo. Leerlas pasa: es lo que hacen las ordenes reales del mes.
+CASES=(
+  'deny|gh api -X DELETE repos/o/r/branches/main/protection'
+  'deny|gh api -X DELETE repos/o/r/branches/develop/protection'
+  'deny|gh api --method DELETE repos/o/r/branches/feat/x/protection'
+  'deny|gh api -X DELETE repos/o/r/branches/develop/protection/required_status_checks'
+  'deny|gh api -X DELETE repos/o/r/branches/develop/protection/required_pull_request_reviews'
+  'deny|gh api -X DELETE repos/o/r/branches/develop/protection/enforce_admins'
+  'deny|gh api -X DELETE repos/o/r/branches/main/protection/required_signatures'
+  'deny|gh api -X DELETE repos/o/r/branches/main/protection/restrictions'
+  "deny|gh api -X DELETE repos/o/r/branches/main/protection/required_status_checks/contexts -f 'contexts[]=tests'"
+  'deny|gh api -X PATCH repos/o/r/branches/develop/protection/required_status_checks -F strict=false'
+  'deny|gh api -X PATCH repos/o/r/branches/develop/protection/required_pull_request_reviews -F required_approving_review_count=0'
+  'deny|gh api -X PUT repos/o/r/branches/main/protection -F enforce_admins=false -F required_status_checks=null -F restrictions=null -F required_pull_request_reviews=null'
+  "deny|gh api -X PUT repos/o/r/branches/develop/protection/required_status_checks/contexts -f 'contexts[]=x'"
+  'deny|gh api -X POST repos/o/r/branches/main/protection/enforce_admins'
+  "deny|gh api repos/o/r/branches/main/protection/required_status_checks/contexts -f 'contexts[]=x'"
+  'deny|gh api -XDELETE https://api.github.com/repos/o/r/branches/main/protection'
+  'deny|gh api --method=delete /repos/o/r/branches/main/protection/'
+  "deny|gh api -X DELETE 'repos/o/r/branches/main/protection?x=1'"
+  'deny|gh api -X DELETE repos/o/r/branches/main/prot%65ction'
+  'deny|gh api -X DELETE repos/o/r/branches/main/x/../protection'
+  'deny|gh api -X DELETE repos/{owner}/{repo}/branches/{branch}/protection'
+  'deny|gh api -X DELETE "repos/$R/branches/$b/protection"'
+  'deny|gh api -X "$M" repos/o/r/branches/main/protection'
+  'deny|gh api repos/o/r/branches/main/protection -X DELETE'
+  'deny|G=gh; $G api -X DELETE repos/o/r/branches/main/protection'
+  "deny|bash -c 'gh api -X DELETE repos/o/r/branches/main/protection'"
+  'deny|for b in develop main; do gh api -X DELETE "repos/o/r/branches/$b/protection"; done'
+  'deny|gh api -X DELETE repos/o/r/rulesets/123'
+  'deny|gh api -X PUT repos/o/r/rulesets/123 -f enforcement=disabled'
+  'deny|gh api -X POST repos/o/r/rulesets -f name=x -f target=branch -f enforcement=active'
+  'deny|gh api repos/o/r/rulesets -f name=x'
+  'deny|gh api -X DELETE orgs/o/rulesets/9'
+  'deny|gh api -X PUT orgs/o/rulesets/9 -f enforcement=evaluate'
+  'deny|gh api -X DELETE https://api.github.com/repos/o/r/rulesets/123'
+  'deny|gh api -X DELETE "repos/$R/rulesets/$id"'
+  'deny|gh api -X DELETE "repos/$O/$N/branches/main/protection"'
+  "deny|gh api graphql -f query='mutation { deleteBranchProtectionRule(input: {branchProtectionRuleId: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { updateBranchProtectionRule(input: {branchProtectionRuleId: \"x\", requiresStatusChecks: false}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { createBranchProtectionRule(input: {repositoryId: \"x\", pattern: \"main\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { deleteRepositoryRuleset(input: {repositoryRulesetId: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { updateRepositoryRuleset(input: {repositoryRulesetId: \"x\", enforcement: DISABLED}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { createRepositoryRuleset(input: {sourceId: \"x\", name: \"y\", rules: [], enforcement: ACTIVE}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { deleteBranch''ProtectionRule(input: {branchProtectionRuleId: \"x\"}) { clientMutationId } }'"
+  'allow|gh api repos/o/r/branches/main/protection'
+  "allow|gh api repos/o/r/branches/develop/protection --jq '.required_status_checks.contexts'"
+  'allow|gh api -X GET repos/o/r/branches/main/protection/required_status_checks'
+  'allow|gh api repos/o/r/branches/main/protection/enforce_admins'
+  'allow|gh api "repos/$R/branches/develop/protection" 2>&1 | head -2'
+  'allow|gh api repos/o/r/branches/main --jq .protected'
+  'allow|gh api repos/o/r/rulesets'
+  "allow|gh api repos/o/r/rulesets --jq '.[] | {id,name,enforcement}'"
+  'allow|gh api repos/o/r/rulesets/123'
+  'allow|gh api -X GET repos/o/r/rulesets -F includes_parents=true'
+  'allow|gh api repos/o/r/rulesets/rule-suites'
+  'allow|gh api repos/o/r/rules/branches/main'
+  "allow|gh api orgs/o/rulesets --jq '.[].name'"
+  'allow|gh ruleset list'
+  'allow|gh ruleset view 123 --repo o/r'
+  'allow|gh ruleset check main'
+  "allow|gh api graphql -f query='query { repository(owner: \"o\", name: \"r\") { branchProtectionRules(first: 5) { nodes { pattern requiresApprovingReviews } } rulesets(first: 5) { nodes { name enforcement } } } }'"
+  'allow|gh api -X PATCH repos/o/r -f description=x'
+  'allow|gh api -X PATCH repos/o/protection -f description=x'
+  'allow|gh api -X DELETE repos/o/r/git/refs/heads/protection-docs'
+  'allow|gh api -X DELETE repos/o/r/git/refs/heads/rulesets'
+  'allow|gh api -X PUT repos/o/r/contents/rulesets/x.json -f message=x -f content=eA== -f branch=feat/x'
+  'allow|gh api -X PUT repos/o/r/contents/branches/x/protection -f message=x -f content=eA== -f branch=feat/x'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+
+# --- 3. Un cuerpo --input leido de un fichero: la ruta basta --------------------------------------
+# El guard no lee el fichero, asi que no puede ver si el cuerpo rebaja la proteccion o si lleva un
+# campo labels que quita todas las etiquetas. En la proteccion y las rulesets decide la ruta; en una
+# issue o PR editada con un cuerpo de fichero, tambien. Un cuerpo escrito en la orden (heredoc,
+# here-string, echo) se sigue leyendo como antes.
+CASES=(
+  'deny|gh api -X PUT repos/o/r/branches/main/protection --input protection.json'
+  'deny|gh api -X PUT repos/o/r/branches/develop/protection --input - < protection.json'
+  'deny|gh api repos/o/r/branches/main/protection --input f.json'
+  'deny|gh api -X PATCH repos/o/r/branches/main/protection/required_pull_request_reviews --input=f.json'
+  'deny|cat protection.json | gh api -X PUT repos/o/r/branches/main/protection --input -'
+  'deny|gh api -X PUT repos/o/r/rulesets/12 --input ruleset.json'
+  'deny|gh api -X POST repos/o/r/rulesets --input ruleset.json'
+  'deny|gh api --method PUT orgs/o/rulesets/9 --input r.json'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input body.json'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input=body.json'
+  'deny|gh api repos/o/r/issues/5 --input body.json'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input "$F"'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input - < body.json'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input - 0<body.json'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input <(cat body.json)'
+  'allow|gh api -X PATCH repos/o/r/issues/5 --input - <<< '"'"'{"title":"x"}'"'"
+  "allow|echo '{\"milestone\":null}' | gh api -X PATCH repos/o/r/issues/5 --input -"
+  'allow|gh api -X POST repos/o/r/issues/5/labels --input labels.json'
+  "allow|gh api -X POST repos/o/r/issues/5/labels --input <(echo '{\"labels\":[\"semver:major\"]}')"
+  'allow|gh api -X PATCH repos/o/r/pulls/5 --input body.json'
+  'allow|gh api -X POST repos/o/r/issues/5/comments --input comment.json'
+  'allow|gh api -X PATCH repos/o/r/git/refs/heads/feat/x --input ref.json'
+  'allow|gh api -X PATCH repos/o/r/issues/5 -F body=@body.md'
+  'allow|gh api repos/o/r/branches/main/protection > /tmp/protection.json'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# El cuerpo en un heredoc, como lo escribieron las ordenes reales del mes: la ruta decide igual.
+run_case deny  $'gh api -X PUT repos/o/r/branches/main/protection --input - <<\'JSON\'\n{"required_status_checks": null, "enforce_admins": false}\nJSON'
+run_case deny  $'R=o/r; for b in develop main; do gh api -X PUT "repos/$R/branches/$b/protection" --input - <<\'JSON\'\n{"enforce_admins": true}\nJSON\ndone'
+run_case allow $'gh api -X PATCH repos/o/r/issues/5 --input - <<\'JSON\'\n{"title": "x"}\nJSON'
+# Bajo cualquier politica, y con el motivo que dice que hacer.
+TEST_POLICY="$POL_PRISMA"; TEST_PR_BASE=""
+run_case deny  'gh pr edit 5 --remove-label no-automerge'
+run_case deny  'gh api -X DELETE repos/o/r/branches/main/protection'
+run_case allow 'gh api repos/o/r/branches/main/protection'
+TEST_POLICY="$POL_PRODUCT"
+msg_case 'keeps merge-when-green from merging the PR on its own' 'gh pr edit 5 --remove-label no-automerge'
+msg_case '--remove-label no-automerge' 'gh api -X DELETE repos/o/r/issues/5/labels/no-automerge'
+msg_case 'revision-humana or no-automerge' 'gh pr edit 5 --remove-label "$L"'
+msg_case 'only a human takes it off' 'gh pr edit 5 --remove-label revision-humana'
+msg_case "the repository owner's settings" 'gh api -X DELETE repos/o/r/branches/main/protection'
+msg_case 'the path alone decides' 'gh api -X PUT repos/o/r/branches/main/protection --input f.json'
+msg_case 'for the repository owner to run' 'gh api -X DELETE repos/o/r/rulesets/1'
+msg_case 'body read from a file' 'gh api -X PATCH repos/o/r/issues/5 --input body.json'
+
+# --- 4. Un cd dentro de un subshell solo vale dentro -------------------------------------------
+# Repos de verdad (los de la seccion 2b del GROUP 11): $INTEG tiene HEAD en develop y $WT es un
+# worktree en una rama de trabajo. El push que va en el subshell ve el cd de antes; el que va
+# despues del subshell no lo ve, en los dos sentidos: ni deja pasar un lease a develop ni niega uno
+# a la rama propia. Igual con $( … ), comillas incluidas, backticks, <( … ), bash -c y un heredoc
+# que alimenta un shell. Un { … } corre en el mismo shell: su cd sigue valiendo.
+push_real deny  "$WT" "(cd $INTEG && git push --force-with-lease)"
+push_real deny  "$WT" "(cd $INTEG; git push --force-with-lease origin HEAD)"
+push_real deny  "$WT" "( cd $INTEG && git fetch -q && git push --force-with-lease ) 2>&1 | tail -3"
+push_real deny  "$WT" "(cd $INTEG && (git push --force-with-lease))"
+push_real deny  "$WT" "cd $INTEG && (git push --force-with-lease)"
+push_real deny  "$WT" "(pushd $INTEG && git push --force-with-lease; popd)"
+push_real deny  "$WT" "x=\$(cd $INTEG && git push --force-with-lease 2>&1)"
+push_real deny  "$WT" "x=\"\$(cd $INTEG && git push --force-with-lease 2>&1)\""
+push_real deny  "$WT" "x=\`cd $INTEG && git push --force-with-lease\`"
+push_real deny  "$WT" "(cd $INTEG && bash -c 'git push --force-with-lease')"
+push_real deny  "$WT" "bash -c 'cd $INTEG && git push --force-with-lease'"
+push_real deny  "$WT" "(cd $INTEG && x=\"\$(git push --force-with-lease 2>&1)\")"
+push_real deny  "$WT" "(cd $INTEG && git push \"\$(git remote | head -1)\" --force-with-lease)"
+push_real deny  "$WT" "(cd ../otro && git push --force-with-lease origin develop)"
+push_real deny  "$WT" $'cd '"$INTEG"$' && bash <<\'EOF\'\ngit push --force-with-lease\nEOF'
+push_real deny  "$WT" $'(cd '"$INTEG"$' && bash <<\'EOF\'\ngit push --force-with-lease\nEOF\n)'
+push_real deny  "$INTEG" "(cd $WT && true); git push --force-with-lease"
+push_real deny  "$INTEG" "(cd $WT) && git push --force-with-lease"
+push_real deny  "$INTEG" "(cd $WT && git push --force-with-lease) && git push --force-with-lease"
+push_real deny  "$INTEG" "x=\$(cd $WT && pwd); git push --force-with-lease"
+push_real deny  "$INTEG" "x=\"\$(cd $WT && pwd)\"; git push --force-with-lease"
+push_real deny  "$INTEG" "x=\`cd $WT\`; git push --force-with-lease"
+push_real deny  "$INTEG" "diff <(cd $WT && git log -1) /dev/null; git push --force-with-lease"
+push_real deny  "$INTEG" "bash -c 'cd $WT'; git push --force-with-lease"
+push_real deny  "$INTEG" "echo \"cd $WT\" && git push --force-with-lease"
+push_real deny  "$INTEG" $'bash <<\'EOF\'\ncd '"$WT"$'\nEOF\ngit push --force-with-lease'
+# Lo que se juzga despues de las ordenes de arriba (el cuerpo de una sustitucion entre comillas, el
+# guion de bash -c, el cuerpo de un heredoc) ve los cd de antes en su sitio, no los de despues, ni
+# los de un texto entre comillas que es datos, ni los del guion de otro bash -c. El cd de un trozo
+# que se relee sin la sustitucion (cd "$( … )") cuenta en el subshell donde esta escrito.
+push_real deny  "$INTEG" "x=\"\$(git push --force-with-lease 2>&1)\"; cd $WT"
+push_real deny  "$INTEG" "echo \"cd $WT\"; x=\"\$(git push --force-with-lease 2>&1)\""
+push_real deny  "$INTEG" "bash -c 'cd $WT'; x=\"\$(git push --force-with-lease 2>&1)\""
+push_real deny  "$INTEG" "bash -c 'git push --force-with-lease'; cd $WT"
+push_real allow "$WT" "bash -c 'git push --force-with-lease'; cd $INTEG"
+push_real deny  "$INTEG" "echo \"cd $WT\"; bash -c 'git push --force-with-lease'"
+push_real deny  "$INTEG" "bash -c 'cd $WT'; bash -c 'git push --force-with-lease'"
+push_real allow "$WT" "bash -c 'cd $INTEG'; bash -c 'git push --force-with-lease'"
+G14_PAD="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+push_real deny  "$INTEG" "x=\$(echo $G14_PAD); echo $G14_PAD; (cd \"\$(echo $WT)\"); bash <<'EOF'
+git push --force-with-lease
+EOF"
+# La linea de posicion la escribe solo el extractor: una orden que empieza con su marca (\x01) no la
+# imita, ni dentro de un guion de bash -c, donde los segmentos comparten posicion.
+push_real deny  "$INTEG" "(cd $WT); bash -c '$(printf '\001')1 /0/; git push --force-with-lease'"
+push_real allow "$INTEG" "{ cd $WT; }; git push --force-with-lease"
+push_real allow "$INTEG" "{ true; cd $WT; }; git push --force-with-lease"
+push_real deny  "$WT" "{ true; cd $INTEG; }; git push --force-with-lease"
+push_real allow "$WT" "(cd $INTEG && git pull --ff-only); git push --force-with-lease"
+push_real allow "$WT" "(cd $INTEG && git status) && git push --force-with-lease origin HEAD"
+push_real allow "$WT" "x=\$(cd $INTEG && git rev-parse HEAD); git push --force-with-lease"
+push_real allow "$WT" "x=\"\$(cd $INTEG && pwd)\"; git push --force-with-lease"
+push_real allow "$WT" "(cd $INTEG && git log --oneline -3)"
+push_real allow "$WT" "(cd $INTEG && ls); git status"
+push_real allow "$INTEG" "(cd $WT && git push --force-with-lease)"
+push_real allow "$INTEG" "(cd $WT; git push --force-with-lease origin HEAD) 2>&1 | tail -1"
+push_real allow "$INTEG" "{ cd $WT && git push --force-with-lease; }"
+push_real allow "$INTEG" "cd $WT && (git fetch -q && git push --force-with-lease)"
+push_real allow "$INTEG" "(cd $WT && x=\"\$(git push --force-with-lease 2>&1)\")"
+push_real allow "$INTEG" "bash -c 'cd $WT && git push --force-with-lease'"
+push_real allow "$INTEG" $'(cd '"$WT"$' && bash <<\'EOF\'\ngit push --force-with-lease\nEOF\n)'
+# Lo mismo para una tarea, un worktree: el cambio de rama corre donde lo deja el cd que sigue valiendo.
+wt_case deny  "$WT_S" "(cd $WT_W && git status); git switch feature"
+wt_case deny  "$WT_S" "x=\$(cd $WT_W && pwd); git checkout feature"
+wt_case allow "$WT_W" "(cd $WT_S && git log -1); git switch feature"
+wt_case allow "$WT_W" "x=\"\$(cd $WT_S && git branch --show-current)\"; git checkout -b otra"
+# --- 5. Lo que encontraron los verificadores de esta PR ------------------------------------------
+# (4) El lector de subshells sigue la gramatica del shell: un comentario, el `)` de un patron de case,
+# ${x:-(}, $(( … )), a=( … ), @( … ) y [[ ( … ) ]] no abren ni cierran un subshell. Antes uno de esos
+# parentesis cerraba o alargaba el subshell, y el cd de dentro dejaba de contar (o contaba fuera).
+push_real deny  "$WT" "(cd $INTEG; case \$x in *) git push --force-with-lease;; esac)"
+push_real deny  "$WT" "x=\$(cd $INTEG; case 1 in 1) git push --force-with-lease 2>&1;; esac)"
+push_real deny  "$WT" $'(cd '"$INTEG"$' # paso 1)\ngit push --force-with-lease)'
+push_real deny  "$WT" $'true # (\ncd '"$INTEG"$'\ntrue # )\ngit push --force-with-lease'
+push_real deny  "$INTEG" $'(cd '"$WT"$' # (\n); git push --force-with-lease'
+push_real deny  "$INTEG" "(cd $WT; echo \${x:-\${y}(}); git push --force-with-lease"
+push_real deny  "$INTEG" "(cd $WT; echo \$(( (1 + 2) * 3 ))); git push --force-with-lease"
+push_real deny  "$INTEG" "(cd $WT; a=(x y); [[ a =~ ^(a|b)\$ ]]); git push --force-with-lease"
+push_real deny  "$INTEG" "(cd $WT; case x in (x) true;; esac); git push --force-with-lease"
+push_real deny  "$WT" "(cd $INTEG; case x in a|x) echo ')';; esac; git push --force-with-lease)"
+# Un comentario no corre: su cd no mueve nada.
+push_real deny  "$INTEG" $'true # ; cd '"$WT"$'\ngit push --force-with-lease'
+push_real allow "$WT" "(cd $INTEG; case x in x) git status;; esac); git push --force-with-lease"
+push_real allow "$INTEG" "(cd $WT; case x in x) git push --force-with-lease;; esac)"
+push_real allow "$INTEG" $'(cd '"$WT"$' # paso 1)\ngit push --force-with-lease)'
+push_real allow "$INTEG" $'cd '"$WT"$' # el worktree (de la tarea)\ngit push --force-with-lease'
+# Un heredoc cuyo delimitador no saca el lector de heredocs ('E-F', \EOF) es dato hasta su linea
+# final, la que bash lee (el delimitador solo, sin espacios detras): un `)` o un `(` en el no cierra
+# ni abre el subshell, y su cd no corre.
+push_real deny  "$WT" $'(cd '"$INTEG"$'; cat <<\'E-F\'\n)\nE-F\ngit push --force-with-lease)'
+push_real deny  "$INTEG" $'(cd '"$WT"$'; cat <<\'E-F\'\n(\nE-F\n); git push --force-with-lease'
+push_real deny  "$WT" $'(cd '"$INTEG"$'; cat <<\\EOF\n)\nEOF\ngit push --force-with-lease)'
+push_real deny  "$INTEG" $'cat <<\'E-F\'\nE-F \ncd '"$WT"$'\nE-F\ngit push --force-with-lease'
+push_real deny  "$INTEG" $'cat <<\'E-F\'\n\tE-F\ncd '"$WT"$'\nE-F\ngit push --force-with-lease'
+push_real allow "$WT" $'cat <<\'E-F\'\ncd '"$INTEG"$'\nE-F\ngit push --force-with-lease'
+push_real allow "$INTEG" $'cat <<-\'E-F\'\n\tE-F\ncd '"$WT"$'\ngit push --force-with-lease'
+# Mas anidada de lo que el lector sigue (400 niveles), una orden con cd no se puede situar: se deniega
+# la orden git que cuenta con su cd; sin cd, nada cambia.
+G14_DEEP="echo $(printf '$(echo %.0s' {1..450})x$(printf ')%.0s' {1..450})"
+push_real deny  "$INTEG" "$G14_DEEP; (cd $WT); git push --force-with-lease"
+push_real deny  "$WT" "$G14_DEEP; cd $INTEG; git push --force-with-lease"
+push_real allow "$WT" "$G14_DEEP; git push --force-with-lease"
+# (4) La linea de posicion solo la lee el bucle principal: una orden que la escribe con \x01 (una
+# variable que es la palabra de la orden, gh alias set, parallel :::) no la imita, ni dentro de un
+# guion de bash -c.
+G14_S="$(printf '\001')"
+push_real deny  "$WT" "true; cd $INTEG && bash -c 'C=\"${G14_S}0\"; \$C /; git push --force-with-lease'"
+push_real deny  "$WT" "true; cd $INTEG && bash -c 'gh alias set x \"!${G14_S}0 /\"; git push --force-with-lease'"
+push_real deny  "$WT" "true; cd $INTEG && bash -c 'parallel ::: \"${G14_S}0 /\"; git push --force-with-lease'"
+# (4) eval, `.` y source corren en el mismo shell: su cd sigue valiendo despues.
+push_real deny  "$WT" "eval \"true; cd $INTEG\"; git push --force-with-lease"
+push_real deny  "$WT" $'. /dev/stdin <<EOF\ncd '"$INTEG"$'\nEOF\ngit push --force-with-lease'
+push_real deny  "$WT" $'source /dev/stdin <<\'EOF\'\ncd '"$INTEG"$'\nEOF\ngit push --force-with-lease'
+push_real deny  "$WT" $'eval "$(cat <<\'EOF\'\ncd '"$INTEG"$'\nEOF\n)"; git push --force-with-lease'
+push_real allow "$INTEG" "eval \"cd $WT\"; git push --force-with-lease"
+push_real allow "$INTEG" $'. /dev/stdin <<EOF\ncd '"$WT"$'\nEOF\ngit push --force-with-lease'
+push_real deny  "$INTEG" "(eval \"cd $WT\"); git push --force-with-lease"
+push_real deny  "$INTEG" "bash -c \"cd $WT\"; git push --force-with-lease"
+# Un guion de bash -c entre comillas dobles con escapes corre donde lo deja su cd, y un texto que solo
+# menciona `cd <dir>` y el push (un --body, un echo, un mensaje de commit) se lee en su propio ambito:
+# su cd mueve lo que el texto lleva, y nada de fuera.
+push_real allow "$INTEG" "bash -c \"cd \\\"$WT\\\" && git push --force-with-lease\""
+push_real allow "$INTEG" "bash -c \"cd $WT && echo \\\$PWD && git push --force-with-lease\""
+push_real allow "$INTEG" $'gh issue comment 5 --body "Retomar:\ncd '"$WT"$'\ngit push --force-with-lease"'
+push_real allow "$INTEG" $'gh issue comment 5 --body "Retomar:\ncd .claude/worktrees/no-existe\ngit push --force-with-lease"'
+push_real allow "$INTEG" "gh pr comment 3 --body 'cd $WT && git push --force-with-lease'"
+push_real allow "$INTEG" "echo \"cd $WT && git push --force-with-lease\""
+push_real deny  "$INTEG" "echo \"cd $WT\" && git push --force-with-lease"
+wt_case allow "$WT_S" "bash -c \"cd $WT_W && git checkout -q tarea && echo \\\"ok\\\"\""
+wt_case allow "$WT_S" "echo 'cd $WT_W && git checkout feature'"
+# Un arnes que lleva la orden git como dato y que la corre en otro sitio (record 51553 del replay): el
+# cd de dentro de $( … ) no mueve la orden entre comillas, que se juzga donde esta la sesion.
+wt_case deny  "$WT_S" "L=\$(mktemp -d); L=\$(cd \$L && pwd -P); wt \"\$S\" 'git checkout feature'"
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE="develop"; TEST_PR_HEAD=""
+CASES=(
+  # (2) repositories/<id>/… sirve la proteccion y las rulesets igual que repos/<o>/<r>/…, y los
+  # ficheros (contents) tambien.
+  'deny|gh api -X DELETE repositories/1299728051/branches/develop/protection'
+  'deny|gh api -X DELETE repositories/1299728051/rulesets/1'
+  'deny|gh api -X PATCH repositories/1/branches/main/protection/required_status_checks -F strict=false'
+  'deny|gh api -X DELETE /repositories/1/branches/main/protection/enforce_admins'
+  'deny|gh api -X PUT repositories/1/contents/README.md -f message=x -f content=eA=='
+  'allow|gh api repositories/1299728051/branches/develop/protection'
+  'allow|gh api repositories/1299728051/rulesets'
+  'allow|gh api repositories/1299728051 --jq .full_name'
+  # (1)(2) Llaves de secuencia: prot{e..e}ction es protection, para el shell y para el guard.
+  'deny|gh api -X DELETE repos/o/r/branches/main/prot{e..e}ction'
+  'deny|gh api -X DELETE repos/o/r/rule{s..s}ets/1'
+  'deny|gh api -X DELETE repos/o/r/{branches,x}/main/protection'
+  'deny|gh label delete no-autom{e..e}rge --yes'
+  'deny|gh api -X DELETE repos/o/r/issues/5/labels/no-autom{e..e}rge'
+  'deny|gh api -X DELETE repos/o/r/labels/no-autom{e..e}rge'
+  'deny|gh api -X DELETE repos/o/r/issues/5/{labels/no-automerge,x}'
+  'allow|gh api -X DELETE repos/o/r/issues/5/labels/riesgo:{2..2}'
+  # (2) Un tramo que rellena el shell (o xargs, o parallel) puede ser protection o rulesets.
+  'deny|gh api -X DELETE "repos/o/r/branches/main/$X"'
+  'deny|gh api -X DELETE "repos/o/r/$Y/protection"'
+  'deny|gh api -X DELETE "repos/o/r/rule$S/1"'
+  'deny|gh api -X DELETE repos/o/r/branches/main/prot*'
+  'deny|for p in protection; do gh api -X DELETE repos/o/r/branches/main/$p; done'
+  'deny|echo protection | xargs -I{} gh api -X DELETE repos/o/r/branches/main/{}'
+  'deny|parallel gh api -X DELETE {} ::: repos/o/r/branches/main/protection'
+  'deny|parallel gh api -X DELETE {} ::: repos/o/r/issues/1 repos/o/r/rulesets/3'
+  'allow|gh api -X POST "repos/o/r/issues/$N/comments" -f body=x'
+  'allow|gh api -X POST "repos/$R/issues/$N/comments" -f body=x'
+  'allow|gh api -X PATCH "repos/$R/pulls/$N" -f title=x'
+  'allow|gh api -X DELETE "repos/o/r/git/refs/heads/feat/$b"'
+  'allow|gh api -X PUT "repos/$R/contents/docs/$f" -f message=x -f content=eA== -f branch=feat/x'
+  'allow|gh api "repos/o/r/branches/main/$X"'
+  'allow|parallel gh api {} ::: repos/o/r/branches/main/protection'
+  'allow|parallel gh api -X POST repos/o/r/issues/{}/comments -f body=x ::: 1 2'
+  # (3) La entrada estandar desde un fichero, en cualquier sitio de la orden, o desde un here-string o
+  # un heredoc sin comillas que la rellena el shell.
+  'deny|< body.json gh api -X PATCH repos/o/r/issues/5 --input -'
+  'deny|0<body.json gh api -X PATCH repos/o/r/issues/5 --input -'
+  'deny|{ gh api -X PATCH repos/o/r/issues/5 --input -; } < body.json'
+  'deny|( gh api -X PATCH repos/o/r/issues/5 --input - ) < body.json'
+  'deny|exec 0<body.json; gh api -X PATCH repos/o/r/issues/5 --input -'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input - <<< "$(cat body.json)"'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input - <<< $(<body.json)'
+  'deny|gh api -X PATCH repos/o/r/issues/5 --input - < <(cat body.json)'
+  # (1) xargs -I{} y parallel en la ruta de la etiqueta; un patron en el nombre.
+  'deny|echo no-automerge | xargs -I{} gh api -X DELETE repos/o/r/issues/5/labels/{}'
+  'deny|echo no-automerge | xargs -I{} gh api -X DELETE repos/o/r/labels/{}'
+  'deny|parallel gh api -X DELETE repos/o/r/issues/5/labels/{} ::: no-automerge'
+  'deny|touch no-automerge && gh pr edit 5 --remove-label no-automerg?'
+  'deny|gh pr edit 5 --remove-label [n]o-automerge'
+  'deny|gh pr edit 5 --remove-label "semver:patch,revision-human*"'
+  'deny|gh label delete no-automerg?'
+  'allow|parallel gh api -X DELETE repos/o/r/issues/5/labels/{} ::: riesgo:2 riesgo:3'
+  'allow|gh pr edit 5 --remove-label riesgo:?'
+  # (2) Las mutaciones GraphQL de proteccion se buscan en la peticion, leida como la lee GraphQL: ni en
+  # el resto de la orden, ni en una cadena o un comentario de otra mutacion.
+  "allow|gh api graphql -f query='query{viewer{login}}'; grep -rn createRepositoryRuleset docs/"
+  "allow|gh api graphql -f query='query{viewer{login}}' && echo 'falta: updateBranchProtectionRule'"
+  "allow|gh api graphql -f query='mutation { addComment(input:{subjectId:\"X\", body:\"hay que llamar a updateBranchProtectionRule\"}) { clientMutationId } }'"
+  "deny|gh api graphql -f query='mutation { x: deleteBranchProtectionRule(input: {branchProtectionRuleId: \"x\"}) { clientMutationId } }'"
+  "deny|gh api graphql -F query='mutation { addComment(input:{subjectId:\"X\", body:\"a\"}) { clientMutationId } deleteRepositoryRuleset(input: {repositoryRulesetId: \"x\"}) { clientMutationId } }'"
+  "deny|echo 'mutation { deleteBranchProtectionRule(input: {branchProtectionRuleId: \"x\"}) { clientMutationId } }' | xargs -0 -I{} gh api graphql -f query={}"
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+run_case deny  $'gh api -X PATCH repos/o/r/issues/5 --input - <<EOF\n$(cat body.json)\nEOF'
+run_case deny  $'gh api -X PATCH repos/o/r/issues/5 --input - <<EOF\n{"title": "$T", "labels": []}\nEOF'
+run_case allow $'gh api -X PATCH repos/o/r/issues/5 --input - <<\'EOF\'\n{"title": "$x"}\nEOF'
+run_case allow $'gh api -X PATCH repos/o/r/issues/5 --input - <<EOF\n{"title": "x"}\nEOF'
+run_case deny  $'gh api graphql -f query=\'mutation { # "\n deleteBranchProtectionRule(input: {branchProtectionRuleId: "x"}) { clientMutationId } }\''
+run_case allow $'gh api graphql -f query=\'mutation { addComment(input:{subjectId:"X", body:"""\nllamar a deleteBranchProtectionRule\n"""}) { clientMutationId } }\''
+# El motivo manda el comando para el humano en un cuerpo que no se lee como orden.
+msg_case 'with --body-file or a heredoc' 'gh pr edit 5 --remove-label no-automerge'
+msg_case 'with --body-file or a heredoc' 'gh api -X DELETE repos/o/r/rulesets/1'
+msg_case 'may make it repos/o/r/branches/main/protection' 'gh api -X DELETE "repos/o/r/branches/main/$X"'
+TEST_POLICY="$POL_PRISMA"
+
+# --- 6. La segunda ronda de verificacion (sobre fdb61b9) -----------------------------------------
+# (1) Detras de repos/, dos tramos seguidos que rellena el shell son el dueño y el nombre: leido el
+# primero como dueño y nombre a la vez, el segundo podia ser `rulesets`, y toda escritura en
+# repos/$OWNER/$REPO/… se negaba como si fuera a las rulesets (un commit por la API en bucle sobre
+# los repos de la flota, real del 2026-09-01). Un tramo que rellena el shell detras del nombre sigue
+# pudiendo ser rulesets, branches/<x> o protection.
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE="develop"; TEST_PR_HEAD=""
+CASES=(
+  'allow|gh api -X POST repos/$OWNER/$REPO/issues/12/comments -f body=hola'
+  'allow|gh api -X PATCH "repos/$OWNER/$REPO/pulls/$N" -f body=x'
+  'allow|gh api --method POST repos/$O/$R/actions/workflows/ci.yml/dispatches -f ref=develop'
+  'allow|gh api -X DELETE "repos/$OWNER/$REPO/git/refs/heads/feat/123-x"'
+  'allow|for r in uno dos; do gh api -X PATCH "repos/$OWNER/$r" -f delete_branch_on_merge=true; done'
+  'allow|OWNER=acme REPO=app; gh api -X POST "repos/$OWNER/$REPO/issues/300/comments" -f body=hola'
+  'allow|O=acme; for R in uno dos; do gh api -X POST repos/$O/$R/git/blobs -f content=x; gh api -X POST repos/$O/$R/git/trees -f base_tree=x; gh api -X POST repos/$O/$R/git/commits -f message=x; gh api -X POST repos/$O/$R/git/refs -f ref=refs/heads/chore/x -f sha=x; done'
+  'allow|gh api -X PUT "repos/$OWNER/$REPO/collaborators/$U" -f permission=push'
+  'allow|gh api -X PATCH "repos/$R/issues/$N" -f state=closed'
+  'deny|gh api -X POST "repos/$OWNER/$REPO/rulesets" -f name=x'
+  'deny|gh api -X DELETE "repos/$OWNER/$REPO/rulesets/$ID"'
+  'deny|gh api -X DELETE "repos/$OWNER/$REPO/$X"'
+  'deny|gh api -X DELETE "repos/$OWNER/$REPO/$Y/protection"'
+  'deny|gh api -X DELETE "repos/$OWNER/$REPO/branches/$B/protection"'
+  'deny|gh api -X DELETE "repos/$OWNER/$REPO/branches/main/$P"'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+msg_case 'may make it repos/x/x/branches/x/protection' 'gh api -X DELETE "repos/$OWNER/$REPO/$Y/protection"'
+# (2) La entrada estandar de gh api es su propio heredoc o here-string, o la tuberia que lo alimenta:
+# un `<` en otro sitio de la orden (en el cuerpo de su heredoc con comillas, en un `wc -l < f` de
+# despues, en el `done < ids.txt` del bucle) no la llena. Sin tuberia ni redireccion propia, se lee
+# la orden entera como antes; y una palabra entre comillas que imita una redireccion no cuenta.
+run_case allow $'gh api -X PATCH repos/o/r/issues/5 --input - <<\'EOF\'\n{"body":"<details><summary>x</summary>y</details>"}\nEOF'
+run_case allow $'gh api -X PATCH repos/o/r/issues/5 --input - <<EOF\n{"body":"a < b"}\nEOF'
+run_case allow $'gh api -X PATCH repos/o/r/issues/5 --input - <<\'EOF\'\n{"title":"x"}\nEOF\ncat <<EOF\n$HOME\nEOF'
+CASES=(
+  "allow|fail=0; for n in \$(jq -r '.[]' < /tmp/backup.json); do out=\$(echo '{\"milestone\":null}' | gh api -X PATCH repos/o/r/issues/\$n --input - --jq '.milestone' 2>&1) || { echo \"FALLO #\$n: \$out\"; fail=\$((fail+1)); }; done"
+  "allow|echo '{\"milestone\":null}' | gh api -X PATCH repos/o/r/issues/531 --input - && [ \"\$(wc -l < /tmp/a)\" -lt 3 ]"
+  "allow|while read -r n; do echo '{\"state\":\"closed\"}' | gh api -X PATCH repos/o/r/issues/\$n --input -; done < /tmp/ids.txt"
+  "allow|echo '{\"state\":\"closed\"}' | gh api -X PATCH repos/o/r/issues/5 --input -; cat <<< \"\$(date)\""
+  'deny|while read -r n; do gh api -X PATCH repos/o/r/issues/$n --input -; done < /tmp/ids.txt'
+  'deny|echo x | gh api -X PATCH repos/o/r/issues/5 --input - < body.json'
+  "deny|{ gh api -X PATCH repos/o/r/issues/5 --input - --jq '<<x'; } < body.json"
+  "deny|{ gh api -X PATCH repos/o/r/issues/5 --input - --jq \"<<'x'\"; } < body.json"
+  "deny|{ gh api -X PATCH repos/o/r/issues/5 --input - --jq '<<<x'; } < body.json"
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# Una tuberia a un señuelo con el mismo texto no habla por la orden que el extractor reescribio.
+run_case deny  $'echo | gh api -X PATCH repos/o/r/issues/5  --input -; { gh api -X PATCH repos/o/r/issues/5 \\\n--input -; } < body.json'
+# (4) Un comentario de GraphQL acaba en su linea: se lee la peticion con sus lineas, como esta en la
+# orden. Una mutacion en la linea de despues, o en otro sitio donde esta el mismo texto, cuenta.
+run_case allow $'gh api graphql -f query=\'\n# lee las reglas (no createBranchProtectionRule)\nquery { repository(owner:"o",name:"r"){ rulesets(first:5){ nodes { name } } } }\''
+run_case allow $'gh api graphql -f query=\'query { viewer { login } } # [a] (b) \\\\ ^$ .*+? {c} | no deleteRepositoryRuleset\''
+run_case allow $'gh api graphql -F owner=o -f query=\'\n  # solo lectura; createRepositoryRuleset no\n  query($owner: String!) { repositoryOwner(login: $owner) { login } }\''
+run_case deny  $'gh api graphql -f query=\'# x\nmutation { deleteBranchProtectionRule(input: {branchProtectionRuleId: "x"}) { clientMutationId } }\''
+run_case deny  $'echo \'# x mutation { deleteBranchProtectionRule(input: {branchProtectionRuleId: "x"}) { clientMutationId } }\'; gh api graphql -f query=\'# x\nmutation { deleteBranchProtectionRule(input: {branchProtectionRuleId: "x"}) { clientMutationId } }\''
+run_case deny  $'gh api graphql -f query=\'mutation { addComment(input:{subjectId:"X", body:"#1"}) { clientMutationId } deleteRepositoryRuleset(input: {repositoryRulesetId: "x"}) { clientMutationId } }\''
+# La peticion se busca dentro del sitio donde esta la orden de gh, no en un señuelo con el mismo texto
+# en una linea; y una peticion con escapes del shell que no se encuentra tal cual se lee entera.
+run_case deny  $'echo \'# x mutation{deleteBranchProtectionRule(input:{branchProtectionRuleId:"x"}){clientMutationId}}\'; gh api graphql -f query="# x\nmutation{deleteBranchProtectionRule(input:{branchProtectionRuleId:\\"x\\"}){clientMutationId}}"'
+# (3) Cada orden que corre parallel es un proceso aparte: su cd mueve el git de esa misma orden, y no
+# el de despues.
+push_real deny  "$WT" "parallel 'cd {} && git push --force-with-lease' ::: $INTEG"
+push_real allow "$INTEG" "parallel 'cd {} && git push --force-with-lease' ::: $WT"
+push_real allow "$INTEG" "parallel 'cd {}; git fetch -q; git push --force-with-lease' ::: $WT"
+wt_case deny  "$WT_W" "parallel 'cd {} && git switch feature' ::: $WT_S"
+wt_case allow "$WT_S" "parallel 'cd {} && git switch -c feat/z' ::: $WT_W"
+push_real allow "$WT" "parallel 'cd {} && git fetch -q' ::: $INTEG ; git push --force-with-lease"
+push_real allow "$WT" "parallel cd {} ::: $INTEG ; git push --force-with-lease"
+push_real allow "$WT" "parallel ::: 'cd $INTEG' ; git push --force-with-lease"
+push_real deny  "$INTEG" "parallel 'cd {} && git fetch -q' ::: $WT ; git push --force-with-lease"
+push_real deny  "$INTEG" "parallel cd {} ::: $WT ; git push --force-with-lease"
+wt_case allow "$WT_W" "parallel 'cd {} && git fetch -q' ::: $WT_S ; git switch -c feat/z"
+wt_case deny  "$WT_S" "parallel 'cd {} && git fetch -q' ::: $WT_W ; git switch -c feat/z"
+# (5) Un `$((` sin cerrar, anidado, se leia en tiempo exponencial: con 34 niveles el guard pasaba del
+# timeout del hook, y un hook que agota el tiempo deja correr la orden. Se lee una sola vez, con un
+# tope de pasos, y en lo que tarda una orden normal.
+G14_ARITH="$(printf '$((%.0s' {1..40})"
+G14_T0=$SECONDS
+run_case deny  $'git push --force origin main\necho '"$G14_ARITH"
+run_case deny  "git push --force origin main; echo \"${G14_ARITH}1$(printf ') %.0s' {1..40})\""
+run_case deny  "$(printf '((%.0s' {1..40}) git push --force origin main"
+push_real deny  "$INTEG" "echo ${G14_ARITH}x; (cd $WT); git push --force-with-lease"
+push_real allow "$WT" "echo ${G14_ARITH}x; git push --force-with-lease"
+total=$((total + 1))
+if [ $((SECONDS - G14_T0)) -lt 20 ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1)); echo "FAIL  the nested \$(( cases took $((SECONDS - G14_T0)) s"; fi
+# (6) Y el extractor corre con un tope de tiempo: lo que no lee a tiempo se niega, no pasa.
+total=$((total + 1))
+G14_OUT="$(make_input 'ls' | env BASH_GUARD_SECONDS=0.001 BASH_GUARD_POLICY="$POL_PRODUCT" \
+  BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+G14_RC=$?
+if ! command -v timeout >/dev/null 2>&1 || { [ "$G14_RC" -eq 2 ] && [[ "$G14_OUT" == *'could not read this command within'* ]]; }; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1)); echo "FAIL  an extractor past its time limit: exit $G14_RC ($G14_OUT)"
+fi
+run_case allow 'ls'
+# Ni juzgar: cada push con lease lee todos los cd de antes, y cientos de pares cd/push llevaban el guard
+# mas alla del timeout del hook. Pasado su tope, la orden se niega.
+G14_PAIRS=""
+for _ in $(seq 60); do G14_PAIRS+="cd $WT; git push --force-with-lease; "; done
+push_real allow "$WT" "$G14_PAIRS"
+# Con tope de 1 s, 300 pares: 60 se juzgan ya en menos de un segundo, y pasaban (#302).
+G14_SLOW=""
+for _ in $(seq 300); do G14_SLOW+="cd $WT; git push --force-with-lease; "; done
+total=$((total + 1))
+G14_OUT="$(cd "$WT" && make_input "$G14_SLOW" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+  -u BASH_GUARD_BRANCH BASH_GUARD_SECONDS=1 PATH="$TMP/bin:$PATH" BASH_GUARD_POLICY="$POL_PRISMA" \
+  BASH_GUARD_PROJECT_ROOT="$PROJ" "$GUARD" 2>&1)"
+G14_RC=$?
+if [ "$G14_RC" -eq 2 ] && [[ "$G14_OUT" == *'could not judge this command within 1 s'* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1)); echo "FAIL  judging past its time limit: exit $G14_RC ($G14_OUT)"
+fi
+# Y si bash no puede escribir en /tmp el heredoc del extractor (pasa de 64 KiB; /tmp lleno), el guard
+# lo lee de su propio fichero: sin eso no leia ninguna orden y las dejaba pasar todas.
+total=$((total + 1))
+G14_OUT="$(make_input 'git push --force origin main' | env BASH_GUARD_POLICY="$POL_PRODUCT" \
+  BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" PATH="${NO_NET_BIN}:${PATH}" \
+  bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$1"' _ "$GUARD" 2>&1)"
+G14_RC=$?
+if [ "$G14_RC" -eq 2 ] && [[ "$G14_OUT" == *'git push --force/-f can rewrite remote history'* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1)); echo "FAIL  a guard that cannot write its heredoc to /tmp: exit $G14_RC ($G14_OUT)"
+fi
+# --- 7. Ordenes largas escritas para que el guard tarde: las niega a tiempo (#302) -----------------
+# Pasado el timeout del hook (60 s el del plugin, 15 s el mas corto de la flota) el harness deja
+# correr la orden. Una consulta GraphQL con miles de `#`, o miles de copias de su segmento en un
+# heredoc, llevaban el guard a 42 s y a mas de 300. Cada busqueda en la orden tal como se escribio
+# tiene ahora un tope de trabajo y de sitios, pasado el cual se lee lo mas estricto, y los recortes
+# de textos largos van con expresiones regulares. Cada orden se niega por su regla, y en segundos.
+# Las ordenes pasan de lo que admite un argumento: van por fichero.
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE="develop"; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+G14_BIG="$TMP/g14-big.txt"
+# big_case <allow|deny> <segundos> <motivo esperado, o vacio> <codigo node que escribe la orden>
+big_case() {
+  local expected="$1" limit="$2" why="$3" out rc want t0 dt
+  total=$((total + 1))
+  node -e "process.stdout.write($4)" > "$G14_BIG"
+  t0=$SECONDS
+  out="$(node -e '
+    process.stdout.write(JSON.stringify({
+      session_id: "test-session", hook_event_name: "PreToolUse",
+      tool_name: "Bash", tool_input: { command: require("fs").readFileSync(process.argv[1], "utf8") },
+    }));
+  ' "$G14_BIG" | env BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$TEST_POLICY" \
+    BASH_GUARD_PR_BASE="$TEST_PR_BASE" BASH_GUARD_PR_HEAD="$TEST_PR_HEAD" \
+    BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
+    PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+  rc=$?
+  dt=$((SECONDS - t0))
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ] && [ "$dt" -lt "$limit" ] && { [ -z "$why" ] || [[ "$out" == *"$why"* ]]; }; then
+    pass=$((pass + 1))
+    return 0
+  fi
+  fail=$((fail + 1))
+  printf 'FAIL  expected=%s (exit %d) in < %s s, got exit %d in %s s  ::  %s\n' "$expected" "$want" "$limit" "$rc" "$dt" "$4"
+  [ -n "$out" ] && printf '      output: %.300s\n' "$out"
+  return 0
+}
+G14_FORCE='git push --force/-f can rewrite remote history'
+G14_PUSH='"\ngit push --force origin develop"'
+# (1) El valor de la consulta con miles de `#`: el comentario se busca donde se escribio mientras el
+# trabajo cabe en su tope; si no, el valor entero.
+big_case deny 8 "$G14_FORCE" '"gh api graphql -f query=" + "#".repeat(5000) + '"$G14_PUSH"
+big_case deny 8 "$G14_FORCE" '"gh api graphql -f query=" + "#".repeat(20000) + '"$G14_PUSH"
+# (2) Miles de copias del segmento en un heredoc con comillas, delante del segmento de verdad.
+big_case deny 8 "$G14_FORCE" '"cat > /dev/null <<'"'"'EOF'"'"'\n" + "gh api graphql -f query=#\n".repeat(8000) + "EOF\ngh api graphql -f query=#" + '"$G14_PUSH"
+big_case deny 8 "$G14_FORCE" '"cat > /dev/null <<'"'"'EOF'"'"'\n" + "gh api graphql -f query=#\n".repeat(16000) + "EOF\ngh api graphql -f query=#" + '"$G14_PUSH"
+# (3) Una consulta de lectura larga cuyo comentario nombra una mutacion: dentro del tope el
+# comentario sigue siendo un comentario; pasado el tope se lee el valor entero, que la nombra.
+big_case allow 8 '' '"gh api graphql -f query='"'"'# " + "x".repeat(3000) + " deleteBranchProtectionRule\nquery { viewer { login } }'"'"'"'
+big_case deny 8 'branch protection rule' '"gh api graphql -f query='"'"'# " + "x".repeat(7000) + " deleteBranchProtectionRule\nquery { viewer { login } }'"'"'"'
+# (4) Valores largos: el texto se lee por ventanas, y uno de mas de 64 KiB (los reales no pasan de
+# 1,1 KB) se lee entero, sin quitarle las cadenas: tambien lo que nombran.
+big_case deny 8 "$G14_FORCE" '"gh api graphql -f query='"'"'{ a(x:\"" + "\\\"".repeat(30000) + "\") }'"'"'" + '"$G14_PUSH"
+big_case allow 8 '' '"gh api graphql -f query='"'"'query { a(x:\"" + "x".repeat(60000) + " deleteBranchProtectionRule\") }'"'"'"'
+big_case deny 8 'branch protection rule' '"gh api graphql -f query='"'"'query { a(x:\"" + "x".repeat(70000) + " deleteBranchProtectionRule\") }'"'"'"'
+# (5) La entrada estandar de gh api: un here-string detras de 200 KB, o detras de 200.000 blancos, y
+# un heredoc con <<- de 200.000 tabuladores; y 64 llamadas por tuberia detras de 200 KB.
+G14_API='"gh api repos/o/r/issues/5 -X PATCH --input -; '
+big_case deny 8 "$G14_FORCE" "$G14_API"'echo " + "a".repeat(200000) + "; cat <<< '"'"'x'"'"'" + '"$G14_PUSH"
+big_case deny 8 "$G14_FORCE" "$G14_API"'cat <<< " + " ".repeat(200000) + "x" + '"$G14_PUSH"
+big_case deny 8 "$G14_FORCE" "$G14_API"'cat <<-EOF\n" + "\t".repeat(200000) + "x\nEOF" + '"$G14_PUSH"
+big_case deny 8 "$G14_FORCE" '"cat > /dev/null <<'"'"'EOF'"'"'\n" + "x".repeat(200000) + "\nEOF\n" + "echo '"'"'{}'"'"' | gh api repos/o/r/issues/5 -X PATCH --input -\n".repeat(64) + '"$G14_PUSH"
+# (6) Lo que no se acaba en segundos (una ruta de la API con 50.000 tramos, un trabajo de parallel
+# con 5000 partes, 50.000 etiquetas en un --remove-label) se niega al llegar al tope de tiempo del
+# guard (10 s), no despues del timeout.
+big_case deny 15 '' '"gh api -X GET \"repos/o/r/branches/" + "a/".repeat(50000) + "protection\"" + '"$G14_PUSH"
+big_case deny 15 '' '"parallel '"'"'" + Array(5000).fill("git status").join(" && ") + "'"'"' ::: x" + '"$G14_PUSH"
+big_case deny 15 '' '"gh pr edit 5 --remove-label '"'"'" + "a,".repeat(50000) + "'"'"'" + '"$G14_PUSH"
+# (7) Lo que encontro esta ronda: con caracteres de varios bytes, el guard dejaba sin leer el final
+# de la consulta (la mutacion) y de las llaves de una etiqueta; y un salto de linea escrito %0a en
+# la ruta de la API cortaba su lectura ahi, y `x%0a/../<ruta>` llegaba a <ruta>.
+G14_E40="$(printf 'é%.0s' {1..40})"
+G14_E150="$(printf 'é%.0s' {1..150})"
+run_case deny "gh api graphql -f operationName=M -f query='query Q { repository(owner:\"o\", name:\"${G14_E150}\") { id } } mutation M { deleteBranchProtectionRule(input:{branchProtectionRuleId:\"x\"}) { clientMutationId } }'"
+run_case allow "gh api graphql -f query='query Q { repository(owner:\"o\", name:\"${G14_E150}\") { id } }'"
+run_case deny "gh pr edit 5 --remove-label ${G14_E40},no-autom{e,x}rge"
+run_case allow "gh pr edit 5 --remove-label ${G14_E40},semver:{patch,minor}"
+CASES=(
+  'deny|gh api -X DELETE "repos/o/r/x%0a/../branches/main/protection"'
+  'deny|gh api -X DELETE "repos/o/r/x%0A/../branches/main/protection"'
+  'allow|gh api "repos/o/r/contents/a%20b.md"'
+  'allow|gh api -X GET "repos/o/r/branches/main/protection"'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# (8) Un salto de linea en el endpoint de gh api, escrito o codificado una vez o mas (%0a, %0d,
+# %250a, %25%30%61), se niega entero y con su propio aviso: la ruta a la que llega no es la que lee
+# el guard, y ninguna orden real escribe uno. Al final de la ruta, develop lo leia bien y la primera
+# version de esta PR no (lo encontro la revision de #305); los %0d y los dobles, ninguna de las dos.
+G14_EOL='a line break in its endpoint'
+for G14_EP in 'repos/o/r/branches/main/protection%0a' 'repos/o/r/branches/main/protection%0A' \
+  'repos/o/r/git/refs/heads/main%0a' 'repos/o/r/labels/no-automerge%0a' \
+  'repos/o/r/issues/5/labels/no-automerge%0a' 'repos/o/r/issues/5/labels/no-automerge%0A' \
+  'repos/o/r/branches/main/protection%0d' 'repos/o/r/git/refs/heads/main%0D' \
+  'repos/o/r/branches/main/protection%250a' 'repos/o/r/labels/no-automerge%250A' \
+  'repos/o/r/git/refs/heads/main%25%30%61' 'repos/o/r/branches/main/protection%252525250d' \
+  'repos/o/r/x%0a/../branches/main/protection' 'repos/o/r/branches/main/prot{e%0,x}action' \
+  'repos/o/r/pulls/5%0a'; do
+  msg_case "$G14_EOL" "gh api -X DELETE \"$G14_EP\""
+done
+msg_case "$G14_EOL" $'gh api -X DELETE "repos/o/r/branches/main/protection\r"'
+msg_case "$G14_EOL" 'gh api "repos/o/r/issues?q=a%0Ab"'
+# Un escape cuyas cifras rellena o expande el shell puede ser uno.
+msg_case "$G14_EOL" 'gh api -X DELETE repos/o/r/branches/main/protection%{0,1}a'
+msg_case "$G14_EOL" 'gh api -X DELETE repos/o/r/branches/main/protection{%0,x}a'
+msg_case "$G14_EOL" 'gh api -X DELETE "repos/o/r/branches/main/protection%0$A"'
+msg_case "$G14_EOL" 'gh api -X DELETE "repos/o/r/labels/no-automerge%${X}"'
+msg_case "$G14_EOL" 'gh api -X DELETE "repos/o/r/git/refs/heads/main%25$(printf 0a)"'
+# Un escape mal formado en la ruta (un % sin dos cifras hexadecimales detras): gh no envia esa ruta,
+# y como leerlo dependia del locale (`%0é` era un escape en UTF-8 y no en C). En la consulta, no.
+G14_BADESC='a malformed percent-escape'
+msg_case "$G14_BADESC" "gh api -X DELETE \"repos/o/r/branches/main/protection%0${G14_E40:0:1}\""
+msg_case "$G14_BADESC" 'gh api -X DELETE "repos/o/r/branches/main/protection%zz"'
+msg_case "$G14_BADESC" 'gh api -X DELETE "repos/o/r/labels/no-automerge%"'
+msg_case "$G14_BADESC" 'gh api -X DELETE "repos/o/r/git/refs/heads/main%4?x=1"'
+# El % de una expansion del shell (`${sha%% *}`, `$((n%3))`, `$(printf %s …)`) no es un escape: las
+# ordenes reales que lo escriben siguen pasando. Lo que la expansion puede poner, si se lee.
+msg_case "$G14_EOL" 'gh api -X DELETE "repos/o/r/branches/main/protection${X:-%0a}"'
+msg_case "$G14_EOL" 'gh api -X DELETE "repos/o/r/branches/main/protection${X%%%0a}"'
+CASES=(
+  'allow|gh api "repos/o/r/actions/runs/${id%% *}/jobs" --jq ".jobs[]"'
+  'allow|gh api repos/o/${p%%/*}/commits/${p##*/} --jq .sha'
+  'allow|gh api "repos/o/r/commits/${sha%% *}/check-runs?per_page=50"'
+  'allow|gh api "repos/o/r/issues/${list%,*}/comments"'
+  'allow|gh api "repos/o/r/issues/$((n%3))"'
+  'allow|gh api "repos/o/r/contents/$(printf %s "$f")"'
+  'allow|gh api "search/issues?q=100%"'
+  'allow|gh api "repos/o/r/contents/100%25.md"'
+  'allow|gh api "repos/o/r/contents/a%2541.md"'
+  'allow|gh api -X DELETE "repos/o/r/issues/5/labels/bug%20fix"'
+  'allow|gh api "search/issues?q=repo:o/r+is:open+label:%22needs%20review%22"'
+  'allow|gh api "repos/o/r/git/refs/heads/feature%2Fx"'
+  'allow|gh api "repos/$R/contents/100%25.md"'
+  'allow|gh api "repos/o/r/issues/$N/comments"'
+)
+for case_line in "${CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+TEST_POLICY="$POL_PRISMA"
+
+# ============================================================================
+# GROUP 15 — LA TERCERA RONDA, SOBRE #301: EL LIMITE DE TIEMPO VALE DENTRO DE UN SEGMENTO, Y NI UN /tmp
+# LLENO NI UN FALLO DEL GUARD DEJAN PASAR LA ORDEN.
+# El juicio corre en un proceso hijo y el guard espera su veredicto como mucho su limite y un segundo
+# mas: pasado eso, o si el juicio muere sin veredicto o falla, lo para y niega. La palabra de orden se
+# lee en tiempo lineal (6.000 `$()` delante de un push tardaban minutos), y la entrada, los segmentos
+# y las palabras de cada segmento ya no van por here-strings que bash escribe en /tmp pasados 64 KiB.
+# Cada caso falla con el guard de develop de c074869.
+# ============================================================================
+# g15_case <descripcion> <texto que debe decir el DENY> <expresion JS de la orden> [prefijo de la orden]:
+# la orden se construye en node (pasa del tope de un argumento), con la politica de producto; niega
+# (exit 2) con ese texto. El prefijo envuelve al guard (`ulimit`, un PATH sin timeout).
+G15_RUN=(env BASH_GUARD_BRANCH=feature/x BASH_GUARD_POLICY="$POL_PRODUCT"
+  BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO")
+G15_FULL_TMP=(bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
+g15_case() {
+  local what="$1" want="$2" js="$3" out rc
+  shift 3
+  total=$((total + 1))
+  out="$(node -e "process.stdout.write(JSON.stringify({tool_name: 'Bash', tool_input: {command: ${js}}}))" |
+    "${G15_RUN[@]}" PATH="${NO_NET_BIN}:${G15_PATH:-$PATH}" "$@" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 2 ] && [[ "$out" == *"$want"* ]]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  %s: exit %d (%s)\n' "$what" "$rc" "${out:0:300}"
+}
+G15_PUSH='git push --force/-f can rewrite remote history'
+G15_LATE='could not judge this command within'
+# (1) Una palabra de orden de miles de sustituciones vacias se lee en lineal: niega por el push, no
+# por el limite (develop pasaba de los 15 s del hook mas corto de la flota, y el push corria).
+g15_case '6000 $() before a force push' "$G15_PUSH" '"$()".repeat(6000) + "; git push --force origin develop"'
+g15_case '10000 backtick pairs before a force push' "$G15_PUSH" '"``".repeat(10000) + "\ngit push --force origin develop"'
+# (2) Con /tmp lleno, una orden de mas de 64 KiB llega entera al lector (develop la dejaba pasar).
+g15_case 'a 70 KB heredoc with /tmp full' "$G15_PUSH" \
+  '"cat > /tmp/f.txt <<\x27EOF\x27\n" + "x".repeat(70000) + "\nEOF\ngit push --force origin develop"' "${G15_FULL_TMP[@]}"
+# (3) Y los segmentos que saca el lector, aunque pasen de 64 KiB (develop salia con 1).
+g15_case '7000 empty segments with /tmp full' "$G15_PUSH" '":;".repeat(7000) + "git push --force origin develop"' \
+  "${G15_FULL_TMP[@]}"
+# (4) Una palabra de 1 MB se juzga en segundos (develop y main pasaban de 30 s sin veredicto).
+g15_case 'a 1 MB word before a force push' "$G15_PUSH" '"echo " + "a".repeat(1000000) + "; git push --force origin develop"'
+# (5) Y un segmento de mas de 64 KiB con /tmp lleno se lee entero (main y develop salian con 1).
+g15_case '6000 $() in an echo with /tmp full' "$G15_PUSH" '"echo " + "$()".repeat(6000) + "; git push --force origin develop"' \
+  "${G15_FULL_TMP[@]}"
+# (6) Sin `timeout` (macOS) el lector no tiene limite propio: lo para el guard, y no deja nada vivo.
+# Un node falso que no acaba hace de lector colgado; el limite, 1 s, y el guard espera uno mas.
+G15_BIN="$TMP/g15-bin"
+mkdir -p "$G15_BIN"
+for g15_tool in bash cat dirname env ps sleep; do
+  g15_path="$(command -v "$g15_tool")" && ln -sf "$g15_path" "$G15_BIN/$g15_tool"
+done
+printf '%s\n' '#!/bin/sh' "echo \$\$ > '$TMP/g15-node.pid'" 'exec sleep 30' > "$G15_BIN/node"
+chmod +x "$G15_BIN/node"
+G15_T0=$SECONDS
+G15_PATH="$G15_BIN" g15_case 'a reader that never ends, without timeout' "$G15_LATE" '"git status"' env BASH_GUARD_SECONDS=1
+total=$((total + 1))
+g15_pid="$(cat "$TMP/g15-node.pid" 2>/dev/null || true)"
+if [ $((SECONDS - G15_T0)) -le 6 ] && [ -n "$g15_pid" ] && ! kill -0 "$g15_pid" 2>/dev/null; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1)); echo "FAIL  the stuck reader: $((SECONDS - G15_T0)) s, pid ${g15_pid:-none} still alive or unknown"
+  [ -n "$g15_pid" ] && kill -9 "$g15_pid" 2>/dev/null
+fi
+# Y un lector que falla (exit 1: el que no pudo leer su entrada) no deja pasar la orden.
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$G15_BIN/node"
+G15_PATH="$G15_BIN" g15_case 'a reader that fails' 'command reader failed on this command (exit 1)' '"git status"'
 
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi

@@ -6,6 +6,11 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "$comment": {
+      "type": ["string", "array"],
+      "items": { "type": "string" },
+      "description": "Free text for the people who maintain this policy: why a value is what it is, who decided it and when. One string, or an array of strings (one paragraph each). No guard reads it. Allowed only at the top level: every other object here is closed, and a `why` already carries the reason for each reserved path."
+    },
     "agent_may_merge": {
       "type": "boolean",
       "default": false,
@@ -42,6 +47,17 @@
       "items": { "type": "string" },
       "default": ["localhost", "127.0.0.1", "::1"],
       "description": "Hosts curl/wget may reach. Universal policy: network egress is restricted to this allow-list in every repo. Extend per-repo only with a ratified reason."
+    },
+    "one_worktree_per_task": {
+      "type": "boolean",
+      "default": false,
+      "description": "true → the agent may not switch branches (git switch, git checkout <branch>, -b/-c/--detach) in a SHARED checkout: the main worktree (not a linked one) of this repository, of a repository next to it (same parent directory) or of one inside it. Every session working in that checkout sees its files change under it; a task gets its own worktree (git worktree add). Restoring files (git checkout -- <path>, git checkout <existing path>, git checkout -p) still passes, and so does any switch in a linked worktree or in a clone elsewhere. The directory is the session's (the hook input's cwd), followed through cd and git -C. false or absent → no such rule: a repository opts in."
+    },
+    "forbidden_paths": {
+      "type": "array",
+      "default": [],
+      "description": "Directories no session of this repository may touch, each `~/<dir>` (the home of the user running the session) or absolute. Denied: a Bash command that names a path under one (as ~, $HOME, ${HOME} or the absolute home, anywhere in the command text, heredoc bodies included) and a session whose working directory is under one. The file tools are judged too (their path, resolved with symlinks followed, and a Glob pattern rooted in one) when this repository's .claude/settings.json also wires bash-guard.sh as a PreToolUse hook with matcher `Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob`. Empty or absent → no such rule.",
+      "items": { "type": "string", "pattern": "^(~/.+|/.+)$" }
     },
     "set_phase_cmd": {
       "type": "string",
