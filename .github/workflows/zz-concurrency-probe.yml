@@ -1,0 +1,17 @@
+# Prueba temporal de concurrency (studio#276). Se borra con su PR.
+name: zz-concurrency-probe
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && (contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha)) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "evento=${{ github.event.action }} sha=${{ github.event.pull_request.head.sha }}"
+          sleep 150
