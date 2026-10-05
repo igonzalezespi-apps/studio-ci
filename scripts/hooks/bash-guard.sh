@@ -1779,6 +1779,7 @@ check_pr_merge() {
 # merges, possibly with another base. The PR a merge names is the one thing this rule must read
 # right.
 GHW=()
+GH_PH_EXTRA=0
 GHX=()
 GHB=()
 GH_OPAQUE=0
@@ -1832,9 +1833,13 @@ gh_words() {
     GHW+=("$w")
   done
   # Without a replace string, xargs appends what it reads to the command: one more word, unknown.
-  if [ "$PFX_XARGS" -eq 1 ] && [ -z "$PFX_REPL" ]; then
+  # GH_PH_EXTRA: that word is there only because a replace string may be cancelled (2.9.18 added it
+  # with no replace string alone); a rule that would read it as a value given loosely skips it.
+  GH_PH_EXTRA=0
+  if [ "$PFX_XARGS" -eq 1 ] && [ "$PFX_APPEND" -eq 1 ]; then
     GHW+=("$XARGS_PLACEHOLDER")
     GHX+=(1)
+    [ -n "$PFX_REPL" ] && GH_PH_EXTRA=1
   fi
   return 0
 }
@@ -2222,6 +2227,7 @@ check_gh() {
 # only commas and blanks) adds none; one the shell fills in counts, like any other option value.
 label_named() {
   local v="$1" x="${2:-0}"
+  [ "$v" = "$XARGS_PLACEHOLDER" ] && [ "${GH_PH_EXTRA:-0}" -eq 1 ] && return 1
   [ "$x" = 1 ] && return 0
   v="${v//[[:space:],]/}"
   [ -n "$v" ]
@@ -3716,7 +3722,7 @@ check_mwg_merge() {
   [ "$BRACE_OVER" -eq 1 ] && sub='$'
   if [ -z "$rawsub" ]; then
     # Without a replace string, xargs appends what it reads: the subcommand comes from stdin.
-    [ "$SEG_XARGS" -eq 1 ] && [ -z "$SEG_REPL" ] && sub='$'
+    [ "$SEG_XARGS" -eq 1 ] && [ "$SEG_APPEND" -eq 1 ] && sub='$'
   elif [[ "$rawsub" == *'$'* || "$rawsub" == *'`'* ]] || { [ -n "$SEG_REPL" ] && [[ "$rawsub" == *"$SEG_REPL"* ]]; }; then
     sub='$'
   fi
@@ -4249,7 +4255,7 @@ check_egress_literal() {
   done
   # Under xargs, what it reads from stdin becomes part of the command: in place of its replace
   # string, or appended at the end (one more destination word, unknown).
-  if [ "$SEG_XARGS" -eq 1 ] && [ -z "$SEG_REPL" ]; then EGRESS_WORDS+=("$XARGS_PLACEHOLDER"); fi
+  if [ "$SEG_XARGS" -eq 1 ] && [ "$SEG_APPEND" -eq 1 ]; then EGRESS_WORDS+=("$XARGS_PLACEHOLDER"); fi
   n=${#EGRESS_WORDS[@]}
   for (( ; i < n; i++)); do
     w="${EGRESS_WORDS[i]}"
@@ -4498,12 +4504,17 @@ wrapper_cluster() {
 # quote stripping, to join a word whose quoted part spans several of them). Sets PFX_END to the
 # index of the command word (>= the number of words: there is none), PFX_XARGS and PFX_REPL, and
 # PFX_PARALLEL when GNU parallel is among the wrappers: it adds arguments like xargs (`{}` is its
-# replace string when the command holds one; otherwise they are appended).
+# replace string when the command holds one; otherwise they are appended). PFX_APPEND: the innermost
+# xargs or parallel MAY append what it reads: it set no replace string of its own, or (xargs) it
+# also has -L, -l, -n, --max-lines or --max-args, which can cancel the replace string, or an option
+# whose name the guard cannot read for quotes or expansions. Judged on the safe side every time:
+# a word holding a replace string still counts as filled in, the appended word is still added.
 PFX_W=()
 PFX_RAW=()
 PFX_END=0
 PFX_XARGS=0
 PFX_REPL=""
+PFX_APPEND=0
 PFX_PARALLEL=0
 # pfx_next <k>: the index right after the word that starts at token k, in PFX_NEXT. With PFX_RAW
 # (whitespace tokens), a quoted part with blanks spans several tokens and all of them are that one
@@ -4530,9 +4541,11 @@ pfx_next() {
 # (`2>/dev/null git push …`, `<cmds.txt parallel`): an operator with its target attached is one
 # word, and one standing alone takes the next word as its target.
 PFX_REDIR_RE='^[0-9]*(<<<|<<-|<<|<>|<&|<|>>|>\||>&|>|&>>|&>)(.*)$'
+# An xargs option written with a quote, a backslash or an expansion: the guard cannot read its name.
+XARGS_OPAQUE_RE="[\\\\'\"\$\`]"
 prefix_end() {
-  local n=${#PFX_W[@]} i=0 w name p
-  PFX_XARGS=0 PFX_REPL="" PFX_PARALLEL=0
+  local n=${#PFX_W[@]} i=0 w name p own_repl=0 may_cancel=0
+  PFX_XARGS=0 PFX_REPL="" PFX_APPEND=0 PFX_PARALLEL=0
   while [ "$i" -lt "$n" ]; do
     w="${PFX_W[i]}"
     if [[ "$w" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
@@ -4559,25 +4572,32 @@ prefix_end() {
     base_name "$w"
     name="$BASE_NAME"
     wrapper_grammar "$name" || break
+    own_repl=0 may_cancel=0
     pfx_next "$i"
     i=$PFX_NEXT
     while [ "$i" -lt "$n" ]; do
       w="${PFX_W[i]}"
+      if [ "$name" = xargs ]; then
+        case "$w" in
+          --max-l* | --max-a*) may_cancel=1 ;;
+        esac
+        [[ "$w" == -* && "${PFX_RAW[i]:-$w}" =~ $XARGS_OPAQUE_RE ]] && may_cancel=1
+      fi
       case "$w" in
         --)
           i=$((i + 1))
           break
           ;;
         --*=*)
-          [[ "$name" == xargs || "$name" == parallel ]] && [ "${w%%=*}" = --replace ] && PFX_REPL="${w#*=}"
+          [[ "$name" == xargs || "$name" == parallel ]] && [ "${w%%=*}" = --replace ] && PFX_REPL="${w#*=}" && own_repl=1
           # xargs takes any prefix of --replace (`--rep=%`): no other long option of its starts with r.
-          [ "$name" = xargs ] && [[ --replace == "${w%%=*}"* ]] && [ "${#w}" -ge 3 ] && PFX_REPL="${w#*=}"
+          [ "$name" = xargs ] && [[ --replace == "${w%%=*}"* ]] && [ "${#w}" -ge 3 ] && PFX_REPL="${w#*=}" && own_repl=1
           pfx_next "$i"
           i=$PFX_NEXT
           ;;
         --?*)
-          [ "$name" = xargs ] && [[ --replace == "$w"* ]] && [ "${#w}" -ge 3 ] && PFX_REPL="{}"
-          [ "$name" = parallel ] && [ "$w" = --replace ] && PFX_REPL="${PFX_W[i + 1]:-}"
+          [ "$name" = xargs ] && [[ --replace == "$w"* ]] && [ "${#w}" -ge 3 ] && PFX_REPL="{}" && own_repl=1
+          [ "$name" = parallel ] && [ "$w" = --replace ] && PFX_REPL="${PFX_W[i + 1]:-}" && own_repl=1
           pfx_next "$i"
           i=$PFX_NEXT
           if [[ "$WG_LONG" == *" $w "* ]] || { [ "$name" = xargs ] && xargs_valued_prefix "$w"; }; then
@@ -4594,8 +4614,9 @@ prefix_end() {
           wrapper_cluster "$w"
           if [ "$name" = xargs ] || [ "$name" = parallel ]; then
             case "$WC_LETTER" in
-              I) if [ "$WC_NEXT" -eq 1 ]; then PFX_REPL="${PFX_W[i + 1]:-}"; else PFX_REPL="$WC_VALUE"; fi ;;
-              i) if [ -n "$WC_VALUE" ]; then PFX_REPL="$WC_VALUE"; else PFX_REPL='{}'; fi ;;
+              I) if [ "$WC_NEXT" -eq 1 ]; then PFX_REPL="${PFX_W[i + 1]:-}"; else PFX_REPL="$WC_VALUE"; fi; own_repl=1 ;;
+              i) if [ -n "$WC_VALUE" ]; then PFX_REPL="$WC_VALUE"; else PFX_REPL='{}'; fi; own_repl=1 ;;
+              L | l | n) [ "$name" = xargs ] && may_cancel=1 ;;
             esac
           fi
           pfx_next "$i"
@@ -4637,11 +4658,17 @@ prefix_end() {
       PFX_XARGS=1 PFX_PARALLEL=1
       if [ -z "$PFX_REPL" ]; then
         for ((p = i; p < n; p++)); do
-          [[ "${PFX_W[p]}" == *'{}'* ]] && PFX_REPL='{}' && break
+          [[ "${PFX_W[p]}" == *'{}'* ]] && PFX_REPL='{}' && own_repl=1 && break
         done
       fi
     fi
+    if [ "$name" = xargs ] || [ "$name" = parallel ]; then
+      if [ "$own_repl" -eq 0 ] || [ "$may_cancel" -eq 1 ]; then PFX_APPEND=1; else PFX_APPEND=0; fi
+    fi
   done
+  # Whatever the wrappers said, with no replace string the guard can read xargs appends (2.9.18's
+  # rule, kept whole: an empty one, as `-I "'"` leaves it, is no replace string).
+  [ -z "$PFX_REPL" ] && PFX_APPEND=1
   PFX_END=$i
   return 0
 }
@@ -5189,6 +5216,7 @@ deny_parallel_input() {
 
 SEG_XARGS=0
 SEG_REPL=""
+SEG_APPEND=0
 check_segment() {
   local seg="$1" PARTIAL=0 QUOTED=0 cw_end=1
   local -a raw=() tok=() pre_raw=()
@@ -5234,6 +5262,7 @@ check_segment() {
   prefix_end
   SEG_XARGS=$PFX_XARGS
   SEG_REPL=$PFX_REPL
+  SEG_APPEND=$PFX_APPEND
   # Before the command word is cut out: an assignment can be the whole segment.
   check_ci_identity_prefix
   if [ "$PFX_END" -ge "${#tok[@]}" ]; then
