@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# bash-guard.sh — PreToolUse guard (matcher: Bash) for Claude Code
+# bash-guard.sh — PreToolUse guard (matcher: Bash|Monitor|PowerShell) for Claude Code
 # ============================================================================
 # Canonical source: plugins/core-dev/scripts/hooks/bash-guard.sh of the core-dev plugin; in
 # a vendored copy, the .vendor.lock next to this file names the repository and commit.
@@ -19,7 +19,13 @@
 #
 # Harness contract: reads the tool-call JSON from STDIN
 #   {"tool_name":"Bash","tool_input":{"command":"..."}, ...}
-# and emits a verdict. Every rule reads Bash commands, so the hook is wired with matcher `Bash`.
+# and emits a verdict. Every rule reads shell commands, so the hook is wired with matcher
+# `Bash|Monitor|PowerShell`, the three tools that run a command the model writes (`tool_input.command`):
+# Monitor runs it in the same shell as Bash, and PowerShell (native on Windows, opt-in elsewhere) in
+# PowerShell. The guard judges all three as a Bash command: the git, gh and network commands its rules
+# look for are written the same in PowerShell, and a reading it cannot make is denied, not let
+# through. A Monitor call with a `ws` source has no command and nothing to judge. A matcher of `Bash`
+# alone let every Monitor and PowerShell command through unread (found 2026-10-04, #311).
 # The one rule that also judges the file tools is `forbidden_paths` (see the policy schema): a
 # repository that sets it wires this same script a second time, with matcher
 # `Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob`. The verdict:
@@ -1070,9 +1076,11 @@ check_git_merge() {
 # is stale is brought up to date, never deleted; deleting it is not a step of any task. Applies in
 # every repository: the name is what counts, wherever the command runs. With -r the names are
 # remote-tracking (`origin/main`): the part after the remote is judged. A name the shell fills in
-# later is not judged, as for a push.
+# later is not judged, as for a push. Renaming one away (`git branch -m/-M <long-lived> <new>`, or
+# `-m <new>` while on it) leaves no branch by that name either: denied too (#306). Renaming another
+# branch TO a long-lived name (`git branch -M main` after `git init`) is not touched.
 check_git_branch() {
-  local i="$1" a del=0 rem=0 b
+  local i="$1" a del=0 rem=0 mv=0 b
   local -a names=()
   while [ "$i" -lt "${#tok[@]}" ]; do
     a="${tok[i]}"
@@ -1082,17 +1090,69 @@ check_git_branch() {
         names+=("${tok[@]:i}")
         break
         ;;
-      --delete) del=1 ;;
-      --remotes) rem=1 ;;
-      -u | --set-upstream-to) i=$((i + 1)) ;;
-      --*) ;;
+      # git takes any unambiguous prefix of a long option (`--mo` is --move, `--del` --delete).
+      --d | --de | --del | --dele | --delet | --delete) del=1 ;;
+      --m | --mo | --mov | --move) mv=1 ;;
+      --rem | --remo | --remot | --remote | --remotes) rem=1 ;;
+      -u) i=$((i + 1)) ;;
+      # A long option that takes its value as the next word (`--format X`, `--sort X`): skipped.
+      --*=*) ;;
+      --*)
+        case "$a" in
+          --f | --fo | --for | --form | --forma | --format | --so | --sor | --sort | --poi* | --con* | --no-con* | \
+            --mer* | --no-mer* | --set-u*) i=$((i + 1)) ;;
+        esac
+        ;;
       -?*)
         [[ "$a" == *[dD]* ]] && del=1
+        [[ "$a" == *[mM]* ]] && mv=1
         [[ "$a" == *r* ]] && rem=1
         ;;
       *) names+=("$a") ;;
     esac
   done
+  if [ "$mv" -eq 1 ] && [ "$del" -eq 0 ]; then
+    # Counted after the shell's brace expansion: `develop{,-old}` is two names, develop the first.
+    local -a exp=()
+    local n=0
+    for b in ${names[@]+"${names[@]}"}; do
+      n=$((n + 1))
+      # A name the shell fills in or decodes (`${X:-develop}`, `$'\x64evelop'`, an escaped brace)
+      # may be a long-lived branch, unless the text before what is filled in already rules that
+      # out (`feature/$TICKET`). The current branch's name printed by git is the current branch.
+      # The new name (the last of two) may be anything, unless braces make it more than one
+      # (independent review of #311).
+      local bare="${b//[\"\']/}"
+      case "$bare" in
+        '$(git branch --show-current)' | '`git branch --show-current`' | '$(git rev-parse --abbrev-ref HEAD)' | '`git rev-parse --abbrev-ref HEAD`')
+          bare="$(current_branch)"
+          b="$bare"
+          ;;
+      esac
+      if [[ "$bare" == *[\$\\]* ]] && { [ "$n" -lt "${#names[@]}" ] || [ "${#names[@]}" -gt 2 ] || [[ "${bare//\$\{/}" == *"{"* ]]; }; then
+        local pre="${bare%%[\$\\\{]*}" x
+        long_lived_names
+        for x in "${LONG_LIVED_NAMES[@]}"; do
+          if [[ "$x" == "$pre"* ]]; then
+            deny "git branch (renaming) a branch whose name the shell fills in (${b}), which may be a long-lived branch of this flow" \
+              "name the branch in full (the current one: git branch -m <new name>); renaming a long-lived branch away is the user's call"
+          fi
+        done
+      fi
+      brace_words "${b//[\"\']/}"
+      [ "$BRACE_OVER" -eq 0 ] || deny_long_lived_delete "git branch (renaming)" "$b"
+      exp+=("${BRACE_OUT[@]}")
+    done
+    names=(${exp[@]+"${exp[@]}"})
+    # With more names than git takes, every one is judged rather than guess which it renames.
+    case "${#names[@]}" in
+      0) return 0 ;;
+      1) deny_long_lived_delete "git branch (renaming)" "$(current_branch)" ;;
+      2) deny_long_lived_delete "git branch (renaming)" "${names[0]}" ;;
+      *) for b in "${names[@]}"; do deny_long_lived_delete "git branch (renaming)" "$b"; done ;;
+    esac
+    return 0
+  fi
   [ "$del" -eq 1 ] || return 0
   for b in ${names[@]+"${names[@]}"}; do
     [ "$rem" -eq 1 ] && b="${b#*/}"
@@ -1128,6 +1188,10 @@ check_git_update_ref() {
 deny_long_lived_delete() {
   local what="$1" b="${2//[\"\'\\]/}" x
   brace_words "$b"
+  if [ "$BRACE_OVER" -eq 1 ]; then
+    deny "${what} deleting a branch whose braces make more names than the guard reads, which may be a long-lived branch of this flow" \
+      "name the branch in full; deleting a long-lived branch is the user's call"
+  fi
   for x in "${BRACE_OUT[@]}"; do
     if is_long_lived_branch "$x"; then
       deny "${what} deleting '${x}': it is a long-lived branch of this flow, and deleting it is not a step of any task" \
@@ -1314,12 +1378,17 @@ shared_checkout() {
   # Not knowing which repository this guard protects leaves every main checkout shared.
   if [ -n "$mine" ] && [ "$top" != "$mine" ] && [ "${top%/*}" != "${mine%/*}" ]; then
     case "$top" in "$mine"/*) ;; *) return 1 ;; esac
+    # A repository nested inside a linked worktree (`git init <worktree>/tmp/x`) belongs to that
+    # worktree's task, not to the shared checkout (#311 (b)). Told by where it is, under
+    # `.claude/worktrees/<task>/`, where this flow puts every worktree: a `.git` file, or an entry
+    # in `.git/worktrees`, is something anyone can write (independent review of #311).
+    case "$top" in "$mine"/.claude/worktrees/?*/?*) return 1 ;; esac
   fi
   printf '%s' "$top"
 }
 
 check_git_switch() {
-  local sub="$1" i="$2" a newb=0 first="" top
+  local sub="$1" i="$2" a p newb=0 first="" top
   [ "$ONE_WORKTREE_PER_TASK" = "true" ] || return 0
   local -a args=("${tok[@]:i}")
   for a in ${args[@]+"${args[@]}"}; do
@@ -1327,18 +1396,44 @@ check_git_switch() {
   done
   command_git_dir || return 0
   if [ "$sub" = checkout ]; then
+    local k=0 pfile=0
     for a in ${args[@]+"${args[@]}"}; do
+      k=$((k + 1))
       case "$a" in
-        --) return 0 ;;
+        # `--` restores the paths after it; with none (a redirection, a comment or an expansion
+        # that may be empty are not paths), `git checkout feature --` switches.
+        --)
+          # Paths a substitution prints (the segment cut at it, PARTIAL) or xargs appends (SEG_XARGS)
+          # follow `--` without showing: `git checkout HEAD -- $(git diff --name-only)` restores.
+          # xargs with a replace string (`-I{}`) appends nothing: it fills in where `{}` stands.
+          if [ "${PARTIAL:-0}" -eq 1 ] || { [ "${SEG_XARGS:-0}" -eq 1 ] && [ -z "${SEG_REPL:-}" ]; }; then return 0; fi
+          local skip=0
+          for p in "${args[@]:k}"; do
+            if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+            case "$p" in
+              '#'*) break ;;
+              # A redirection's target is not a path: glued (`2>/dev/null`) or the next word.
+              *'>' | *'<') skip=1 ;;
+              '' | '""' | "''" | *'>'* | '<'*) ;;
+              *) return 0 ;;
+            esac
+          done
+          break
+          ;;
         -p | --patch) return 0 ;;
         -b | -B | --orphan) newb=1 ;;
+        # Its value is a file of paths, not a path restored: empty, the branch is switched. Git takes
+        # any unambiguous prefix (`--pathspec-from`).
+        --pathspec-fr*) pfile=1 ;;
       esac
     done
-    if [ "$newb" -eq 0 ]; then
+    if [ "$newb" -eq 0 ] && [ "$pfile" -eq 0 ]; then
       for a in ${args[@]+"${args[@]}"}; do
         case "$a" in -*) continue ;; esac
-        first="$a"
-        break
+        # `git checkout <rev> <path>…` restores files, without `--` too: a path after the first
+        # word means no branch is switched (#311).
+        [ -n "$first" ] && [ -e "$CMD_GIT_DIR/$a" ] && return 0
+        [ -n "$first" ] || first="$a"
       done
       [ -n "$first" ] && [ -e "$CMD_GIT_DIR/$first" ] && return 0
     fi
@@ -1685,15 +1780,29 @@ check_pr_merge() {
 # right.
 GHW=()
 GHX=()
+GHB=()
 GH_OPAQUE=0
 # The word that stands for what xargs appends (see prefix_end): a `$` makes every rule that asks
 # "is this word literal?" get a truthful no.
 # shellcheck disable=SC2016 # literal on purpose
 XARGS_PLACEHOLDER='$__XARGS__'
+# xargs_valued_prefix <word>: is it an unambiguous prefix of one of xargs' long options that take
+# their value as the next word (`--delim ,` is --delimiter)? GNU getopt takes any such prefix, and
+# its value read as the command word left the command judged by no rule (independent review of #324).
+xargs_valued_prefix() {
+  local o hits=0
+  [ "${#1}" -ge 3 ] || return 1
+  # --eof and --max-lines take their value only with `=`: the next word is the command.
+  for o in --arg-file --delimiter --max-args --max-procs --max-chars --process-slot-var; do
+    [[ "$o" == "$1"* ]] && hits=$((hits + 1))
+  done
+  [ "$hits" -eq 1 ]
+}
 gh_words() {
   local w k=0 n
   GHW=()
   GHX=()
+  GHB=()
   egress_words "$1"
   n=${#EGRESS_WORDS[@]}
   PFX_W=()
@@ -1714,6 +1823,8 @@ gh_words() {
   for ((k = k + 1; k < n; k++)); do
     w="${EGRESS_WORDS[k]}"
     if [[ "$w" == *'$'* || "$w" == *'`'* ]]; then GHX+=(1); else GHX+=(0); fi
+    # GHB: the shell multiplies this word (an unquoted brace that expands, see egress_words).
+    if [[ "$w" == *$'\x1e'* ]]; then GHB+=(1); else GHB+=(0); fi
     w="${w//$'\x1e'/}"
     w="${w//$'\x1f'/\$}"
     # A word holding xargs' replace string is filled in from stdin.
@@ -1787,12 +1898,48 @@ check_gh() {
   gh_words "$seg"
   opaque="$GH_OPAQUE"
   n=${#GHW[@]}
+  # A word the shell multiplies past what brace_words reads may become any words (#306). In the
+  # subcommand slots (`gh {api,-f=<2100 x>} -X DELETE …`) it may be any subcommand; in `gh api` it
+  # may be the method or a field that makes the call write (`{-XDELETE,-H…}`). Elsewhere (a long
+  # value, `--{delete-branch,…}`) the rules below read it; a quoted one is one word, untouched.
+  local pos=0 skipv=0 sub_api=0
+  for ((i = 0; i < n; i++)); do
+    w="${GHW[i]}"
+    if [ "$skipv" -eq 1 ]; then skipv=0; continue; fi
+    case "$w" in
+      -R | --repo | --hostname) skipv=1; continue ;;
+      -*) ;;
+      *)
+        pos=$((pos + 1))
+        [ "$pos" -eq 1 ] && [ "$w" = api ] && sub_api=1
+        ;;
+    esac
+    [ "${GHB[i]:-0}" -eq 1 ] && [ "${#w}" -gt "$BRACE_MAX_LEN" ] || continue
+    # The second slot of `gh api` is its endpoint, which check_gh_api_braces reads.
+    if [ "$pos" -lt 2 ] || { [ "$pos" -eq 2 ] && [ "$sub_api" -eq 0 ] && [[ "$w" != -* ]]; }; then
+      deny "gh with a word in its subcommand slots whose braces expand past what the guard reads (${#w} characters): it may turn into any subcommand or flag" \
+        "write the subcommand out; quote a long value that holds braces"
+    fi
+    if [ "$sub_api" -eq 1 ] && { could_spell "$w" -X || could_spell "$w" --method || could_spell "$w" -f || could_spell "$w" -F || could_spell "$w" --input; }; then
+      deny "gh api with a word whose braces expand past what the guard reads (${#w} characters) and may spell its method or a field, so the guard cannot tell whether it writes" \
+        "write the method and fields out; quote a long value that holds braces"
+    fi
+  done
+  i=0
   while [ "$i" -lt "$n" ]; do
     w="${GHW[i]}"
     # Brace expansion makes several words of one (`--{admin,squash}`): the flags read below are
     # looked for in each of them too.
     if [ "$opts_done" -eq 0 ] && [[ "$w" == *'{'*,* ]]; then
       brace_words "$w"
+      # Past what brace_words reads, the word may be any flag it could spell.
+      if [ "$BRACE_OVER" -eq 1 ]; then
+        could_spell "$w" --admin && admin=1
+        if could_spell "$w" --remove-label=; then
+          removed+=("$w")
+          removed_x+=("${GHX[i]}")
+        fi
+      fi
       for a in "${BRACE_OUT[@]}"; do
         case "$a" in
           --admin) admin=1 ;;
@@ -2060,6 +2207,7 @@ check_gh() {
           ;;
       esac
     fi
+    check_gh_api_braces "$sub2"
     check_gh_api_labels "$sub2" "$sub2_x"
     check_gh_api_refs "$sub2" "$sub2_x"
     check_gh_api_protection "$sub2" "$sub2_x"
@@ -2277,6 +2425,10 @@ owner_label_list() {
   fi
   # Brace expansion makes several words of one (`--remove-label={revision-humana,x}`): each counts.
   brace_words "$1"
+  if [ "$BRACE_OVER" -eq 1 ]; then
+    HELD_LABEL="$OWNER_LABELS"
+    return 0
+  fi
   for b in "${BRACE_OUT[@]}"; do
     v="${b//\"/}"
     while :; do
@@ -2739,6 +2891,22 @@ segs_holding() {
   return 0
 }
 
+# An endpoint whose braces make more paths than brace_words reads, or that is longer than it expands,
+# may be any path: a label, a long-lived branch, branch protection. Written with any method that
+# writes, it is denied (#306); no real endpoint comes near either limit.
+check_gh_api_braces() {
+  [ -n "$1" ] || return 0
+  brace_words "$1"
+  [ "$BRACE_OVER" -eq 1 ] || return 0
+  gh_api_request
+  case "$API_METHOD" in
+    POST | PUT | PATCH | DELETE | ANY) ;;
+    *) return 0 ;;
+  esac
+  deny "gh api ${API_METHOD/ANY/<method>} with an endpoint whose braces make more paths than the guard reads, which may write a label, a long-lived branch or branch protection" \
+    "write the endpoint in full, one call per path"
+}
+
 check_gh_api_labels() {
   local e
   [ -n "$1" ] || return 0
@@ -2850,6 +3018,10 @@ check_gh_api_refs() {
     fi
     [[ "$fb" == *'$'* || "$fb" == *'`'* ]] && return 0
     brace_words "$fb"
+    if [ "$BRACE_OVER" -eq 1 ]; then
+      deny "gh api ${API_METHOD/ANY/<method>} ${ep}: writes a commit onto a branch whose braces make more names than the guard reads, which may be a long-lived branch" \
+        "commit in your branch's worktree and push it (git push), then open a PR; a long-lived branch moves by a merged PR"
+    fi
     for w in "${BRACE_OUT[@]}"; do
       is_long_lived_branch "$w" || continue
       deny "gh api ${API_METHOD/ANY/<method>} ${ep}: writes a commit onto the long-lived branch '${w}', past the rules git push follows" \
@@ -3299,13 +3471,23 @@ unquoted() {
   return 0
 }
 
-# shell_words <word>: the words the shell makes of it, quotes taken out and braces expanded, in
-# SHELL_WORDS (`{GITHUB_ACTIONS,X}=true` is two assignments to export and env).
+# shell_words <word> [<word as written>]: the words the shell makes of it, quotes taken out and braces
+# expanded, in SHELL_WORDS (`{GITHUB_ACTIONS,X}=true` is two assignments to export and env).
 SHELL_WORDS=()
 shell_words() {
+  local name bare="${2:-$1}"
   unquoted "$1"
   brace_words "$UNQUOTED"
   SHELL_WORDS=("${BRACE_OUT[@]}")
+  # Past what brace_words reads, the word may be either name, and its assignment (#306); but only a
+  # brace outside quotes expands (`sed 's/{1..12}/x/'` is one word, as written).
+  # One linear pass, left to right; an escaped quote opens nothing.
+  [ "$BRACE_OVER" -eq 1 ] && bare="$(printf '%s\n' "$bare" | sed -E "s/\\\\.|'[^']*'|\"([^\"\\\\]|\\\\.)*\"//g")"
+  if [ "$BRACE_OVER" -eq 1 ] && [[ "$bare" == *'{'* ]]; then
+    for name in GITHUB_ACTIONS MWG_WRITE_TOKEN_KIND; do
+      could_spell "$UNQUOTED" "$name" && SHELL_WORDS+=("$name" "$name=")
+    done
+  fi
   return 0
 }
 
@@ -3321,7 +3503,7 @@ check_ci_identity_prefix() {
   local k w last=$PFX_END
   [ "$last" -lt "${#tok[@]}" ] || last=$((${#tok[@]} - 1))
   for ((k = 0; k <= last; k++)); do
-    shell_words "${tok[k]}"
+    shell_words "${tok[k]}" "${raw[k]-}"
     for w in "${SHELL_WORDS[@]}"; do
       if [[ "$w" =~ $CI_IDENTITY_ASSIGN_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
     done
@@ -3343,7 +3525,7 @@ check_ci_identity_builtin() {
           -v?*) a="${a#-v}" ;;
           *) continue ;;
         esac
-        shell_words "$a"
+        shell_words "$a" "${raw[k]-}${raw[k + 1]-}"
         for w in "${SHELL_WORDS[@]}"; do
           w="${w%%\[*}"
           if [[ "$w" =~ $CI_IDENTITY_NAME_RE ]]; then deny_ci_identity "$w"; fi
@@ -3360,7 +3542,7 @@ check_ci_identity_builtin() {
           # -d, -i, -n, -N, -p, -t and -u take the next word as their value (-a names an array).
           -*[dinNptu]) k=$((k + 1)) ;;
           *)
-            shell_words "$a"
+            shell_words "$a" "${raw[k]-}"
             for w in "${SHELL_WORDS[@]}"; do
               if [[ "$w" =~ $CI_IDENTITY_NAME_RE ]]; then deny_ci_identity "$w"; fi
             done
@@ -3379,7 +3561,7 @@ check_ci_identity_builtin() {
         ;;
       +*) continue ;;
     esac
-    shell_words "$a"
+    shell_words "$a" "${raw[k]-}"
     for a in "${SHELL_WORDS[@]}"; do
       if [[ "$a" =~ $CI_IDENTITY_ASSIGN_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
       # A nameref (declare/typeset/local -n) to one of them sets it through another name.
@@ -3530,6 +3712,8 @@ check_mwg_merge() {
   # Brace expansion makes several words of one (`{merge,x}`): the first is the subcommand.
   brace_words "$sub"
   sub="${BRACE_OUT[0]}"
+  # Past what brace_words reads, the subcommand may be any: as if the shell filled it in (#306).
+  [ "$BRACE_OVER" -eq 1 ] && sub='$'
   if [ -z "$rawsub" ]; then
     # Without a replace string, xargs appends what it reads: the subcommand comes from stdin.
     [ "$SEG_XARGS" -eq 1 ] && [ -z "$SEG_REPL" ] && sub='$'
@@ -3562,7 +3746,7 @@ check_env_dump() {
     a="${tok[k]}"
     # Only a name that starts with `.` (or a word with braces, quotes or backslashes, which the
     # shell may turn into one) can be an environment file: the rest is skipped cheaply.
-    case "$a" in .* | */.* | *[{\"\'\\]*) ;; *) continue ;; esac
+    case "$a" in .* | */.* | *[\{\"\'\\]*) ;; *) continue ;; esac
     quoted=0
     case "${raw[k]:-$a}" in *[\"\']*) quoted=1 ;; esac
     # A whitespace token may sit inside a quoted string that an earlier token opened.
@@ -3645,8 +3829,11 @@ env_glob() {
 # opens a parameter expansion, not a list. With a needle, only a word that can expand into one
 # containing it is expanded: a comma list keeps the order of what it copies, so the needle's
 # characters are in <word> in that order (a sequence makes characters of its own: a word holding
-# `..` is always expanded). Words longer than BRACE_MAX_LEN are not expanded; past
-# BRACE_MAX words the expansion stops and BRACE_OVER is 1.
+# `..` is always expanded). Past BRACE_MAX words the expansion stops and BRACE_OVER is 1; a word
+# longer than BRACE_MAX_LEN is not expanded, and BRACE_OVER is 1 too: it may expand into any word,
+# and every caller treats it as possibly the name it looks for (found 2026-10-03: such a word slipped
+# past the callers that read only BRACE_OUT, #306). A word that holds no list or sequence, or not the
+# needle's characters in order, is never over.
 BRACE_OUT=()
 BRACE_OVER=0
 BRACE_MAX=64
@@ -3657,13 +3844,16 @@ brace_words() {
   BRACE_OUT=("$w")
   BRACE_OVER=0
   [[ "$w" == *'{'* && ("$w" == *,* || "$w" == *..*) ]] || return 0
-  [ "${#w}" -le "$BRACE_MAX_LEN" ] || return 0
   r="$w"
   [[ "$w" == *..* ]] && needle=""
   for ((k = 0; k < ${#needle}; k++)); do
     [[ "$r" == *"${needle:k:1}"* ]] || return 0
     r="${r#*"${needle:k:1}"}"
   done
+  if [ "${#w}" -gt "$BRACE_MAX_LEN" ]; then
+    BRACE_OVER=1
+    return 0
+  fi
   BRACE_OUT=()
   todo=("$w")
   while [ "${#todo[@]}" -gt 0 ]; do
@@ -3678,6 +3868,42 @@ brace_words() {
     else
       BRACE_OUT+=("$w")
     fi
+  done
+  return 0
+}
+
+# could_spell <word> <name>: <word> holds the characters of <name> in order, so that its braces could
+# expand into a word containing it (a comma list keeps the order of what it copies). For a word
+# brace_words leaves over (BRACE_OVER): only the names it could spell count as possibly there. A
+# sequence (`{a..e}`, `{1..40}`) makes characters of its own: it is read as every character of its
+# range, in order (a superset of what any one word gets), and one the guard cannot read could spell
+# anything.
+could_spell() {
+  local r="$1" k c x y lo hi chars pre post
+  while [[ "$r" == *..* ]]; do
+    if [[ "$r" =~ ^(.*)\{([A-Za-z]|-?[0-9]{1,6})\.\.([A-Za-z]|-?[0-9]{1,6})(\.\.-?[0-9]{1,6})?\}(.*)$ ]]; then
+      pre="${BASH_REMATCH[1]}" x="${BASH_REMATCH[2]}" y="${BASH_REMATCH[3]}" post="${BASH_REMATCH[5]}" chars=""
+      if [[ "$x$y" =~ ^-?[0-9]+-?[0-9]+$ ]]; then
+        lo=$((x < y ? x : y)) hi=$((x < y ? y : x))
+        [ $((hi - lo)) -le 1000 ] || return 0
+        chars="$(seq "$lo" "$hi" | tr -d '\n')"
+      elif [[ "$x$y" =~ ^[A-Za-z][A-Za-z]$ ]]; then
+        lo="$(printf '%d' "'$x")" hi="$(printf '%d' "'$y")"
+        [ "$lo" -le "$hi" ] || { k="$lo"; lo="$hi"; hi="$k"; }
+        for ((k = lo; k <= hi; k++)); do chars+="$(printf '%b' "\\$(printf '%03o' "$k")")"; done
+      else
+        return 0
+      fi
+      r="${pre}${chars}${post}"
+      [ "${#r}" -le 65536 ] || return 0
+    else
+      return 0
+    fi
+  done
+  for ((k = 0; k < ${#2}; k++)); do
+    c="${2:k:1}"
+    [[ "$r" == *"$c"* ]] || return 1
+    r="${r#*"$c"}"
   done
   return 0
 }
@@ -4344,15 +4570,17 @@ prefix_end() {
           ;;
         --*=*)
           [[ "$name" == xargs || "$name" == parallel ]] && [ "${w%%=*}" = --replace ] && PFX_REPL="${w#*=}"
+          # xargs takes any prefix of --replace (`--rep=%`): no other long option of its starts with r.
+          [ "$name" = xargs ] && [[ --replace == "${w%%=*}"* ]] && [ "${#w}" -ge 3 ] && PFX_REPL="${w#*=}"
           pfx_next "$i"
           i=$PFX_NEXT
           ;;
         --?*)
-          [ "$name" = xargs ] && [ "$w" = --replace ] && PFX_REPL="{}"
+          [ "$name" = xargs ] && [[ --replace == "$w"* ]] && [ "${#w}" -ge 3 ] && PFX_REPL="{}"
           [ "$name" = parallel ] && [ "$w" = --replace ] && PFX_REPL="${PFX_W[i + 1]:-}"
           pfx_next "$i"
           i=$PFX_NEXT
-          if [[ "$WG_LONG" == *" $w "* ]]; then
+          if [[ "$WG_LONG" == *" $w "* ]] || { [ "$name" = xargs ] && xargs_valued_prefix "$w"; }; then
             pfx_next "$i"
             i=$PFX_NEXT
           fi
@@ -5093,6 +5321,10 @@ check_segment() {
     export | declare | typeset | readonly | local | let | printf | read) check_ci_identity_builtin ;;
   esac
 
+  # `source .env` and `. .env` load the file into the shell without printing it, and are not denied
+  # on purpose: a script that loads its own variables is the ordinary use, and what this rule keeps
+  # out is the secrets in the transcript (decided 2026-10-04, #306). Printing what was loaded takes
+  # one of the commands below, or env, and those stay judged.
   case "$cmd0" in
     cat | head | tail | less | more | grep | sed | awk | strings | base64 | xxd | od | tee)
       check_env_dump
@@ -6486,7 +6718,7 @@ fi
 
 # --- Paths no session may touch (policy: forbidden_paths) ----------------------
 # Each entry of `forbidden_paths` (`~/<dir>` or an absolute path) is out of every session of this
-# repository: a Bash command that names a path under it — in any of its spellings: `~`, `$HOME`,
+# repository: a Bash, Monitor or PowerShell command that names a path under it — in any of its spellings: `~`, `$HOME`,
 # `${HOME}` or the absolute home, with a path boundary on both sides, anywhere in the command text
 # (heredoc bodies included) — and a session whose working directory is under it are denied. The
 # same script judges the file tools when the repository wires it for them as well
@@ -6512,11 +6744,27 @@ function expand(p) {
   return p;
 }
 // Absolute and normalised, with the symlinks of its longest existing ancestor resolved.
-function real(p) {
+// `..` after a link goes up from where the link points, as the kernel does (`link/../x`): each prefix
+// is resolved before its `..` applies.
+function real(p, depth = 0) {
+  const s = path.isAbsolute(p) ? p : cwd + "/" + p;
+  if (!/(^|\/)\.\.(\/|$)/.test(s)) return realPath(s, depth);
+  let cur = "/";
+  for (const c of s.split("/")) {
+    if (!c || c === ".") continue;
+    cur = c === ".." ? path.dirname(realPath(cur, depth)) : path.join(cur, c);
+  }
+  return realPath(cur, depth);
+}
+function realPath(p, depth) {
   let abs = path.resolve(cwd, p);
   const rest = [];
   for (;;) {
     try { return path.join(fs.realpathSync.native(abs), ...rest); } catch (e) {}
+    // A link whose target does not exist (yet) still points there: follow it (#311).
+    try {
+      if (depth < 8 && fs.lstatSync(abs).isSymbolicLink()) return path.join(real(path.resolve(path.dirname(abs), fs.readlinkSync(abs)), depth + 1), ...rest);
+    } catch (e) {}
     const parent = path.dirname(abs);
     if (parent === abs) return path.resolve(cwd, p);
     rest.unshift(path.basename(abs));
@@ -6534,12 +6782,70 @@ for (const e of entries) {
 }
 if (!roots.length) process.exit(0);
 const under = (p, root) => p === root || p.startsWith(root.endsWith("/") ? root : root + "/");
+// Both readings of `..` count: the kernel's, from where a link points (real), and the text's, which
+// Claude Code's file tools apply before opening (`link/../link/x` is `link/x`; independent review of
+// #311, which found the file tools reading through it).
 function hit(p) {
   if (typeof p !== "string" || !p) return null;
   const x = expand(p);
   if (x === null) return null;
-  const r = real(x);
-  return roots.find((o) => under(r, o.real) || under(path.resolve(cwd, x), o.abs)) || null;
+  const r = real(x), l = realPath(path.resolve(cwd, x), 0);
+  return roots.find((o) => under(r, o.real) || under(l, o.real) || under(path.resolve(cwd, x), o.abs)) || null;
+}
+// A directory that holds a root: a recursive read from it, or a pattern that may expand into it,
+// reaches the root (found 2026-10-04: a search over the whole home listed the names under one, #311).
+function holder(p) {
+  if (typeof p !== "string" || !p) return null;
+  const x = expand(p);
+  if (x === null) return null;
+  const r = real(x), l = realPath(path.resolve(cwd, x), 0);
+  const a = path.resolve(cwd, x);
+  return roots.find((o) => under(o.real, r) || under(o.real, l) || under(o.abs, a)) || null;
+}
+// One path component of a pattern (`*`, `?`, `[…]`, `{a,b}`) against a name. A pattern the guard
+// cannot turn into a regex is compared as written, as bash leaves a pattern that matches nothing.
+function compMatch(g, name) {
+  if (!/[*?[{]/.test(g)) return g === name;
+  let re = "", depth = 0;
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else if (c === "[") {
+      const j = g.indexOf("]", i + 2);
+      if (j < 0) { re += "\\["; continue; }
+      re += "[" + g.slice(i + 1, j).replace(/^!/, "^").replace(/\\/g, "\\\\") + "]";
+      i = j;
+    } else if (c === "{") { re += "(?:"; depth++; }
+    else if (c === "}" && depth) { re += ")"; depth--; }
+    else if (c === "," && depth) re += "|";
+    else re += c.replace(/[.+^$()|\\\]{}]/g, "\\$&");
+  }
+  try { return new RegExp("^" + re + ")".repeat(depth) + "$").test(name); } catch (e) { return g === name; }
+}
+// Can an absolute pattern reach a root? Its components match the root's, one by one (`**` matches
+// any depth). One that goes on below the root names what is in it. One that stops at the root names
+// the directory itself: that reads what is in it only for a command that lists (`ls ~/*`) or a
+// recursive read. One that stops above the root names a directory that holds it: only a recursive
+// read reaches it.
+function globReaches(g, root, rec, lists) {
+  const pc = g.split("/"), rc = root.split("/");
+  for (let i = 0; i < Math.min(pc.length, rc.length); i++) {
+    if (pc[i] === "**") return true;
+    if (!compMatch(pc[i], rc[i])) return false;
+  }
+  if (pc.length > rc.length) return true;
+  return pc.length === rc.length ? rec || lists : rec;
+}
+function globHit(g, rec, lists = rec) {
+  return roots.find((o) => globReaches(g, o.abs, rec, lists) || globReaches(g, o.real, rec, lists)) || null;
+}
+// An ignore glob that leaves out every directory with the root's name: `dir`, `dir/`, `**/dir/**`
+// (or a pattern that matches the name). One with a path in it (`x/dir`) leaves out another place.
+function dirGlob(v, b) {
+  if (typeof v !== "string") return false;
+  const x = v.replace(/^(\*\*\/)+/, "").replace(/(\/\*{1,3})+$/, "").replace(/\/+$/, "");
+  return x !== "" && !x.includes("/") && compMatch(x, b);
 }
 function report(what, root) { process.stdout.write(what.replace(/[\t\n\r]/g, " ") + "\t" + root.entry); process.exit(0); }
 let h = hit(cwd);
@@ -6551,16 +6857,36 @@ if (["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"].includes(tool)) {
 if (tool === "Grep" || tool === "Glob") {
   h = hit(input.path);
   if (h) report(tool + " in " + input.path, h);
+  const base = typeof input.path === "string" && input.path ? input.path : cwd;
   const g = typeof input.pattern === "string" ? input.pattern : "";
   if (tool === "Glob" && /^(\/|~|\$HOME|\$\{HOME\})/.test(g)) {
     const fixed = g.split(/[*?[{]/)[0];
     h = hit(fixed || "/");
     if (h) report("Glob " + g, h);
   }
+  // Both search every directory under where they start: from one that holds a root, they reach it.
+  // Grep from its path (or the session's directory); Glob from the fixed directory of its pattern.
+  // A Grep whose glob leaves the root out (`!dir/**`) does not reach it.
+  if (tool === "Grep") {
+    h = holder(base);
+    const gl = typeof input.glob === "string" ? input.glob : "";
+    if (h && !(gl.startsWith("!") && dirGlob(gl.slice(1), path.basename(h.abs)))) report("Grep over " + base + ", which holds", h);
+  } else {
+    const ex = expand(/^(\/|~|\$HOME|\$\{HOME\})/.test(g) ? g : base + "/" + g);
+    h = ex === null ? null : globHit(path.resolve(cwd, ex), false);
+    // Its fixed directory through a link (`casa/**` with casa -> ~): the pattern runs where it points.
+    if (!h && ex !== null) {
+      const abs = path.resolve(cwd, ex), fixed = abs.split(/[*?[{]/)[0], dir = fixed.endsWith("/") ? fixed : path.dirname(fixed) + "/";
+      const r = realPath(dir, 0);
+      if (r !== path.resolve(dir)) h = globHit(path.join(r, abs.slice(dir.length)), false);
+    }
+    if (h) report("Glob " + g + (input.path ? " in " + input.path : "") + ", which reaches", h);
+  }
   process.exit(0);
 }
 const cmd = typeof input.command === "string" ? input.command : "";
-if (tool !== "Bash" || !cmd) process.exit(0);
+// Monitor and PowerShell run a command too, judged as Bash's (#311).
+if (!["Bash", "Monitor", "PowerShell"].includes(tool) || !cmd) process.exit(0);
 const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const homes = [...new Set([home, homeReal].filter(Boolean))];
 for (const o of roots) {
@@ -6578,12 +6904,486 @@ for (const o of roots) {
   // As written, and as the shell reads it once quotes and backslashes are gone (~/"dir", \~/dir).
   if (re.test(cmd) || re.test(cmd.replace(/["'\\]/g, ""))) report("the command", o);
 }
+// The command's words, as the shell reads them closely enough to see where they point: each path is
+// resolved (`~//dir`, `~/./dir`, `../../dir`, `${HOME%/}/dir`, `/proc/self/root/…`), from the directory
+// the command's own `cd`s leave it in. A word under a root is denied, and so is a recursive read
+// (find, grep -r, tar, rsync…) from a directory that holds one, or a pattern whose fixed part holds
+// one (`~/*`, `~/{dir,x}`): bash expands it into the root (#311).
+// The index of the `)` that closes the `$(` at i, past quotes and escapes inside it (-1: none).
+function closeSub(text, i) {
+  let depth = 0;
+  for (let j = i + 1; j < text.length; j++) {
+    const c = text[j];
+    if (c === "\\") { j++; continue; }
+    if (c === "'") { j = text.indexOf("'", j + 1); if (j < 0) return -1; continue; }
+    if (c === '"') { j++; while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1; continue; }
+    if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return j;
+  }
+  return -1;
+}
+// A heredoc's body is not commands: it stays on its segment (seg.docs), read only where a shell runs it.
+// The same text is read once: the judging of a substitution reads its text again at every level of
+// nesting, and the time grew by about 1.8 for each one (independent review of #311).
+const wordsMemo = new Map();
+function words(text) {
+  let r = wordsMemo.get(text);
+  if (!r) { r = wordsRaw(text); wordsMemo.set(text, r); }
+  return r;
+}
+function wordsRaw(text) {
+  const segs = [];
+  let seg = [], w = "", inw = false, q = "", docs = [], pd = 0;
+  const arith = [], nested = [];
+  const end = () => { if (inw) seg.push(w); w = ""; inw = false; };
+  const cut = () => { end(); if (seg.length) segs.push(seg); seg = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q === "'") { if (c === "'") q = ""; else w += c; continue; }
+    if (q === "$'") { if (c === "'") q = ""; else if (c === "\\" && i + 1 < text.length) w += text[++i]; else w += c; continue; }
+    if (q === '"') {
+      if (c === '"') q = "";
+      else if (c === "\\" && i + 1 < text.length) w += text[++i];
+      // A substitution inside double quotes still runs (`"$(find .)"`): its text is read after.
+      else if ((c === "$" && text[i + 1] === "(" && text[i + 2] !== "(") || c === "`") {
+        let j = i + 1;
+        if (c === "`") { while (j < text.length && text[j] !== "`") j += text[j] === "\\" ? 2 : 1; }
+        else { j = closeSub(text, i); if (j < 0) j = text.length; }
+        nested.push(text.slice(c === "`" ? i + 1 : i + 2, j));
+        w += text.slice(i, j + 1);
+        i = j;
+      } else w += c;
+      continue;
+    }
+    if (c === "$" && (text[i + 1] === "'" || text[i + 1] === '"')) { q = text[i + 1] === "'" ? "$'" : '"'; inw = true; i++; continue; }
+    if (c === "'" || c === '"') { q = c; inw = true; continue; }
+    // A comment runs to the end of its line; an apostrophe in it opens nothing.
+    if (c === "#" && !inw) { while (i + 1 < text.length && text[i + 1] !== "\n") i++; continue; }
+    // Inside arithmetic (`$((1<<2))`, `(( y = 1 << 2 ))`) `<<` is a shift, not a heredoc. What is in
+    // it is still read: `$(( $(cmd) ))` runs cmd, and `((cmd) )` is a subshell.
+    if (c === "(") {
+      if (text[i + 1] === "(") arith.push(pd);
+      pd++;
+    } else if (c === ")") {
+      pd--;
+      while (arith.length && pd <= arith[arith.length - 1]) arith.pop();
+    }
+    // A here-string (`<<<word`) is a redirection; its word is a word of its own.
+    if (c === "<" && text[i + 1] === "<" && text[i + 2] === "<") { end(); i += 2; continue; }
+    if (c === "<" && text[i + 1] === "<" && !arith.length) {
+      end();
+      i += 2;
+      const dash = text[i] === "-";
+      if (dash) i++;
+      while (text[i] === " " || text[i] === "\t") i++;
+      let d = "";
+      for (; i < text.length && !" \t\n;&|()<>".includes(text[i]); i++) if (!"'\"\\".includes(text[i])) d += text[i];
+      i--;
+      if (d) docs.push({ d, dash, seg });
+      continue;
+    }
+    // A redirection glued to a word (`~>/dev/null`) ends it; its target is a word of its own.
+    if ((c === "<" || c === ">") && text[i + 1] !== "(") { end(); continue; }
+    if (c === "\\" && i + 1 < text.length) { w += text[++i]; inw = true; continue; }
+    // An unquoted substitution is part of its word, as the shell has it (`grep -r x $(true) ~` is
+    // one grep, found in the independent review of #311); its text is read after as commands. One
+    // that does not close is read as it comes.
+    // A process substitution (`<(cmd)`, `>(cmd)`) too.
+    if ((c === "$" && text[i + 1] === "(" && text[i + 2] !== "(") || c === "`" || ((c === "<" || c === ">") && text[i + 1] === "(")) {
+      let j = i + 1;
+      if (c === "`") { while (j < text.length && text[j] !== "`") j += text[j] === "\\" ? 2 : 1; }
+      else j = closeSub(text, i);
+      if (j >= 0 && j < text.length) {
+        nested.push(text.slice(c === "`" ? i + 1 : i + 2, j));
+        w += text.slice(i, j + 1);
+        inw = true;
+        i = j;
+        continue;
+      }
+    }
+    if (c === "$" && text[i + 1] === "(") {
+      if (text[i + 2] === "(") arith.push(pd);
+      pd++;
+      cut(); i++; continue;
+    }
+    // The bodies of the line's heredocs. One whose end is not found is read as commands: what the
+    // guard took for a heredoc may not be one.
+    if (c === "\n" && docs.length) {
+      cut();
+      const start = i;
+      let whole = true;
+      for (const doc of docs) {
+        const body = [];
+        let found = false;
+        while (i < text.length) {
+          let j = text.indexOf("\n", i + 1);
+          if (j < 0) j = text.length;
+          const line = text.slice(i + 1, j);
+          i = j;
+          if ((doc.dash ? line.replace(/^\t+/, "") : line) === doc.d) { found = true; break; }
+          body.push(line);
+        }
+        if (!found) { whole = false; break; }
+        (doc.seg.docs = doc.seg.docs || []).push(body.join("\n"));
+      }
+      if (!whole) i = start;
+      docs = [];
+      continue;
+    }
+    // A segment whose output a pipe carries to the next one is marked (seg.pipe).
+    if (c === "|" && text[i + 1] !== "|" && text[i - 1] !== "|") { end(); seg.pipe = true; }
+    if (";&|()`\n".includes(c)) { cut(); continue; }
+    if (c === " " || c === "\t") { end(); continue; }
+    w += c; inw = true;
+  }
+  cut();
+  for (const t of nested) segs.push(...words(t));
+  return segs;
+}
+function shellPath(w) {
+  let x = w.replace(/^\$\{HOME[^}]*\}/, "$HOME").replace(/^"?\$HOME"?/, "$HOME");
+  x = x.replace(/^\/proc\/(self|thread-self|[0-9]+)\/root(?=\/|$)/, "") || "/";
+  return x;
+}
+const WRAP = new Set(["sudo", "doas", "env", "time", "nice", "nohup", "ionice", "timeout", "stdbuf", "command", "exec", "builtin", "xargs", "setsid", "chroot", "busybox", "flock", "runuser"]);
+// The options of a wrapper that take a value as the next word (`sudo -u root`, `timeout -s KILL`).
+const VALUED = {
+  sudo: /^-[ugCDhprtU]$/, doas: /^-[uC]$/, env: /^-[uC]$/, timeout: /^-[sk]$/, nice: /^-n$/,
+  ionice: /^-[cnp]$/, stdbuf: /^-[ioe]$/, xargs: /^-[ILnPsdEa]$/, runuser: /^-[ugGl]$/, flock: /^-[wEn]$/,
+  chroot: /^--(userspec|groups)$/,
+};
+const KEYWORDS = new Set(["{", "}", "!", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"]);
+const SHELLS = new Set(["bash", "sh", "dash", "zsh", "ksh", "mksh", "ash"]);
+// Commands that run a string as a command: a shell's, su's, runuser's and script's `-c`.
+const RUNS_C = new Set([...SHELLS, "su", "runuser", "script"]);
+const ALWAYS = new Set(["find", "fd", "fdfind", "tree", "du", "ncdu", "rsync", "tar", "bsdtar", "rg", "ag", "ack", "zip", "7z", "rclone", "rgrep", "mv"]);
+let rest0 = [];
+function recursive(name, flags) {
+  if (ALWAYS.has(name)) return true;
+  const has = (re) => flags.some((f) => re.test(f));
+  switch (name) {
+    case "grep": case "egrep": case "fgrep": case "zgrep": case "ugrep": case "ug":
+      return has(/^-[A-Za-z]*[rR]/) || has(/^--(dereference-)?recursive$/) || has(/^(--directories=|-d)recurse$/) ||
+        rest0.some((f, j) => (f === "-d" || f === "--directories") && rest0[j + 1] === "recurse");
+    case "rm": return has(/^-[A-Za-z]*[rR]/) || has(/^--recursive$/);
+    case "git": return rest0.includes("grep") && rest0.includes("--no-index");
+    case "ls": case "dir": return has(/^-[A-Za-z]*R/) || has(/^--recursive$/);
+    case "cp": case "scp": case "mv": return has(/^-[A-Za-z]*[rRa]/) || has(/^--(recursive|archive)$/);
+    case "chmod": case "chown": case "chgrp": case "setfacl": case "getfacl": return has(/^-[A-Za-z]*R/) || has(/^--recursive$/);
+    default: return false;
+  }
+}
+// `ls -d` names the directories, not what is in them; in a bundle, a letter that takes a value
+// (`-I`, `-w`, `-T`) ends it (`-Id` ignores `d`).
+function lsDir(flags) {
+  for (const f of flags) {
+    if (f === "--directory") return true;
+    if (f.startsWith("--")) continue;
+    for (const ch of f.slice(1)) { if (ch === "d") return true; if ("IwT".includes(ch)) break; }
+  }
+  return false;
+}
+const LISTS = new Set(["ls", "dir", "vdir", "du", "tree"]);
+const DEFAULT_DOT = new Set(["ugrep", "ug", "rgrep", "find", "fd", "fdfind", "tree", "du", "ncdu", "rg", "ag", "ack", "grep", "egrep", "fgrep", "ls", "dir"]);
+// The command word of a segment, past reserved words, assignments and wrappers.
+function head(seg) {
+  let k = 0, xargs = false;
+  while (k < seg.length && KEYWORDS.has(seg[k])) k++;
+  while (k < seg.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(seg[k])) k++;
+  while (k < seg.length && WRAP.has(path.basename(seg[k]))) {
+    const wname = path.basename(seg[k]);
+    if (wname === "xargs") xargs = true;
+    k++;
+    while (k < seg.length && (/^-/.test(seg[k]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(seg[k]) || /^[0-9.]+[smhd]?$/.test(seg[k]))) {
+      if (seg[k] === "--") { k++; break; }
+      // `env -S 'cmd args'` splits its value into the command it runs.
+      if (wname === "env" && /^(-S|--split-string)/.test(seg[k])) {
+        const v = /^(-S|--split-string)$/.test(seg[k]) ? seg.slice(k + 1) : [seg[k].replace(/^(-S|--split-string=)/, ""), ...seg.slice(k + 1)];
+        return { name: "eval", rest: v, xargs };
+      }
+      k += VALUED[wname] && VALUED[wname].test(seg[k]) ? 2 : 1;
+    }
+    // flock's lock file, before the command it runs.
+    if (wname === "flock" && k < seg.length) {
+      k++;
+      if (/^(-c|--command)$/.test(seg[k] || "")) return { name: "eval", rest: seg.slice(k + 1), xargs };
+    }
+  }
+  return k < seg.length ? { name: path.basename(seg[k]), rest: seg.slice(k + 1), xargs } : null;
+}
+// A shell that reads its commands from stdin (`| bash`, `sh -s`, `. /dev/stdin`): the heredocs of
+// the command are what it runs.
+function stdinShell(seg) {
+  const hd = head(seg);
+  if (!hd) return false;
+  if (SHELLS.has(hd.name)) return !hd.rest.some((a) => /^-[A-Za-z]*c/.test(a)) && hd.rest.every((a) => /^-/.test(a));
+  return (hd.name === "source" || hd.name === ".") && /^(-|\/dev\/stdin|\/proc\/self\/fd\/0|\/dev\/fd\/0)$/.test(hd.rest[0] || "");
+}
+let here = cwd, before = cwd, seen = 0;
+// Past what it reads (nesting or length), the guard denies rather than let the rest through unread.
+const tooMuch = () => report("the command, nested deeper or longer than the guard reads,", roots[0]);
+// The segments being judged: what `xargs` reads may come from any of them (`echo ~ | xargs du`).
+let group = [];
+function walk(segs, depth) {
+  if (depth > 16) tooMuch();
+  const piped = segs.some(stdinShell);
+  const outer = group;
+  group = segs;
+  for (const seg of segs) {
+    if (++seen > 20000) tooMuch();
+    judge(seg, depth, piped);
+  }
+  group = outer;
+}
+// An argument of the segments `segs` that names a root or a directory holding one: the output of a
+// command (`$(echo ~)`, `$(realpath ../..)`) or what xargs reads may be that path (#311, independent
+// review). Not read: each command's name, an option's value (`cut -d /`), and `/` alone, which is
+// the separator of `tr`, `cut` and `sed` far more often than a path. `HOME` is the home
+// (`$(printenv HOME)`).
+const holderMemo = new WeakMap();
+function namesHolder(segs, depth = 0) {
+  for (const sg of segs) {
+    // Read once per directory it is read from: relative words name another place after a `cd`.
+    const m = holderMemo.get(sg);
+    if (m && m.here === here) { if (m.o) { holderAt = m.at; return m.o; } continue; }
+    const o = segHolder(sg, depth);
+    holderMemo.set(sg, { here, o, at: holderAt });
+    if (o) return o;
+  }
+  return null;
+}
+function segHolder(sg, depth) {
+  for (let j = 1; j < sg.length; j++) {
+    const w = sg[j];
+    if (typeof w !== "string" || !w || w === "/" || /^-/.test(w) || /^-/.test(sg[j - 1])) continue;
+    // A path a substitution prints (`$(dirname $(dirname ~/x/y))`): what it names, one level up
+    // for each `dirname`.
+    const inner = subOnly(w);
+    if (inner !== null) { if (depth < 8) { const o = namesHolder(words(inner), depth + 1); if (o) return o; } continue; }
+    if (/[*?[{]/.test(shellPath(w))) continue;
+    const x = w === "HOME" ? home : expand(shellPath(w));
+    if (!x) continue;
+    let p = path.isAbsolute(x) ? x : path.resolve(here, x);
+    if (sg[0] === "dirname") p = path.dirname(p);
+    const o = holder(p) || hit(p);
+    if (o) { holderAt = p; return o; }
+  }
+  return null;
+}
+let holderAt = "";
+// The command of a word that is a substitution and nothing else (`$(echo ~)`, `"$(pwd)/"`): the path
+// is its output. With text around it (`$(pwd)/src`) the path is another one.
+const subOnly = (a) => { const m = /^(?:\$\(([\s\S]*)\)|`([\s\S]*)`)\/?$/.exec(a); return m ? (m[1] !== undefined ? m[1] : m[2]) : null; };
+function judge(seg, depth, piped) {
+  const hd = head(seg);
+  if (!hd) return;
+  const name = hd.name;
+  let rest = hd.rest;
+  // The script of `bash -c '…'` (`su -c`, `script -c`), the words of `eval` and `watch`, and a heredoc
+  // a shell runs are commands of their own, read in turn.
+  if (RUNS_C.has(name)) {
+    const eq = rest.find((a) => /^--command=/.test(a));
+    if (eq) { walk(words(eq.slice(10)), depth + 1); return; }
+    const c = rest.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a) || a === "--command");
+    if (c >= 0) {
+      let s = c + 1;
+      if (rest[s] === "--") s++;
+      if (s < rest.length) { walk(words(rest[s]), depth + 1); return; }
+    }
+  }
+  if (name === "eval" && rest.length) { walk(words(rest.join(" ")), depth + 1); return; }
+  if (name === "watch") { walk(words(rest.filter((a, j) => !/^-/.test(a) && !/^(-[nq]|--interval|--equexit)$/.test(rest[j - 1] || "")).join(" ")), depth + 1); return; }
+  if (seg.docs && (SHELLS.has(name) || piped)) for (const d of seg.docs) walk(words(d), depth + 1);
+  // `xargs cmd <<EOF`: the lines are cmd's arguments.
+  if (seg.docs && hd.xargs) rest = rest.concat(seg.docs.join("\n").split(/\s+/).filter(Boolean));
+  rest0 = rest;
+  const flags = rest.filter((a) => /^-/.test(a));
+  let args = rest.filter((a) => !/^-/.test(a) && a !== "");
+  // find: only its start points are paths (`-name dir` is a pattern), and what -exec runs is a command.
+  if (name === "find") {
+    let j = 0;
+    while (/^-([HLP]|D\S*|O[0-9])$/.test(rest[j] || "")) j++;
+    if (rest[j] === "--") j++;
+    const starts = [];
+    for (; j < rest.length && !/^[-(!]/.test(rest[j]); j++) starts.push(rest[j]);
+    for (let e = j; e < rest.length; e++) {
+      if (!/^-(exec|execdir|ok|okdir)$/.test(rest[e])) continue;
+      let f = e + 1;
+      while (f < rest.length && rest[f] !== ";" && rest[f] !== "+") f++;
+      walk([rest.slice(e + 1, f)], depth + 1);
+      e = f;
+    }
+    args = starts.filter((a) => a !== "");
+  }
+  const at = (a) => {
+    const x = expand(shellPath(a));
+    return x === null ? null : path.isAbsolute(x) ? x : here + "/" + x;
+  };
+  if (name === "cd" || name === "pushd") {
+    // Into a directory a command prints (`cd $(echo ~)`): where that command names, when it names a
+    // directory that holds a root.
+    const sub = args.length ? subOnly(args[0]) : null;
+    const t = args[0] === "-" ? before : sub !== null ? (namesHolder(words(sub)) ? holderAt : null) : args.length ? at(args[0]) : home || null;
+    if (t) {
+      h = hit(t);
+      if (h) report("the command (" + name + " " + (args[0] || "") + ")", h);
+      before = here;
+      here = t;
+    }
+    return;
+  }
+  const rec = recursive(name, flags);
+  const cands = args.slice();
+  // A flag's value (`-C ~`, `--directory=~`) may be where it reads.
+  for (let j = 0; j < rest.length && name !== "find"; j++) {
+    const m = /^--?[A-Za-z-]+=(.+)$/.exec(rest[j]);
+    if (m) cands.push(m[1]);
+  }
+  // A recursive read that leaves out every directory with the root's name, in that tool's own syntax
+  // and with nothing else on the line undoing it: find `[-type d] -name dir -prune -o …` first in
+  // its expression (no -depth/-delete, which descend before pruning), grep `--exclude-dir=dir`, the
+  // last rg/ugrep glob `-g '!dir'`, ag `--ignore dir`, fd `-E dir`, rsync `--exclude=dir` with no
+  // include or filter rule, tar `--exclude=dir` unanchored. Any other exclusion (grep's `--exclude`,
+  // `-not -name dir`, a path such as `x/dir`) still walks into it.
+  const lastGlob = rest.reduce((n, a, j) => (/^(-g|--glob|--iglob)(=|$)/.test(a) ? j : n), -1);
+  const findLeaves = (o, b) => {
+    if (rest.some((a) => a === "-depth" || a === "-d" || a === "-delete")) return false;
+    let j = 0;
+    while (/^-[HLP]$/.test(rest[j] || "")) j++;
+    while (j < rest.length && !/^[-(!]/.test(rest[j])) j++;
+    for (;;) {
+      if (/^-(maxdepth|mindepth)$/.test(rest[j] || "")) j += 2;
+      else if (/^-(xdev|mount|noleaf|ignore_readdir_race|daystart)$/.test(rest[j] || "")) j++;
+      else break;
+    }
+    const open = rest[j] === "(";
+    if (open) j++;
+    if (rest[j] === "-type" && rest[j + 1] === "d") { j += 2; if (rest[j] === "-a") j++; }
+    const f = rest[j], v = rest[j + 1];
+    if (typeof v !== "string") return false;
+    const named = (/^-i?name$/.test(f) && compMatch(v, b)) || (/^-i?(path|wholename)$/.test(f) && (v === "*/" + b || v === o.abs || v === o.real));
+    if (!named) return false;
+    j += 2;
+    if (rest[j] === "-a") j++;
+    if (rest[j] !== "-prune") return false;
+    j++;
+    if (open) { if (rest[j] !== ")") return false; j++; }
+    return rest[j] === "-o" || j >= rest.length;
+  };
+  const leaves = (o) => {
+    const b = path.basename(o.abs);
+    if (name === "find") return findLeaves(o, b);
+    for (let j = 0; j < rest.length; j++) {
+      const m = /^(--?[A-Za-z-]+)=([\s\S]*)$/.exec(rest[j]);
+      const f = m ? m[1] : rest[j], v = m ? m[2] : rest[j + 1];
+      if (typeof v !== "string") continue;
+      if (/grep$|^ug$/.test(name) && f === "--exclude-dir" && dirGlob(v, b)) return true;
+      if (/^(rg|ugrep|ug)$/.test(name) && j === lastGlob && /^(-g|--glob|--iglob)$/.test(f) && v.startsWith("!") && dirGlob(v.slice(1), b)) return true;
+      if (name === "ag" && /^--ignore(-dir)?$/.test(f) && dirGlob(v, b)) return true;
+      if (/^fd(find)?$/.test(name) && /^(-E|--exclude)$/.test(f) && dirGlob(v, b)) return true;
+      if (name === "rsync" && f === "--exclude" && dirGlob(v, b) && !rest.some((a) => /^--(include|filter|include-from|exclude-from|files-from|cvs-exclude)/.test(a) || /^-[A-Za-z]*[fFC]/.test(a))) return true;
+      if (/tar$/.test(name) && f === "--exclude" && dirGlob(v, b) && !rest.includes("--anchored")) return true;
+    }
+    return false;
+  };
+  // A depth limit (`find -maxdepth`, `tree -L`, `du -d`) is not read: du walks everything under it
+  // anyway, and every tool spells and repeats it its own way (#311, third review).
+  const holds = (p) => { const o = holder(p); return o && !leaves(o) ? o : null; };
+  // Where a copy or an extraction writes is not read: the last word of cp/mv/rsync/scp (unless
+  // `-t DIR` names it), and every directory of `tar -x`. What lands under a root is still a word under it.
+  const extract = /tar$/.test(name) && (flags.some((f) => /^-[A-Za-z]*x/.test(f) || f === "--extract") || /^[A-Za-z]*x[A-Za-z]*$/.test(rest[0] || ""));
+  const target = /^(cp|mv)$/.test(name) && flags.some((f) => /^-[A-Za-z]*t/.test(f) || /^--target-directory/.test(f));
+  const dest = /^(cp|mv|rsync|scp)$/.test(name) && args.length > 1 && !target ? args[args.length - 1] : null;
+  const lists = LISTS.has(name) && !(name === "ls" && lsDir(flags));
+  // A path the shell computes is judged by what computes it, and xargs' by the pipeline that feeds
+  // it (`echo ~ | cat | xargs du`).
+  if (rec || lists) {
+    for (const a of cands) {
+      const t = subOnly(a);
+      if (t === null) continue;
+      h = namesHolder(words(t));
+      if (h) report("the command (" + name + " " + a + "), whose path a command computes from a directory that holds", h);
+    }
+    const k = group.indexOf(seg);
+    if (hd.xargs && k > 0) {
+      let f = k;
+      while (f > 0 && group[f - 1].pipe) f--;
+      h = namesHolder(group.slice(f, k));
+      if (h) report("the command (xargs " + name + "), whose arguments may come from a directory that holds", h);
+    }
+  }
+  for (const a of cands) {
+    const p = at(a);
+    if (p === null) continue;
+    const reads = rec && !extract && a !== dest;
+    if (/[*?[{]/.test(a)) {
+      h = globHit(path.resolve(p), reads, reads || lists);
+      if (h && rec && leaves(h)) h = null;
+    } else {
+      h = hit(p) || (reads ? holds(p) : null);
+    }
+    if (h) report("the command (" + name + " " + a + ")", h);
+  }
+  if (rec && DEFAULT_DOT.has(name) && args.length <= (/grep$|^rg$|^ag$|^ack$/.test(name) ? 1 : 0)) {
+    h = holds(here);
+    if (h) report("the command (" + name + " from " + here + ", which holds", h);
+  }
+}
+walk(words(cmd), 0);
 JS
+
+# Without node nothing can read the command (see header), but forbidden_paths still holds, in pure
+# bash and by the text alone: the policy's entries read with a pattern, and any spelling of one
+# (`~/<dir>`, `$HOME/<dir>`, `${HOME}/<dir>`, the absolute path) anywhere in the hook input — the
+# command, a file tool's path, the session's directory — is denied (#311 (a)). Cruder than the node
+# rule, and strict: it errs toward denying.
+check_forbidden_paths_bare() {
+  local text="" body e abs rel h sp
+  # The list, its strings read whole (a `]` inside one does not end it), then each string.
+  local list_re='"forbidden_paths"[[:space:]]*:[[:space:]]*\[(([[:space:],]|"([^"\\]|\\.)*")*)\]'
+  local -a entries=()
+  if [ "$PUBLISHED" -eq 1 ] && [ -z "${BASH_GUARD_POLICY:-}" ]; then
+    text="$(git_clean -C "$PUBLISHED_PROJECT" show "origin/HEAD:scripts/hooks/guard.policy.json" 2>/dev/null || true)"
+  elif [ -r "$POLICY_FILE" ]; then
+    text="$(cat "$POLICY_FILE" 2>/dev/null || true)"
+  fi
+  [[ "$text" =~ $list_re ]] || return 0
+  body="${BASH_REMATCH[1]}"
+  while [[ "$body" =~ \"(([^\"\\]|\\.)+)\"(.*)$ ]]; do
+    entries+=("${BASH_REMATCH[1]}")
+    body="${BASH_REMATCH[3]}"
+  done
+  h="${BASH_GUARD_HOME:-${HOME:-}}"
+  h="${h%/}"
+  # shellcheck disable=SC2088 # the policy entry as written, a literal tilde
+  for e in ${entries[@]+"${entries[@]}"}; do
+    case "$e" in
+      "~/"?*) rel="${e#\~/}"; rel="${rel%/}"; abs="${h:+$h/$rel}" ;;
+      /?*) abs="${e%/}"; rel=""; [ -n "$h" ] && [[ "$abs" == "$h/"* ]] && rel="${abs#"$h"/}" ;;
+      *) continue ;;
+    esac
+    for sp in ${abs:+"$abs"} ${rel:+"~/$rel" "\$HOME/$rel" "\${HOME}/$rel"}; do
+      # With a path boundary after it: `~/<dir>s` is another directory.
+      if [[ "$INPUT" == *"$sp" || "$INPUT" == *"$sp"[!A-Za-z0-9_.-]* ]]; then
+        deny "the hook input names ${sp}, which this repository's guard.policy.json keeps out of every session (forbidden_paths), and without node the guard reads it by the text alone" \
+          "leave it alone; and install node (>= 24), which the guard needs to read commands"
+      fi
+    done
+  done
+  return 0
+}
 
 check_forbidden_paths() {
   local out what entry
   [ "${#FORBIDDEN_PATHS[@]}" -gt 0 ] || return 0
-  out="$(printf '%s' "$INPUT" | node -e "$FORBID_JS" "${BASH_GUARD_HOME:-${HOME:-}}" "${FORBIDDEN_PATHS[@]}" 2>/dev/null || true)"
+  local rc=0
+  out="$(printf '%s' "$INPUT" | node -e "$FORBID_JS" "${BASH_GUARD_HOME:-${HOME:-}}" "${FORBIDDEN_PATHS[@]}" 2>/dev/null)" || rc=$?
+  # A reader that fails (a stack overflow on thousands of nested `"$(`, found in the independent
+  # review of #311) has judged nothing: denied, as the main reader's failures are.
+  if [ "$rc" -ne 0 ]; then
+    deny "the guard could not read this command for the paths this repository's guard.policy.json keeps out of every session (forbidden_paths), and a command it cannot read is not let through" \
+      "split it into simpler commands"
+  fi
   [ -n "$out" ] || return 0
   what="${out%%$'\t'*}"
   entry="${out#*$'\t'}"
@@ -6615,7 +7415,14 @@ guard_judge() {
   # here-string to a temporary file, and with /tmp full the extractor read nothing and every such
   # command ran (found 2026-10-03, third verification round of #299: a file written with a heredoc
   # of 70 KB, then `git push --force`).
-  if command -v timeout >/dev/null 2>&1; then
+  # A file tool's input has no "command" key (inside a JSON string a quote is escaped, so the key
+  # with its bare quotes appears only as a key; JSON spells a letter otherwise only as \u, and an
+  # input with one is read whole): its reader would read nothing, and is not started.
+  # Two node processes for a Read instead of three (#311 (c)).
+  if [[ "$INPUT" != *'"command"'* && "$INPUT" != *'\u'* ]]; then
+    command -v node >/dev/null 2>&1 || rc=127
+    SEGMENTS=""
+  elif command -v timeout >/dev/null 2>&1; then
     SEGMENTS="$(printf '%s' "$INPUT" | timeout -k 2 "$GUARD_SECONDS" node -e "$EXTRACT_JS" 2>/dev/null)" || rc=$?
   else
     SEGMENTS="$(printf '%s' "$INPUT" | node -e "$EXTRACT_JS" 2>/dev/null)" || rc=$?
@@ -6626,8 +7433,12 @@ guard_judge() {
       deny "the guard could not read this command within ${GUARD_SECONDS} s, and a command it cannot read is not let through" \
         "split it into shorter commands, with less nesting"
       ;;
-    # No node (timeout's 127 and 126, like the shell's): nothing can read the command (see header).
-    126 | 127) SEGMENTS="" ;;
+    # No node (timeout's 127 and 126, like the shell's): nothing can read the command (see header),
+    # and only forbidden_paths holds, by the text alone.
+    126 | 127)
+      SEGMENTS=""
+      command -v node >/dev/null 2>&1 || check_forbidden_paths_bare
+      ;;
     *)
       deny "the guard's command reader failed on this command (exit ${rc}), and a command it cannot read is not let through" \
         "split it into shorter commands"

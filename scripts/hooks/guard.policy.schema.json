@@ -56,7 +56,7 @@
     "forbidden_paths": {
       "type": "array",
       "default": [],
-      "description": "Directories no session of this repository may touch, each `~/<dir>` (the home of the user running the session) or absolute. Denied: a Bash command that names a path under one (as ~, $HOME, ${HOME} or the absolute home, anywhere in the command text, heredoc bodies included) and a session whose working directory is under one. The file tools are judged too (their path, resolved with symlinks followed, and a Glob pattern rooted in one) when this repository's .claude/settings.json also wires bash-guard.sh as a PreToolUse hook with matcher `Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob`. Empty or absent → no such rule.",
+      "description": "Directories no session of this repository may touch, each `~/<dir>` (the home of the user running the session) or absolute. Denied: a Bash, Monitor or PowerShell command that names a path under one (as ~, $HOME, ${HOME} or the absolute home, anywhere in the command text, heredoc bodies included) and a session whose working directory is under one. The file tools are judged too (their path, resolved with symlinks followed, and a Glob pattern rooted in one) when this repository's .claude/settings.json also wires bash-guard.sh as a PreToolUse hook with matcher `Read|Edit|Write|MultiEdit|NotebookEdit|Grep|Glob`. Empty or absent → no such rule.",
       "items": { "type": "string", "pattern": "^(~/.+|/.+)$" }
     },
     "set_phase_cmd": {
