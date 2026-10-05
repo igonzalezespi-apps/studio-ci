@@ -8,8 +8,10 @@
 #   1. PARITY — the vendored bash-guard.sh has not diverged from the canonical
 #      core in core-dev. The code is byte-identical across repos; only the
 #      separate guard.policy.json differs, so bash-guard.sh must match exactly.
-#   2. WIRING — the guard is actually cabled as a PreToolUse Bash hook in the
-#      repo's .claude/settings.json (a perfect but un-cabled copy never runs).
+#   2. WIRING — the guard is actually cabled as a PreToolUse Bash|Monitor|PowerShell
+#      hook in the repo's .claude/settings.json (a perfect but un-cabled copy never
+#      runs; Monitor and PowerShell run commands too, and a matcher without them
+#      lets those through unread, #311).
 #   3. LIVENESS — a known-forbidden input actually produces a deny (exit 2). A
 #      byte-perfect, well-cabled guard can still be 100% inert (node missing,
 #      the extractor throws) and every other check would pass green. This smoke
@@ -62,22 +64,35 @@ else
   echo "OK    parity: vendored core == canonical"
 fi
 
-# --- 2. Wiring: cabled as PreToolUse Bash in settings.json ------------------
+# routes(matcher, tool): does a hook group with this matcher run on that tool, as Claude Code reads
+# it? None, empty or `*`: every tool. Only names, `|` or `,` and blanks: a list of exact names.
+# Anything else: a regex.
+MATCHER_JS='
+function routes(m, tool) {
+  if (m === undefined || m === null || m === "" || m === "*") return true;
+  if (typeof m !== "string") return false;
+  if (/^[A-Za-z0-9_|, ]+$/.test(m)) return m.split(/[|,]/).map((t) => t.trim()).includes(tool);
+  try { return new RegExp("^(?:" + m + ")$").test(tool); } catch (e) { return false; }
+}'
+
+# --- 2. Wiring: cabled as PreToolUse Bash|Monitor|PowerShell in settings.json
+# One group or several, as long as the three tools reach the guard. guard-sync.sh adds the missing
+# ones where Bash is wired.
 if [ ! -f "$SETTINGS" ]; then
   echo "FAIL  no $SETTINGS"; fail=$((fail + 1))
 elif ! node -e '
   const fs = require("fs");
   const s = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const pre = (s.hooks && s.hooks.PreToolUse) || [];
-  const cabled = pre.some(g =>
-    (g.matcher || "").split("|").includes("Bash") &&
+  const cabled = (tool) => pre.some(g =>
+    routes(g.matcher, tool) &&
     (g.hooks || []).some(h => typeof h.command === "string" && h.command.includes("bash-guard.sh")));
-  process.exit(cabled ? 0 : 1);
-' "$SETTINGS" 2>/dev/null; then
-  echo "FAIL  bash-guard.sh is not cabled as a PreToolUse Bash hook in settings.json"
+  process.exit(["Bash", "Monitor", "PowerShell"].every(cabled) ? 0 : 1);
+'"$MATCHER_JS" "$SETTINGS" 2>/dev/null; then
+  echo "FAIL  bash-guard.sh is not cabled as a PreToolUse hook for Bash, Monitor and PowerShell in settings.json (re-run guard-sync.sh: it adds the missing ones)"
   fail=$((fail + 1))
 else
-  echo "OK    wiring: cabled as PreToolUse Bash"
+  echo "OK    wiring: cabled as PreToolUse Bash|Monitor|PowerShell"
 fi
 
 # --- 3. Liveness: a known-forbidden input must deny (exit 2) -----------------
@@ -85,14 +100,32 @@ fi
 # real vendored guard the exact harness JSON for `git push origin main` and
 # asserts exit 2. If node is missing / the extractor is broken, the guard
 # fail-opens (exit 0) and THIS is what catches it.
+# The same command from Monitor and PowerShell must deny too (#311).
 if [ -f "$VENDORED" ]; then
-  input='{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}'
-  printf '%s' "$input" | BASH_GUARD_BRANCH="feature/1-x" bash "$VENDORED" >/dev/null 2>&1
-  rc=$?
-  if [ "$rc" -eq 2 ]; then
-    echo "OK    liveness: forbidden input denied (exit 2), guard fires"
+  for tool in Bash Monitor PowerShell; do
+    input='{"tool_name":"'"$tool"'","tool_input":{"command":"git push origin main"}}'
+    printf '%s' "$input" | BASH_GUARD_BRANCH="feature/1-x" bash "$VENDORED" >/dev/null 2>&1
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+      echo "OK    liveness: forbidden input from $tool denied (exit 2), guard fires"
+    else
+      echo "FAIL  liveness: 'git push origin main' from $tool returned exit $rc (expected 2) — guard is INERT (node missing? extractor broken?)"
+      fail=$((fail + 1))
+    fi
+  done
+fi
+
+# --- 3b. Policy: guard.policy.json parses -----------------------------------
+# The guard reads a policy it cannot parse as no policy: strict defaults, which keep main protected
+# but turn off the opt-in rules, forbidden_paths and one_worktree_per_task among them, without a word
+# (#311). The guard cannot deny everything over it (the session that would fix the file is judged by
+# the same guard), so the check is here, where pre-push and CI see it.
+POLICY="$ROOT/scripts/hooks/guard.policy.json"
+if [ -f "$POLICY" ]; then
+  if node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$POLICY" 2>/dev/null; then
+    echo "OK    policy: guard.policy.json parses"
   else
-    echo "FAIL  liveness: 'git push origin main' returned exit $rc (expected 2) — guard is INERT (node missing? extractor broken?)"
+    echo "FAIL  policy: guard.policy.json does not parse — the guard would run on strict defaults, without its opt-in rules (forbidden_paths, one_worktree_per_task)"
     fail=$((fail + 1))
   fi
 fi
@@ -123,11 +156,13 @@ if [ -f "$SDD_VENDORED" ]; then
     const fs = require("fs");
     const s = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     const pre = (s.hooks && s.hooks.PreToolUse) || [];
-    const cabled = pre.some(g =>
+    const groups = pre.filter(g =>
       (g.hooks || []).some(h => typeof h.command === "string" && h.command.includes("sdd-gate.sh")));
-    process.exit(cabled ? 0 : 1);
-  ' "$SETTINGS" 2>/dev/null; then
-    echo "FAIL  sdd-gate.sh is vendored but not cabled as a PreToolUse hook in settings.json"
+    // Where it judges Bash it must judge Monitor and PowerShell too: they run commands as well (#311).
+    const on = (tool) => groups.some(g => routes(g.matcher, tool));
+    process.exit(groups.length && (!on("Bash") || (on("Monitor") && on("PowerShell"))) ? 0 : 1);
+  '"$MATCHER_JS" "$SETTINGS" 2>/dev/null; then
+    echo "FAIL  sdd-gate.sh is vendored but not cabled as a PreToolUse hook in settings.json, or cabled for Bash without Monitor and PowerShell (re-run guard-sync.sh: it adds the missing ones)"
     fail=$((fail + 1))
   else
     echo "OK    wiring: sdd-gate cabled as PreToolUse"

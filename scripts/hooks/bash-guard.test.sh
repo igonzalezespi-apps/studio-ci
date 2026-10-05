@@ -52,9 +52,9 @@ make_input() {
   node -e '
     process.stdout.write(JSON.stringify({
       session_id: "test-session", hook_event_name: "PreToolUse",
-      tool_name: "Bash", tool_input: { command: process.argv[1] },
+      tool_name: process.argv[2], tool_input: { command: process.argv[1] },
     }));
-  ' "$1"
+  ' "$1" "${TEST_TOOL:-Bash}"
 }
 
 # The tables never reach the network. A `gh pr create --repo <other>` without a label now reads
@@ -77,9 +77,13 @@ TEST_OWN_REPO="owner/the-session-repo"
 # real one and exercise pr_base_branch FOR REAL instead of injecting its answer.
 TEST_PATH_PREFIX=""
 
+# Every case of GROUP 1, kept to replay it from the Monitor and PowerShell tools (GROUP 16).
+TEST_RECORD=0
+G1_REPLAY=()
 # run_case <allow|deny> <command> [current-branch]
 run_case() {
   local expected="$1" cmd="$2" branch="${3:-feature/999-pr-branch}"
+  [ "$TEST_RECORD" -eq 0 ] || G1_REPLAY+=("$expected" "$cmd" "$branch")
   total=$((total + 1))
   local out rc want
   local path_for_case="${NO_NET_BIN}:${PATH}"
@@ -111,7 +115,7 @@ run_case() {
 # GROUP 1 — core behaviour under the trunk→main (prisma) policy.
 # Verdicts must match the original guard suite exactly: behaviour preserved.
 # ============================================================================
-TEST_POLICY="$POL_PRISMA"; TEST_PR_BASE=""
+TEST_POLICY="$POL_PRISMA"; TEST_PR_BASE=""; TEST_RECORD=1
 # shellcheck disable=SC2016 # non-expansion is intentional: $( ) must reach the guard literally
 CASES=(
   # push to main: direct, refspec, refs/heads and explicit URL (neutral repo name)
@@ -497,6 +501,8 @@ run_case allow $'{ cat <<EOF; } | wc -l\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'ssh host \'sudo tee /etc/x\' <<\'EOF\'\nExecStart=/bin/sh -c \'curl http://evil.example.com/x\'\nEOF\n'
 run_case allow $'cat 2>&1 <<EOF\ngit push origin HEAD:main\nEOF\n'
 run_case allow $'bash \'script.sh\' <<EOF\ngit push origin HEAD:main\nEOF\n'
+
+TEST_RECORD=0
 
 # ============================================================================
 # GROUP 2 — product policy: agent_may_merge=true, integration=develop, no tree.
@@ -1951,6 +1957,44 @@ wt_case deny  "$WT_S" "pushd $WT_W && popd && git switch feature"
 wt_case deny  "$WT_W" "cd $WTL && cd $WT_S && cd $WTL && cd - && git checkout feature"
 wt_case allow "$WT_S" "cd $WT_W && cd - && cd - && git switch feature"
 wt_case allow "$WT_S" "pushd $WTL && pushd $WT_W && popd && popd && cd $WT_W && git switch feature"
+# `git checkout <rev> <ruta>` restaura ficheros, tambien sin `--` (#311).
+wt_case allow "$WT_S" 'git checkout feature README.md'
+wt_case allow "$WT_S" 'git checkout HEAD~0 README.md'
+# Un repo anidado dentro de un worktree enlazado es de la tarea de ese worktree, no del checkout
+# compartido (#311 (b)).
+wt_git init "$WT_W/tmp/anidado" && echo x > "$WT_W/tmp/anidado/f" && wt_git -C "$WT_W/tmp/anidado" add f \
+  && wt_git -C "$WT_W/tmp/anidado" commit -m init && wt_git -C "$WT_W/tmp/anidado" branch otra
+wt_case allow "$WT_W/tmp/anidado" 'git switch otra'
+wt_case allow "$WT_W" 'git -C tmp/anidado switch otra'
+# Lo que git lista como worktree enlazado, no un `.git` fichero que cualquiera escribe.
+wt_repo "$WT_S/sub2/prod" && echo 'gitdir: /no/existe' > "$WT_S/sub2/.git"
+wt_case deny  "$WT_W" "git -C $WT_S/sub2/prod checkout feature"
+# El valor de --pathspec-from-file no es una ruta restaurada, y `--` sin nada detras no nombra
+# ninguna: las dos cambian de rama (revision independiente de #311).
+wt_case deny  "$WT_S" 'git checkout feature --pathspec-from-file README.md'
+wt_case deny  "$WT_S" 'git checkout feature --pathspec-from-file=/dev/null'
+wt_case deny  "$WT_S" 'git checkout feature --'
+wt_case deny  "$WT_S" 'git checkout feature -- 2>/dev/null'
+wt_case deny  "$WT_S" 'git checkout feature -- # restaura'
+wt_case deny  "$WT_S" 'git checkout feature --pathspec-from README.md'
+wt_case deny  "$WT_S" 'git checkout feature -- 2> /dev/null'
+# Lo que imprime una sustitucion, una variable o lo que anade xargs detras de `--` son rutas.
+wt_case allow "$WT_S" 'git checkout HEAD -- "$FILE"'
+wt_case allow "$WT_S" 'for f in $(git diff --name-only); do git checkout HEAD -- "$f"; done'
+wt_case allow "$WT_S" 'git checkout HEAD -- $(git diff --name-only)'
+wt_case allow "$WT_S" 'git checkout feature -- `cat lista.txt`'
+wt_case allow "$WT_S" 'git diff --name-only | xargs git checkout HEAD --'
+wt_case allow "$WT_S" 'git ls-files -m | xargs -I{} git checkout HEAD -- {}'
+wt_case deny  "$WT_S" 'echo feature | xargs -I{} git checkout {} --'
+wt_case deny  "$WT_S" 'echo x | xargs -I % git checkout feature --'
+wt_case deny  "$WT_S" 'echo feature | xargs --rep=% git checkout % --'
+wt_case deny  "$WT_S" 'echo feature | xargs --r git checkout {} --'
+wt_case deny  "$WT_S" 'echo , | xargs --delim , git switch feature'
+wt_case deny  "$WT_S" 'echo , | xargs --max-a 1 git switch feature'
+wt_case deny  "$WT_S" 'echo x | xargs --eof git switch feature'
+wt_case deny  "$WT_S" 'echo x | xargs --max-l git switch feature'
+wt_case deny  "$WT_S" 'echo feature | xargs --eof -I% git checkout % --'
+wt_case allow "$WT_S" 'git ls-files -m | xargs --repl git checkout HEAD -- {}'
 # Sin la clave (o en false) no hay regla: un repo la activa en su politica.
 wt_case allow "$WT_S" 'git checkout feature' "$POL_PRISMA"
 wt_case allow "$WT_S" 'git switch -c nueva' "$POL_PRISMA"
@@ -2009,6 +2053,11 @@ fp_case deny  Read "$(fpath "$FH/privado/notas.md")"
 fp_case deny  Read "$(fpath '~/privado/notas.md')"
 fp_case deny  Read "$(fpath '../../privado/notas.md')"
 fp_case deny  Read "$(fpath 'atajo/notas.md')"
+# Las herramientas de ficheros aplican `..` sobre el texto: `atajo/../atajo/x` es `atajo/x`.
+fp_case deny  Read "$(fpath 'atajo/../atajo/notas.md')"
+fp_case deny  Write "$(fpath "$FH/proyectos/repo/atajo/../atajo/nuevo.md")"
+fp_case deny  Grep '{"pattern":"x","path":"atajo/../atajo"}'
+fp_case deny  Glob "{\"pattern\":\"$FH/proyectos/repo/atajo/../atajo/*.md\"}"
 fp_case deny  Write "$(node -e 'process.stdout.write(JSON.stringify({ file_path: process.argv[1], content: "x" }))' "$FH/privado/n.md")"
 fp_case deny  Edit "$(node -e 'process.stdout.write(JSON.stringify({ file_path: process.argv[1], old_string: "a", new_string: "b" }))' "$FH/privado/notas.md")"
 fp_case deny  NotebookEdit "$(node -e 'process.stdout.write(JSON.stringify({ notebook_path: process.argv[1] }))' "$FH/privado/n.ipynb")"
@@ -2020,6 +2069,223 @@ fp_case allow Read "$(fpath "$FREPO/README.md")"
 fp_case allow Grep "$(node -e 'process.stdout.write(JSON.stringify({ pattern: "privado", path: process.argv[1] }))' "$FREPO")"
 fp_case allow Glob '{"pattern":"**/*.md"}'
 fp_case allow WebFetch '{"url":"https://example.com"}'
+# Recorrer un directorio que contiene la ruta vetada la alcanza (#311): una busqueda en todo el home o
+# en todo el disco listaba los nombres de dentro. Y un patron cuya parte fija la contiene se expande en
+# ella. Una busqueda que la deja fuera por su nombre, o un patron que no puede llegar, pasan.
+mkdir -p "$FH/godot1"
+gpath() { node -e 'const o={ pattern: process.argv[1] }; if (process.argv[2]) o.path = process.argv[2]; if (process.argv[3]) o.glob = process.argv[3]; process.stdout.write(JSON.stringify(o))' "$@"; }
+# shellcheck disable=SC2016 # the `$HOME` spellings must reach the guard literally
+{
+  fp_case deny  Bash "$(bash_input 'grep -r x ~')"
+  fp_case deny  Bash "$(bash_input 'grep -rn x $HOME')"
+  fp_case deny  Bash "$(bash_input 'find ~')"
+  fp_case deny  Bash "$(bash_input 'find / -name x 2>/dev/null')"
+  fp_case deny  Bash "$(bash_input "find $FH -name '*.md'")"
+  fp_case deny  Bash "$(bash_input 'tar czf /tmp/h.tgz ~')"
+  fp_case deny  Bash "$(bash_input 'tar -C ~ -czf /tmp/h.tgz .')"
+  fp_case deny  Bash "$(bash_input 'rsync -a ~/ /tmp/copia')"
+  fp_case deny  Bash "$(bash_input 'du -sh ~')"
+  fp_case deny  Bash "$(bash_input 'ls -R ~')"
+  fp_case deny  Bash "$(bash_input 'rg x ~')"
+  fp_case deny  Bash "$(bash_input 'sudo find / -name x')"
+  fp_case deny  Bash "$(bash_input 'cd ~ && grep -r x')"
+  fp_case deny  Bash "$(bash_input 'find . -name x')" "$FH"
+  # Las grafias que se escapaban: ~//, ~/./, ${HOME%/}, /proc/self/root, ../.., y un cd antes.
+  fp_case deny  Bash "$(bash_input 'cat ~//privado/notas.md')"
+  fp_case deny  Bash "$(bash_input 'cat ~/./privado/notas.md')"
+  fp_case deny  Bash "$(bash_input 'cat ${HOME%/}/privado/notas.md')"
+  fp_case deny  Bash "$(bash_input "cat /proc/self/root$FH/privado/notas.md")"
+  fp_case deny  Bash "$(bash_input 'cat ../../privado/notas.md')"
+  fp_case deny  Bash "$(bash_input 'cd ~ && cat privado/notas.md')"
+  fp_case deny  Bash "$(bash_input 'cd .. && cd .. && cat privado/notas.md')"
+  # Un patron que se expande en ella.
+  fp_case deny  Bash "$(bash_input 'ls ~/*')"
+  fp_case deny  Bash "$(bash_input 'cat ~/p*/notas.md')"
+  fp_case deny  Bash "$(bash_input 'cat ~/{privado,x}/notas.md')"
+  fp_case deny  Bash "$(bash_input 'cat ~/privad?/notas.md')"
+  # Lo que no la alcanza.
+  fp_case allow Bash "$(bash_input 'ls ~')"
+  fp_case allow Bash "$(bash_input 'cat ~/.bashrc')"
+  fp_case allow Bash "$(bash_input 'ls ~/godot*')"
+  fp_case allow Bash "$(bash_input 'du -sh ~/proyectos')"
+  fp_case allow Bash "$(bash_input 'grep -rn x ~/proyectos/repo')"
+  fp_case allow Bash "$(bash_input 'find . -name x')"
+  fp_case allow Bash "$(bash_input 'grep -rn x src')"
+  fp_case allow Bash "$(bash_input "sed '/^[[:space:]]*#/d' f")"
+  fp_case allow Bash "$(bash_input "awk '/^##/{print}' f")"
+  fp_case allow Bash "$(bash_input 'echo rc=$?')" "$FH"
+  fp_case allow Bash "$(bash_input 'ls *.md')" "$FH"
+  # La deja fuera por su nombre.
+  fp_case allow Bash "$(bash_input "find / -path '*/privado' -prune -o -name x -print")"
+  fp_case allow Bash "$(bash_input 'grep -r --exclude-dir=privado x ~')"
+  fp_case allow Bash "$(bash_input "rg -g '!privado' x ~")"
+  fp_case allow Bash "$(bash_input 'rsync -a --exclude=privado ~/ /tmp/copia')"
+  fp_case allow Bash "$(bash_input 'find ~ -name privado -prune -o -print')"
+  fp_case allow Bash "$(bash_input 'tar --exclude=privado -czf /tmp/h.tgz -C ~ .')"
+  # Una exclusion que no es la de esa herramienta, o que nombra otro sitio, no la deja fuera.
+  fp_case deny  Bash "$(bash_input 'grep -r --exclude=privado x ~')"
+  fp_case deny  Bash "$(bash_input 'grep -r --exclude-dir=otra/privado x ~')"
+  fp_case deny  Bash "$(bash_input 'find ~ -not -name privado')"
+  fp_case deny  Bash "$(bash_input 'rsync -a --exclude=foo/privado ~/ /tmp/b')"
+  fp_case deny  Bash "$(bash_input 'grep -r --exclude=foo x ~ /tmp/privado')"
+  # Entrar en ella con cd ya la alcanza.
+  fp_case deny  Bash "$(bash_input 'cd ~ && cd privado && ls')"
+  fp_case deny  Bash "$(bash_input 'cd ~/privados/../privado && ls -la')"
+  fp_case deny  Bash "$(bash_input 'cd privado && ls')" "$FH"
+  # Lo que la shell lee igual: redireccion pegada, palabras reservadas, $'…', comentarios, bash -c, eval.
+  fp_case deny  Bash "$(bash_input 'find ~>/dev/null')"
+  fp_case deny  Bash "$(bash_input '{ find ~; }')"
+  fp_case deny  Bash "$(bash_input 'if true; then find ~; fi')"
+  fp_case deny  Bash "$(bash_input '! find ~')"
+  fp_case deny  Bash "$(bash_input "cat ~/priv\$'a'do/notas.md")"
+  fp_case deny  Bash "$(bash_input $'true # it\'s fine\nfind ~')"
+  fp_case deny  Bash "$(bash_input "bash -c 'grep -r x ~'")"
+  fp_case deny  Bash "$(bash_input "eval 'find ~'")"
+  # Borrar o mover lo que la contiene, y otras formas de recorrer.
+  fp_case deny  Bash "$(bash_input 'rm -rf ~/*')"
+  fp_case deny  Bash "$(bash_input 'mv ~/p* /tmp/')"
+  fp_case deny  Bash "$(bash_input 'grep -d recurse x ~')"
+  fp_case deny  Bash "$(bash_input 'busybox find ~')"
+  fp_case deny  Bash "$(bash_input 'ugrep -r x ~')"
+  # Donde escribe una copia o una extraccion no se lee.
+  fp_case allow Bash "$(bash_input 'cp -r src ~/')"
+  fp_case allow Bash "$(bash_input 'rsync -av src/ ~')"
+  fp_case allow Bash "$(bash_input 'tar -C ~ -xzf x.tgz')"
+  fp_case allow Bash "$(bash_input 'ls -d ~/*')"
+  # El cuerpo de un heredoc es texto, salvo que lo ejecute una shell.
+  fp_case allow Bash "$(bash_input $'cat > /tmp/x.sh <<\'EOF\'\nfind / -name x\nrm -rf ~/*\nEOF\necho ok')"
+  fp_case deny  Bash "$(bash_input $'bash <<\'EOF\'\nfind ~\nEOF')"
+  fp_case deny  Bash "$(bash_input $'cat > /tmp/x.sh <<\'EOF\'\nhola\nEOF\nfind ~')"
+  # git grep lee el repositorio, no la carpeta; con --no-index si la recorre.
+  fp_case allow Bash "$(bash_input 'git -C ~/proyectos/repo grep -n x -- .')" "$FH"
+  fp_case deny  Bash "$(bash_input 'git grep --no-index x ~')"
+  # Segunda revision: un desplazamiento aritmetico o un here-string no abren un heredoc; uno que no
+  # cierra se lee como ordenes.
+  fp_case deny  Bash "$(bash_input $'echo $((1<<2))\ngrep -r x ~')"
+  fp_case deny  Bash "$(bash_input $'(( y = 1 << 2 ))\ngrep -rl x ~')"
+  fp_case deny  Bash "$(bash_input $'cat <<<hola\nfind ~')"
+  fp_case deny  Bash "$(bash_input $'cat <<EOF\nno cierra\nfind ~')"
+  # La exclusion vale solo si nada en la linea la deshace.
+  fp_case deny  Bash "$(bash_input 'find ~ -depth -name privado -prune -o -print')"
+  fp_case deny  Bash "$(bash_input 'find ~ -print -o -name privado -prune')"
+  fp_case deny  Bash "$(bash_input 'find ~ -type f -name privado -prune -o -print')"
+  fp_case deny  Bash "$(bash_input 'rsync -a --include=privado --exclude=privado ~/ /tmp/out')"
+  fp_case deny  Bash "$(bash_input 'tar --anchored --exclude=privado -cf /tmp/o.tar ~')"
+  fp_case deny  Bash "$(bash_input "rg -g '!privado' -g '*' x ~")"
+  fp_case allow Bash "$(bash_input "rg -g '*.md' -g '!privado' x ~")"
+  fp_case allow Bash "$(bash_input 'find ~ -type d -name privado -prune -o -type f -print')"
+  # cp -t: el destino es el de -t, y la ultima palabra se lee.
+  fp_case deny  Bash "$(bash_input 'cp -rt /tmp/x ~')"
+  # Una shell que lee de la entrada estandar corre los heredocs; y bash -c --, su -c, watch, xargs.
+  fp_case deny  Bash "$(bash_input $'cat <<EOF | bash\ngrep -r x ~\nEOF')"
+  fp_case deny  Bash "$(bash_input $'. /dev/stdin <<EOF\ngrep -r x ~\nEOF')"
+  fp_case deny  Bash "$(bash_input "bash -c -- 'grep -r x ~'")"
+  fp_case deny  Bash "$(bash_input "su -c 'find ~' root")"
+  fp_case deny  Bash "$(bash_input "watch -n 1 'du ~'")"
+  fp_case deny  Bash "$(bash_input "$(printf 'xargs grep -r x <<EOF\n%s\nEOF' "$FH")")"
+  fp_case deny  Bash "$(bash_input 'ls -Id ~/*')"
+  # Mas alla de lo que lee (anidado o largo), niega.
+  fp_case deny  Bash "$(bash_input "$(printf ':;%.0s' {1..20001})")"
+  # Un limite de profundidad no se lee (du recorre todo igual; cada herramienta lo escribe y repite a su
+  # manera): a proposito, se niega aunque no llegue (tercera revision).
+  fp_case deny  Bash "$(bash_input 'find ~ -maxdepth 1 -maxdepth 5 -exec cat {} +')"
+  fp_case deny  Bash "$(bash_input 'rg -e -d1 -e s ~')"
+  fp_case deny  Bash "$(bash_input 'du -d 0 ~')"
+  fp_case allow Bash "$(bash_input 'stat ~/*')"
+  # Lo que corre dentro de una cuenta, de unas comillas dobles o de un -exec se lee.
+  fp_case deny  Bash "$(bash_input 'cd ~ && echo $(( $(find . | wc -l) ))')"
+  fp_case deny  Bash "$(bash_input 'cd ~ && ((cat privado/notas.md) )')"
+  fp_case deny  Bash "$(bash_input 'cd ~ && echo "$(find .)"')"
+  fp_case deny  Bash "$(bash_input 'cd ~ && echo "`find .`"')"
+  fp_case deny  Bash "$(bash_input 'cd ~ && find . -type f -exec grep -l x {} +')"
+  fp_case allow Bash "$(bash_input 'echo $((1<<2)); ls')"
+  fp_case allow Bash "$(bash_input 'cd ~ && find . -name privado -prune -o -print')"
+  # `..` detras de un enlace sube desde donde apunta el enlace.
+  fp_case deny  Bash "$(bash_input 'cat atajo/../privado/notas.md')"
+  # Envoltorios con opciones que llevan valor, su --command=, watch --interval, filtros de rsync.
+  fp_case deny  Bash "$(bash_input 'sudo -u root find ~')"
+  fp_case deny  Bash "$(bash_input 'timeout -s KILL 5 find ~')"
+  fp_case deny  Bash "$(bash_input 'flock /tmp/l find ~')"
+  fp_case deny  Bash "$(bash_input 'su --command="find ~"')"
+  fp_case deny  Bash "$(bash_input 'watch --interval 1 find ~')"
+  fp_case deny  Bash "$(bash_input 'rsync -a -F --exclude=privado ~ out')"
+  fp_case allow Bash "$(bash_input 'sudo -u root ls /etc')"
+  # Cuarta revision: `$((` es una cuenta; las comillas dentro de "$(…)"; env -S; find --; flock -c.
+  fp_case deny  Bash "$(bash_input $'echo $((1<<X))\nfind ~\nX')"
+  fp_case allow Bash "$(bash_input $'echo $((1<<2)); cat <<EOF\nfind ~\nEOF')"
+  fp_case deny  Bash "$(bash_input 'echo "$(echo ")")"; find ~')"
+  fp_case deny  Bash "$(bash_input 'env -S "cat atajo/notas.md"')"
+  fp_case deny  Bash "$(bash_input 'find -- ~')"
+  fp_case deny  Bash "$(bash_input 'flock /tmp/l -c "cat atajo/notas.md"')"
+  fp_case allow Bash "$(bash_input $'git commit -m "$(cat <<\'EOF\'\nfind ~ en el texto\nEOF\n)"')"
+}
+# shellcheck disable=SC2088 # the literal tilde is the input under test
+{
+  fp_case deny  Grep "$(gpath x '~')"
+  fp_case deny  Grep "$(gpath x "$FH" 'privado/**')"
+  fp_case deny  Grep "$(gpath x /)"
+  fp_case deny  Grep "$(gpath x)" "$FH"
+  fp_case deny  Glob "$(gpath 'privado/**' '~')"
+  fp_case deny  Glob "$(gpath '~/{privado,x}/**')"
+  fp_case deny  Glob "$(gpath '~/p*/**')"
+  fp_case deny  Glob "$(gpath '/**/notas.md')"
+  fp_case deny  Glob "$(gpath '**/*.md')" "$FH"
+  fp_case allow Grep "$(gpath x '~' '!privado/**')"
+  fp_case allow Grep "$(gpath x '~' '!privado')"
+  fp_case deny  Grep "$(gpath x '~' '!noprivado')"
+  fp_case deny  Grep "$(gpath x '~' '!*.privado')"
+  fp_case deny  Grep "$(gpath x '~' '!privado/*.md')"
+  fp_case allow Grep "$(gpath x "$FH/proyectos")"
+  fp_case allow Glob "$(gpath 'proyectos/**' '~')"
+  fp_case allow Glob "$(gpath '*.md' '~')"
+  fp_case allow Glob "$(gpath '~/godot*/**')"
+  fp_case allow Glob "$(gpath '/usr/lib/**')"
+}
+
+# Un enlace cuyo destino aun no existe tambien apunta alli (#311).
+ln -s "$FH/privado/nuevo.md" "$FREPO/colgado"
+fp_case deny  Read "$(fpath "$FREPO/colgado")"
+fp_case deny  Write "$(node -e 'process.stdout.write(JSON.stringify({ file_path: process.argv[1], content: "x" }))' "$FREPO/colgado")"
+
+# Sin node nada lee la orden (lo dice la cabecera del guard), pero forbidden_paths se sigue aplicando, en bash
+# puro y por el texto: cualquier grafia de la entrada en la entrada del hook se niega (#311 (a)).
+NN_BIN="$TMP/sin-node-bin"
+mkdir -p "$NN_BIN"
+for nn_tool in bash cat dirname env ps sleep timeout git awk sed grep head tr cut kill; do
+  nn_path="$(command -v "$nn_tool")" && ln -sf "$nn_path" "$NN_BIN/$nn_tool"
+done
+nn_case() { # nn_case <allow|deny> <tool> <tool_input JSON> [policy]
+  local expected="$1" out rc want
+  total=$((total + 1))
+  out="$(input_with "$2" "$3" "$FREPO" | env -i PATH="$NN_BIN" BASH_GUARD_POLICY="${4:-$POL_FP}" BASH_GUARD_HOME="$FH" \
+    BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" "$NN_BIN/bash" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  without node: expected=%s (exit %d), got exit %d  [%s]  ::  %s\n' "$expected" "$want" "$rc" "$2" "$3"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+# shellcheck disable=SC2016 # the `$HOME` spelling must reach the guard literally
+{
+  nn_case deny  Read "$(fpath "$FH/privado/notas.md")"
+  nn_case deny  Bash "$(bash_input 'cat ~/privado/notas.md')"
+  nn_case deny  Bash "$(bash_input 'cat $HOME/privado/notas.md')"
+  nn_case allow Bash "$(bash_input 'ls ~/privados')"
+  nn_case allow Read "$(fpath "$FREPO/README.md")"
+  # Una entrada con `]` no apaga las demas; una con barra final tambien vale.
+  printf '{ "forbidden_paths": [ "~/a]b", "~/privado/" ] }' > "$TMP/pol-nn.json"
+  nn_case deny  Read "$(fpath "$FH/privado")" "$TMP/pol-nn.json"
+  nn_case deny  Bash "$(bash_input 'cat ~/privado/x')" "$TMP/pol-nn.json"
+}
+
+# Una clave escrita con \u sigue siendo "command": esa entrada se lee entera.
+total=$((total + 1))
+printf '{"tool_name":"Bash","tool_input":{"\\u0063ommand":"git pu''sh --for''ce origin main"}}' |
+  BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" bash "$GUARD" >/dev/null 2>&1
+if [ $? -eq 2 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL  a \\u-escaped command key was not read"; fi
+
 # Sin la clave no hay regla.
 fp_case allow Read "$(fpath "$FH/privado/notas.md")" "$FREPO" "$POL_PRISMA"
 fp_case allow Bash "$(bash_input 'cat ~/privado/notas.md')" "$FREPO" "$POL_PRISMA"
@@ -3132,9 +3398,17 @@ total=$((total + 1))
 if [ $((SECONDS - G14_T0)) -lt 20 ]; then pass=$((pass + 1)); else
   fail=$((fail + 1)); echo "FAIL  the nested \$(( cases took $((SECONDS - G14_T0)) s"; fi
 # (6) Y el extractor corre con un tope de tiempo: lo que no lee a tiempo se niega, no pasa.
+# El lector lento es de pega (un node que espera 5 s antes de empezar), con un tope de 1 s: con un
+# tope de 0,001 s y el node de verdad, un `timeout` que mira el reloj cada 100 ms (el de uutils antes
+# de 2026-07-25) dejaba acabar al lector, y la orden se negaba por el tope total, con otro mensaje
+# (#312).
+G14_SLOW="$TMP/g14-slow-node"
+mkdir -p "$G14_SLOW"
+printf '%s\n' '#!/bin/sh' 'sleep 5' "exec '$(command -v node)' \"\$@\"" > "$G14_SLOW/node"
+chmod +x "$G14_SLOW/node"
 total=$((total + 1))
-G14_OUT="$(make_input 'ls' | env BASH_GUARD_SECONDS=0.001 BASH_GUARD_POLICY="$POL_PRODUCT" \
-  BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+G14_OUT="$(make_input 'ls' | env BASH_GUARD_SECONDS=1 BASH_GUARD_POLICY="$POL_PRODUCT" \
+  BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" PATH="${G14_SLOW}:${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
 G14_RC=$?
 if ! command -v timeout >/dev/null 2>&1 || { [ "$G14_RC" -eq 2 ] && [[ "$G14_OUT" == *'could not read this command within'* ]]; }; then
   pass=$((pass + 1))
@@ -3313,6 +3587,81 @@ done
 TEST_POLICY="$POL_PRISMA"
 
 # ============================================================================
+# GROUP 17 — UNA PALABRA CON LLAVES DE MAS DE 2048 CARACTERES (#306).
+# brace_words no expande una palabra tan larga; bash si. Antes, las reglas que solo miraban las
+# palabras expandidas no veian el nombre protegido y la orden pasaba. Ahora la palabra puede ser
+# cualquiera, y cada regla la trata como posiblemente el nombre que busca. La version corta de cada
+# orden ya se paraba (sus casos estan en los grupos de cada regla).
+# ============================================================================
+TEST_POLICY="$POL_PRODUCT"; TEST_PR_BASE="develop"; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+G17_X="$(printf 'x%.0s' {1..2100})"
+# shellcheck disable=SC2016 # the `$` must reach the guard literally
+G17_CASES=(
+  "deny|gh {api,-fa=$G17_X} -X DELETE repos/o/r/git/refs/heads/develop"
+  "deny|gh api {-XDELETE,-HA:$G17_X} repos/o/r/git/refs/heads/main"
+  "allow|gh api repos/o/r/issues/5/comments -f body='{\"a\":\"$G17_X{b,c}\"}'"
+  "allow|gh pr comment 5 --body \"{a,$G17_X}\""
+  "deny|git branch -D {develop,$G17_X}"
+  "deny|git update-ref -d refs/heads/{develop,$G17_X}"
+  "deny|gh pr edit 5 --remove-label {no-automerge,$G17_X}"
+  "deny|gh pr edit 5 --remove-label={revision-humana,$G17_X}"
+  "deny|gh pr edit 5 --{remove-label=no-automerge,$G17_X}"
+  "deny|gh label delete {no-automerge,$G17_X} --yes"
+  "deny|gh api -X DELETE repos/o/r/git/refs/heads/{develop,$G17_X}"
+  "deny|gh api -X DELETE repos/o/r/issues/5/labels/{no-automerge,$G17_X}"
+  "deny|gh api -X DELETE repos/o/r/branches/main/{protection,$G17_X}"
+  "deny|gh api -X PUT repos/o/r/contents/x.md -f message=m -f content=Y -f branch={develop,$G17_X}"
+  "deny|cat {.env,$G17_X}"
+  "deny|{gh,$G17_X} pr merge 5 --squash --admin"
+  "deny|gh pr merge 5 --squash --{admin,$G17_X}"
+  "deny|{GITHUB_ACTIONS,$G17_X}=true ls"
+  "deny|export {GITHUB_ACTIONS,$G17_X}=true"
+  "deny|bash merge-when-green/pr-merge.sh {merge,$G17_X} --repo owner/name --pr 5"
+  # Lo que la palabra larga no puede escribir, o lo que solo lee, sigue pasando.
+  "allow|gh api repos/o/r/git/refs/heads/{develop,$G17_X}"
+  "allow|cat {notes,$G17_X}.md"
+  "allow|gh pr merge 5 --squash --{delete-branch,$G17_X}"
+  "allow|gh pr comment 5 --body {a,$G17_X}"
+  "allow|echo {GITHUB,$G17_X}"
+  "allow|bash merge-when-green/pr-merge.sh decide --repo owner/name --pr 5 --note {a,$G17_X}"
+)
+for case_line in "${G17_CASES[@]}"; do
+  run_case "${case_line%%|*}" "${case_line#*|}"
+done
+# De la misma revision: renombrar en local una rama de larga vida la deja sin ese nombre, como
+# borrarla; renombrar otra HACIA ese nombre (`git branch -M main` tras `git init`) sigue pasando. Y
+# `source .env` carga el fichero sin imprimirlo: no se niega, a proposito.
+run_case deny  'git branch -M develop otra'
+run_case deny  'git branch -m main x'
+run_case deny  'git branch --move develop x'
+run_case deny  'git branch -m nuevo' develop
+run_case allow 'git branch -M main'
+# Un prefijo de opcion larga es la opcion entera; una opcion con valor no desplaza los nombres.
+run_case deny  'git branch --mo develop x'
+run_case deny  'git branch --del develop'
+run_case deny  'git branch --format x -m develop y'
+run_case deny  'git branch -m --sort refname develop x'
+run_case deny  'git branch --no-color -D develop'
+run_case allow 'git branch --sort refname -m feature/a feature/b'
+run_case allow 'git branch -m feature/a feature/b'
+run_case allow 'git branch -m nuevo'
+# Las llaves se cuentan expandidas: `develop{,-old}` son dos nombres, y el primero es develop.
+run_case deny  'git branch -m develop{,-old}'
+run_case deny  'git branch -M {develop,x}'
+run_case allow 'git branch -m feature/a{,-old}'
+# Un nombre que la shell rellena o descodifica puede ser develop; el nombre nuevo puede ser cualquiera.
+run_case deny  'git branch -m develop{,-old\}}'
+run_case deny  "git branch -m \$'develop'{,-old}"
+run_case deny  'git branch -m ${X:-develop} x'
+run_case allow 'git branch -m feature/a ${NUEVO}'
+# Con un prefijo que ya no puede ser una rama de larga vida, el nombre rellenado no lo es.
+run_case allow 'git branch -m "feature/$TICKET" "feature/$TICKET-old"'
+run_case allow 'git branch -m fix/$X fix/y'
+run_case deny  'git branch -m dev$X x'
+run_case allow 'source .env'
+run_case allow 'set -a; . ./.env; set +a; ./scripts/run.sh'
+
+# ============================================================================
 # GROUP 15 — LA TERCERA RONDA, SOBRE #301: EL LIMITE DE TIEMPO VALE DENTRO DE UN SEGMENTO, Y NI UN /tmp
 # LLENO NI UN FALLO DEL GUARD DEJAN PASAR LA ORDEN.
 # El juicio corre en un proceso hijo y el guard espera su veredicto como mucho su limite y un segundo
@@ -3368,7 +3717,19 @@ G15_T0=$SECONDS
 G15_PATH="$G15_BIN" g15_case 'a reader that never ends, without timeout' "$G15_LATE" '"git status"' env BASH_GUARD_SECONDS=1
 total=$((total + 1))
 g15_pid="$(cat "$TMP/g15-node.pid" 2>/dev/null || true)"
-if [ $((SECONDS - G15_T0)) -le 6 ] && [ -n "$g15_pid" ] && ! kill -0 "$g15_pid" 2>/dev/null; then
+# Killed is enough: a killed reader stays a zombie until whoever inherits it reaps it, and kill -0
+# still finds a zombie (develop CI, 2026-10-04). So: gone or zombie, within 2 s.
+g15_dead() {
+  local st
+  for _ in $(seq 20); do
+    kill -0 "$1" 2>/dev/null || return 0
+    st="$(ps -o stat= -p "$1" 2>/dev/null)" || return 0
+    [[ "$st" == *Z* ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+if [ $((SECONDS - G15_T0)) -le 6 ] && [ -n "$g15_pid" ] && g15_dead "$g15_pid"; then
   pass=$((pass + 1))
 else
   fail=$((fail + 1)); echo "FAIL  the stuck reader: $((SECONDS - G15_T0)) s, pid ${g15_pid:-none} still alive or unknown"
@@ -3377,6 +3738,76 @@ fi
 # Y un lector que falla (exit 1: el que no pudo leer su entrada) no deja pasar la orden.
 printf '%s\n' '#!/bin/sh' 'exit 1' > "$G15_BIN/node"
 G15_PATH="$G15_BIN" g15_case 'a reader that fails' 'command reader failed on this command (exit 1)' '"git status"'
+
+# ============================================================================
+# GROUP 16 — MONITOR Y POWERSHELL TAMBIEN EJECUTAN ORDENES (#311).
+# Monitor, en el mismo shell que Bash; PowerShell, en PowerShell. El guard juzga las dos como una orden
+# de Bash: cada caso del GROUP 1, repetido desde Monitor, da el mismo veredicto, y uno de cada diez
+# desde PowerShell. Una llamada a Monitor con fuente `ws` no trae orden: no hay nada que juzgar.
+# ============================================================================
+TEST_POLICY="$POL_PRISMA"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""; TEST_TOOL=Monitor
+[ "${#G1_REPLAY[@]}" -gt 300 ] || { fail=$((fail + 1)); echo "FAIL  GROUP 1 recorded only $((${#G1_REPLAY[@]} / 3)) cases to replay"; }
+for ((g16 = 0; g16 + 2 < ${#G1_REPLAY[@]}; g16 += 3)); do
+  run_case "${G1_REPLAY[g16]}" "${G1_REPLAY[g16+1]}" "${G1_REPLAY[g16+2]}"
+done
+TEST_TOOL=PowerShell
+for ((g16 = 0; g16 + 2 < ${#G1_REPLAY[@]}; g16 += 30)); do
+  run_case "${G1_REPLAY[g16]}" "${G1_REPLAY[g16+1]}" "${G1_REPLAY[g16+2]}"
+done
+TEST_TOOL=""
+# forbidden_paths: the command of a Monitor or PowerShell call names the path, or its session sits under it.
+# shellcheck disable=SC2016 # the `$HOME` spelling must reach the guard literally
+fp_case deny  Monitor "$(bash_input 'tail -f ~/privado/notas.md')"
+# shellcheck disable=SC2016
+fp_case deny  Monitor "$(bash_input 'while true; do ls $HOME/privado; sleep 5; done')"
+fp_case deny  Monitor "$(bash_input 'tail -f build.log')" "$FH/privado"
+fp_case allow Monitor "$(bash_input 'tail -f build.log')"
+fp_case allow Monitor '{"ws":{"url":"wss://events.example.com/stream"},"description":"d","timeout_ms":1000}'
+# shellcheck disable=SC2016
+fp_case deny  PowerShell "$(bash_input 'Get-Content $HOME/privado/notas.md')"
+fp_case deny  PowerShell "$(bash_input 'Get-ChildItem')" "$FH/privado"
+fp_case allow PowerShell "$(bash_input 'Get-ChildItem')"
+# A path a command prints, or that xargs reads from the segment before it, is judged by the words that
+# compute it: `$(echo ~)` is the home, which holds the root (#311, independent review).
+# shellcheck disable=SC2016 # the `$HOME` spellings must reach the guard literally
+{
+  fp_case deny  Bash "$(bash_input 'du -a "$(echo ~)"')"
+  fp_case deny  Bash "$(bash_input 'du -a $(echo ~)')"
+  fp_case deny  Bash "$(bash_input 'ls -R `echo $HOME`')"
+  fp_case deny  Bash "$(bash_input "grep -r x \"\$(printf %s $FH)\"")"
+  fp_case deny  Bash "$(bash_input 'echo ~ | xargs grep -r foo')"
+  fp_case deny  Bash "$(bash_input 'echo ~ | xargs -I{} find {}')"
+  fp_case allow Bash "$(bash_input 'du -sh "$(git rev-parse --show-toplevel)"')"
+  fp_case allow Bash "$(bash_input 'ls -R $(pwd)/src')"
+  fp_case allow Bash "$(bash_input 'grep -rl x . | xargs ls -la')"
+  fp_case allow Bash "$(bash_input 'echo ~; find src -name x | xargs grep -r foo')"
+  fp_case allow Bash "$(bash_input 'grep -r x $(sed "s|$|/|" lista.txt)')"
+  # Una sustitucion es parte de su palabra, y su salida puede ser la casa por otros caminos.
+  fp_case deny  Bash "$(bash_input 'grep -r x $(true) ~')"
+  fp_case deny  Bash "$(bash_input 'du -sh $(printenv HOME)')"
+  fp_case deny  Bash "$(bash_input 'du -sh $(realpath ../..)')"
+  fp_case deny  Bash "$(bash_input 'du -sh $(dirname ~/x)')"
+  fp_case deny  Bash "$(bash_input 'du -sh <(echo) $(echo ~)')"
+  fp_case deny  Bash "$(bash_input 'cd $(echo ~) && du -sh .')"
+  fp_case deny  Bash "$(bash_input 'echo ~ | cat | xargs du -sh')"
+  # La salida con texto alrededor es otra ruta, y `/` suelto es un separador.
+  fp_case allow Bash "$(bash_input 'rsync -a "$(pwd)/" /tmp/espejo')"
+  fp_case allow Bash "$(bash_input 'find "$(git rev-parse --show-toplevel)/" -name x')"
+  fp_case allow Bash "$(bash_input 'du -sh $(cut -d / -f1 lista.txt | sort -u)')"
+  fp_case allow Bash "$(bash_input 'cut -d / -f1 lista.txt | xargs du -sh')"
+  fp_case allow Bash "$(bash_input 'rg foo $(echo ~)/proyectos/repo')"
+}
+# Un Glob cuyo directorio fijo es un enlace corre donde apunta.
+mkdir -p "$TMP/enlaces" && ln -s "$FH" "$TMP/enlaces/casa"
+fp_case deny  Glob "{\"pattern\":\"casa/**/*.md\",\"path\":\"$TMP/enlaces\"}"
+fp_case allow Glob "{\"pattern\":\"casa/proyectos/*.md\",\"path\":\"$TMP/enlaces\"}"
+# A forbidden_paths reader that fails has judged nothing: denied (a node that fails only for it).
+FPX="$TMP/fp-failing-node"
+mkdir -p "$FPX"
+printf '%s\n' '#!/bin/sh' 'case "$2" in *namesHolder*) exit 1 ;; esac' "exec '$(command -v node)' \"\$@\"" > "$FPX/node"
+chmod +x "$FPX/node"
+PATH="$FPX:$PATH" fp_case deny Bash "$(bash_input 'git status')"
+fp_case allow Bash "$(bash_input 'git status')"
 
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi
