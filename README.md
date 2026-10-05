@@ -17,12 +17,18 @@ One aggregate gate per workflow: the single required check. Call it from a final
 on every other job, so path/label-skipped jobs never wedge the merge — `skipped` and `success`
 both pass; only `failure`/`cancelled` fail it.
 
+Run it with `if: ${{ !cancelled() }}`, not `always()`. Both run the gate when a job it needs
+failed, was cancelled (a timeout included) or was skipped, so it decides the same way. They differ
+only when the whole run is cancelled — a newer commit superseding it: `always()` still starts the
+gate, which then holds a runner just to report red on a commit nobody is looking at;
+`!cancelled()` does not start it.
+
 ```yaml
 jobs:
   # ... your jobs ...
   ci-gate:
     name: ci-gate
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [lint, typecheck, test, build] # list EVERY job
     runs-on: ubuntu-latest
     steps:

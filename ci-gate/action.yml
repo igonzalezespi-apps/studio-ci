@@ -1,9 +1,10 @@
 name: ci-gate
 description: >-
   Single aggregate gate for a workflow's jobs. Call it from a final job that needs every other
-  job and runs if-always, passing toJSON(needs) as the needs-json input. Fails iff any job ended
-  in failure or cancelled; skipped and success both pass — so path/label-gated jobs that were
-  skipped never wedge the one required check. One canonical implementation for every project.
+  job and runs if !cancelled(), passing toJSON(needs) as the needs-json input. Fails iff any job
+  ended in failure or cancelled; skipped and success both pass — so path/label-gated jobs that
+  were skipped never wedge the one required check. One canonical implementation for every
+  project.
 
 inputs:
   needs-json:
