@@ -202,11 +202,21 @@ load_policy() {
 # The repository-selecting global options of the git command being analysed (-C,
 # --git-dir, -c ...), set by check_git for its segment. Empty = git's own discovery.
 GIT_GLOBALS=()
+# The subcommand of the last git segment read (check_git), for note_maker.
+GIT_SUB=""
 
 # A segment judged as what its command word stands for (see cw_read) says so in its deny:
 # CW_CONTEXT goes in front of the reason, CW_HINT in front of the alternative.
 CW_CONTEXT=""
 CW_HINT=""
+# Half of the merges this guard could not resolve in the 30 days to 2026-09-30 (20 of 38) were
+# not merges at all: `gh pr merge <n>` as TEXT inside another command — a sed pattern editing a
+# doc, a grep, a python string — and the same happens to every rule. The guard reads every quoted
+# span as a possible command too, because `bash -c "…"` does run it, and it cannot tell a pattern
+# from a script without letting some script through. So those stay denied (owner's decision of
+# 2026-10-13, #189), and a deny met inside a quoted span says it may be text and how to go around
+# it. A command that is certainly a command (not quoted, or a `bash -c` script) never carries it.
+QUOTED_TEXT_HINT="If what was denied is text inside a quoted argument (a sed or grep pattern, a printf or echo text, a message) and not a command meant to run, this may be a text false positive, because the guard reads quoted text as a possible command too: make a file edit with the Edit tool, and for a search pattern or a message write that text to a file with the Write tool and have the command read it from there as data (grep -f, git commit -F, gh --body-file)"
 # The second of this shell's clock (SECONDS) past which judging stops and the command is denied; empty,
 # no limit. A hook that runs past the harness's timeout lets the command run, and a command can be
 # written to keep the guard busy that long while what it denies waits at the end: every
@@ -226,12 +236,27 @@ check_deadline() {
   deny "the guard could not judge this command within ${GUARD_DEADLINE} s, and a command it cannot judge is not let through" \
     "split it into shorter commands"
 }
+# A deny met while judging the text of a quoted span (QUOTED, check_segment's: a sed or grep
+# pattern, a printf text, a commit message) may be a text false positive, and its alternative says
+# so (see QUOTED_TEXT_HINT). Only the message changes: the verdict is the same.
+# Not when the command runs a program of another language (python -c, node -e, an awk program, a
+# heredoc to perl…), names a shell or what hands text to one (`… | bash`, trap, eval, xargs), or has
+# a `$(…)`, a backtick or a `<(…)` anywhere, which can turn a text into a command without naming one
+# (third review of #375, 2026-10-14). In doubt, no hint: it only ever takes help away, never a deny. the guard reads that program's quoted text as text, but it does run, and
+# "put it in a file" would then be a way to run it out of the guard's sight (owner's decision of
+# 2026-10-14, #189: the hint never points at a path that hides code that runs; so neither does it
+# offer `sed -f`, whose script can run commands with GNU sed's `e`). Set once per
+# command from its segments, before any is judged.
+INTERP_RE='(^|[^A-Za-z0-9_.-])(sh|bash|zsh|dash|ksh|mksh|yash|fish|csh|tcsh|trap|source|eval|exec|xargs|parallel|sudo|doas|nohup|setsid|python[0-9.]*|pypy[0-9]*|node|nodejs|deno|bun|perl[0-9.]*|ruby|irb|php[0-9.]*|lua[0-9.]*|luajit|Rscript|osascript|pwsh|powershell|tclsh|wish|expect|awk|gawk|mawk|nawk|busybox|jshell|groovy|scala|julia|elixir|erl|ghci|runghc|swift|kotlin|java|dotnet|psql|mysql|sqlite3|su|script|watch|tmux|screen|docker|podman|kubectl|lxc|nsenter|chroot|ssh)([^A-Za-z0-9_.-]|$)'
+QUOTED_HINT_OFF=0
 deny() {
+  local alt="$2"
+  [ "${QUOTED:-0}" != 1 ] || [ "$QUOTED_HINT_OFF" = 1 ] || alt="${alt%.}. ${QUOTED_TEXT_HINT}"
   if [ -n "$CW_CONTEXT" ]; then
-    printf 'bash-guard DENY: %s: %s. Alternative: %s%s\n' "$CW_CONTEXT" "$1" "${CW_HINT:+$CW_HINT; then }" "$2" >&2
+    printf 'bash-guard DENY: %s: %s. Alternative: %s%s\n' "$CW_CONTEXT" "$1" "${CW_HINT:+$CW_HINT; then }" "$alt" >&2
     exit 2
   fi
-  printf 'bash-guard DENY: %s. Alternative: %s\n' "$1" "$2" >&2
+  printf 'bash-guard DENY: %s. Alternative: %s\n' "$1" "$alt" >&2
   exit 2
 }
 
@@ -319,6 +344,137 @@ lines_of() {
   [ "$noglob" -eq 1 ] || set +f
   return 0
 }
+# shell_text <word as written>: what the shell hands the command for <word> when it fills nothing
+# in, in ST_TEXT: quotes taken off; outside quotes a backslash keeps the next character as it is,
+# inside double quotes only before $ ` " \; a backslash-newline taken out (a line continuation);
+# $'…' decoded (\xHH, \n, \uHHHH…, and since round 6 \NNN and \cX) and $"…" read as "…".
+# ST_FILL is 1 when a `$` or a backquote is left for the shell to fill in (or a \c the guard does
+# not decode); an unquoted *, ? or [ is kept as written (the callers read globs on their own). An
+# unclosed quote runs to the end of the word. A word over 4096 characters is not read: ST_TEXT is
+# the word and ST_FILL 1. Brace expansion is not done here (brace_words), and a backslash-newline
+# only counts when the guard's split kept it inside the word. The rules
+# that read a git word through it judge this reading as well as the one they had (#327, round 5:
+# `feat@\{u}`, `--forc\e`, `alias.fb=branch\ -f`, `--s\e=` are what git receives, not what was written).
+ST_TEXT=""
+ST_FILL=0
+shell_text() {
+  local w="$1" n=${#1} k=0 c d q s dec o
+  ST_TEXT=""
+  ST_FILL=0
+  if [ "$n" -gt 4096 ]; then
+    ST_TEXT="$w"
+    ST_FILL=1
+    return 0
+  fi
+  while [ "$k" -lt "$n" ]; do
+    c="${w:k:1}"
+    k=$((k + 1))
+    case "$c" in
+      \\)
+        # A backslash-newline is a line continuation: bash takes both out (round 6).
+        [ "${w:k:1}" = $'\n' ] || ST_TEXT+="${w:k:1}"
+        k=$((k + 1))
+        ;;
+      \')
+        q="${w:k}"
+        q="${q%%\'*}"
+        ST_TEXT+="$q"
+        k=$((k + ${#q} + 1))
+        ;;
+      \")
+        while [ "$k" -lt "$n" ]; do
+          c="${w:k:1}"
+          k=$((k + 1))
+          case "$c" in
+            \") break ;;
+            \\)
+              case "${w:k:1}" in
+                [\$\`\"\\])
+                  ST_TEXT+="${w:k:1}"
+                  k=$((k + 1))
+                  ;;
+                $'\n') k=$((k + 1)) ;;
+                *) ST_TEXT+='\' ;;
+              esac
+              ;;
+            \$ | \`)
+              ST_FILL=1
+              ST_TEXT+="$c"
+              ;;
+            *) ST_TEXT+="$c" ;;
+          esac
+        done
+        ;;
+      \$)
+        case "${w:k:1}" in
+          \")  ;;
+          \')
+            k=$((k + 1))
+            s=""
+            while [ "$k" -lt "$n" ]; do
+              c="${w:k:1}"
+              k=$((k + 1))
+              [ "$c" != "'" ] || break
+              if [ "$c" = '\' ]; then
+                d="${w:k:1}"
+                k=$((k + 1))
+                case "$d" in
+                  [\'\"\?]) s+="$d" ;;
+                  \\) s+='\\' ;;
+                  # Round 6: \NNN (one to three octal digits; the byte is the value's low 8 bits, as
+                  # bash takes it) and \cX (X's low 5 bits, \c? is DEL) are decoded too: `$'\55f'` is
+                  # -f, `feat$'\100'{u}` is feat@{u}. A \c the guard cannot decode stays a fill.
+                  [0-7])
+                    o="$d"
+                    while [ "${#o}" -lt 3 ] && [[ "${w:k:1}" == [0-7] ]]; do
+                      o+="${w:k:1}"
+                      k=$((k + 1))
+                    done
+                    printf -v o '\\x%02x' $((8#$o & 255))
+                    s+="$o"
+                    ;;
+                  c)
+                    case "${w:k:1}" in
+                      [A-Za-z@\[\]^_])
+                        printf -v o '\\x%02x' $(($(printf '%d' "'${w:k:1}") & 31))
+                        s+="$o"
+                        k=$((k + 1))
+                        ;;
+                      \?)
+                        s+='\x7f'
+                        k=$((k + 1))
+                        ;;
+                      *)
+                        ST_FILL=1
+                        s+='\\c'
+                        ;;
+                    esac
+                    ;;
+                  *) s+="\\$d" ;;
+                esac
+              else
+                s+="$c"
+              fi
+            done
+            printf -v dec '%b' "$s" 2>/dev/null || dec="$s"
+            ST_TEXT+="$dec"
+            ;;
+          *)
+            ST_FILL=1
+            ST_TEXT+="$c"
+            ;;
+        esac
+        ;;
+      \`)
+        ST_FILL=1
+        ST_TEXT+="$c"
+        ;;
+      *) ST_TEXT+="$c" ;;
+    esac
+  done
+  return 0
+}
+
 # segment_lines: the lines of SEGMENTS (the extractor's output) in SEGMENT_LINES, split once for each
 # value it takes: several rules read them all.
 SEGMENT_LINES=()
@@ -446,15 +602,19 @@ check_generated_redirect() {
 # blank), GW_NEXT the token after it. Taking the second half for the subcommand left every git rule
 # out, the --force one included (pfx_next does the same for the wrappers in front).
 GW_VALUE=""
+GW_RAW=""
 GW_NEXT=0
 git_word() {
   local k="$1"
   GW_VALUE="${tok[k]:-}"
+  GW_RAW="$GW_VALUE"
   GW_NEXT=$((k + 1))
   [ "${#raw[@]}" -eq "${#tok[@]}" ] || return 0
+  GW_RAW="${raw[k]:-}"
   quote_carry "" "${raw[k]:-}"
   while [ -n "$QC" ] && [ "$GW_NEXT" -lt "${#tok[@]}" ]; do
     GW_VALUE+=" ${tok[GW_NEXT]}"
+    GW_RAW+=" ${raw[GW_NEXT]}"
     quote_carry "$QC" "${raw[GW_NEXT]}"
     GW_NEXT=$((GW_NEXT + 1))
   done
@@ -468,25 +628,43 @@ check_git() {
   # The ones that decide WHICH repository git works on and where its remotes point
   # are kept verbatim in GIT_GLOBALS, so the push check can replay them and ask git
   # itself instead of re-deriving git's repository discovery by hand.
-  local i=1 sub="" opt
+  local i=1 sub="" opt sub_w="" gv
   GIT_GLOBALS=()
+  GIT_GLOBALS_RAW=()
+  GIT_SUB=""
+  GIT_EXECPATH=0
+  GIT_INLINE_SRC=""
   while [ "$i" -lt "${#tok[@]}" ]; do
-    opt="${tok[i]}"
+    # #379: the option's name and the subcommand as git gets them (`-c''`, `-"c"`, `\-c`, `b''ranch`).
+    git_opt_word "$i"
+    opt="$GOW"
+    case "$opt" in --exec-path | --exec-path=*) GIT_EXECPATH=1 ;; esac
     case "$opt" in
       -c | -C | --git-dir | --work-tree | --config-env)
         git_word $((i + 1))
+        git_brace_check "$GW_RAW"
         GIT_GLOBALS+=("$opt" "$GW_VALUE")
+        GIT_GLOBALS_RAW+=("$opt" "$GW_RAW")
         i=$GW_NEXT
         ;;
       # Their value can also be the next word: taking it for the subcommand left `git
       # --attr-source HEAD push --force` judged by no rule.
       --namespace | --exec-path | --attr-source)
         git_word $((i + 1))
+        git_brace_check "$GW_RAW"
         i=$GW_NEXT
         ;;
       --git-dir=* | --work-tree=* | --config-env=* | --bare)
         git_word "$i"
-        GIT_GLOBALS+=("$GW_VALUE")
+        # A name written with quotes or a backslash (`--config-env''=…`) is kept as git reads it.
+        gv="$GW_VALUE"
+        if [ "${opt%%=*}" != "${gv%%=*}" ]; then
+          gv="${opt%%=*}"
+          [ "$opt" = --bare ] || gv+="=${GW_VALUE#*=}"
+          GW_RAW="$gv"
+        fi
+        GIT_GLOBALS+=("$gv")
+        GIT_GLOBALS_RAW+=("$GW_RAW")
         i=$GW_NEXT
         ;;
       -*)
@@ -494,23 +672,598 @@ check_git() {
         i=$GW_NEXT
         ;;
       *)
-        sub="${tok[i]}"
+        sub_w="${tok[i]}"
+        sub="$opt"
         i=$((i + 1))
         break
         ;;
     esac
   done
+  [ -z "$sub" ] || git_inline_alias "$sub_w" "$i"
+  [ -z "$sub" ] || git_alias_reach "$sub_w" "$sub" "$i"
   case "$sub" in
     # send-pack is the plumbing under push: the same <repository> [<refspec>...], --force,
     # --all and --mirror, and a refspec with `+` or an empty source forces or deletes alike.
     push | send-pack) check_git_push "$i" ;;
+    fetch | pull) check_git_fetch "$i" "$sub" ;;
     commit) check_git_commit ;;
     merge) check_git_merge ;;
     branch) check_git_branch "$i" ;;
     update-ref) check_git_update_ref "$i" ;;
     switch | checkout) check_git_switch "$sub" "$i" ;;
   esac
+  # A fresh repository is recorded only for the subcommand as written: one read through quotes
+  # must not make a later forced `git branch` pass (#379 loosens nothing).
+  case "$sub_w" in
+    init | clone) record_fresh_repo "$sub_w" "$i" ;;
+  esac
+  GIT_SUB="$sub_w"
   return 0
+}
+
+# git_inline_alias <subcommand> <index of the word after it>: an alias given in the command itself
+# (`git -c alias.fb='branch -f' fb develop x`, also `--config-env alias.fb=VAR`) runs what it
+# stands for, which the rules never saw (independent review of #327, round 4). One that git
+# expands (no `!`) is judged again as written out: the git words in front, the alias's value, then
+# the rest, by every git rule (more judgments, never fewer: an alias that names a git command git
+# itself runs instead is still judged as that command too). One that runs a shell command (`!…`)
+# or takes its value from the environment is denied: the guard does not read it.
+# Round 5: what git receives is the word after the shell's quotes and backslashes (`alias.f\b=…`,
+# `alias.fb=branch\ -f`, `alias.fb=$'branch -f'`, the subcommand `f\b`), and git's own split of the
+# value takes its quotes and backslashes off too (`'br\anch -f'`). Both readings are judged: the
+# words as the guard split them before, and the words git gets (shell_text). An alias whose name the
+# shell fills in (`alias.$A=…`) is read as this subcommand's; one whose whole key, or the git
+# command of its value, the shell fills in is denied; past GIT_ALIAS_DEPTH links of a chain it is
+# denied, not let through. An alias given through the environment in the same command
+# (GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n, GIT_CONFIG_PARAMETERS) is denied (git_env_alias). One set in a
+# git config file, or by a `git config alias.…` of the same command, is not read: since #379 such a
+# command lets only git's built-ins through (git_alias_reach).
+GIT_ALIAS_DEPTH=0
+GIT_ALIAS_MAX=8
+GIT_ALIAS_USED=" "
+GIT_GLOBALS_RAW=()
+GIT_EXECPATH=0
+git_inline_alias() {
+  local sub="$1" i="$2" k r v key name env w s p lsub kind rawv src=""
+  local -a ntok=() nraw=() subs=() reads=() seen=() wsubs=("$1")
+  lsub="$(printf '%s' "$sub" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  subs=("$lsub")
+  if [ "${#raw[@]}" -eq "${#tok[@]}" ] && [[ "${raw[i - 1]:-}" == *[\"\'\\\$]* ]]; then
+    shell_text "${raw[i - 1]}"
+    subs+=("$(printf '%s' "$ST_TEXT" | LC_ALL=C tr '[:upper:]' '[:lower:]')")
+    wsubs+=("$ST_TEXT")
+    git_env_alias "$sub" "$ST_TEXT"
+  else
+    git_env_alias "$sub"
+  fi
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    env=0
+    kind="${GIT_GLOBALS[k]}"
+    case "$kind" in
+      -c | --config-env)
+        v="${GIT_GLOBALS[k + 1]}"
+        rawv="${GIT_GLOBALS_RAW[k + 1]-$v}"
+        k=$((k + 1))
+        [ "$kind" = -c ] || env=1
+        ;;
+      --config-env=*)
+        v="${GIT_GLOBALS[k]#--config-env=}"
+        rawv="${GIT_GLOBALS_RAW[k]-${GIT_GLOBALS[k]}}"
+        env=1
+        ;;
+      *) continue ;;
+    esac
+    # The two readings of the key=value: quote characters taken off (as before), and the shell's.
+    # The `$` of a `$'…'` or `$"…"` goes with its quotes (round 6): left in, it read as a fill at the
+    # start of the key (`$'user.name=A B'`), which matched every alias name.
+    r="${v//\$\'/\'}"
+    r="${r//\$\"/\"}"
+    reads=("${r//[\"\']/}")
+    shell_text "$rawv"
+    r="$ST_TEXT"
+    [ "$env" -eq 0 ] || r="${r#--config-env=}"
+    [ "$r" = "${reads[0]}" ] || reads+=("$r")
+    # An entry already expanded in this chain is not read again (round 6): git stops with "recursive
+    # alias" before it runs anything. Read again, an entry whose name the shell fills in matched
+    # every link and ended in the chain-length deny, on a command that is no chain.
+    [[ "$GIT_ALIAS_USED" != *" $k "* ]] || continue
+    # Third verification of #377: any alias source in the call (not one this chain already expanded) (alias.*, include.path,
+    # includeIf.<cond>.path, or a key the shell fills in that may be one) is recorded; it is judged
+    # after the inline aliases, whose own denials say more (see the end of this function).
+    for r in "${reads[@]}"; do
+      if [ "$env" -eq 1 ]; then key="${r%=*}"; else key="${r%%=*}"; fi
+      name="$(printf '%s' "$key" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+      p="${name%%[\$\`\*\?\[]*}"
+      if [[ "$name" == alias.* || "$name" == include.path || "$name" =~ ^includeif\..*\.path$ ]] ||
+        { [ "$p" != "$name" ] && [[ "alias." == "$p"* || "$p" == alias.* || "include.path" == "$p"* || "includeif." == "$p"* || "$p" == includeif.* ]]; }; then
+        [ -n "$src" ] || src="$key"
+      fi
+    done
+    for r in "${reads[@]}"; do
+      # git cuts --config-env's <name>=<envvar> at its last `=` (a name may hold one), -c's at the first.
+      if [ "$env" -eq 1 ]; then key="${r%=*}"; else key="${r%%=*}"; fi
+      # The section and the key of a git config name are read in any case (`ALIAS.FB` is alias.fb).
+      name="$(printf '%s' "$key" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+      # The text of the name before what the shell fills in or matches: the name may be any that
+      # starts with it.
+      p="${name%%[\$\`\*\?\[]*}"
+      w=0
+      for s in "${subs[@]}"; do
+        if [ "$name" = "alias.${s}" ] || { [ "$p" != "$name" ] && [[ "alias.${s}" == "$p"* ]]; }; then w=1; fi
+      done
+      [ "$w" -eq 1 ] || continue
+      if [ "$r" = "$key" ]; then
+        # No `=` in what is written: an alias only when the shell fills in the rest.
+        [ "$p" != "$name" ] || continue
+        deny "git ${sub}: an alias given in the command whose name and value the shell fills in, which the guard does not read" \
+          "run the command it stands for directly"
+      fi
+      if [ "$GIT_ALIAS_DEPTH" -ge "$GIT_ALIAS_MAX" ]; then
+        deny "git ${sub}: an alias given in the command that leads to another more than ${GIT_ALIAS_MAX} times, further than the guard follows" \
+          "run the command it stands for directly"
+      fi
+      if [ "$env" -eq 1 ]; then v="${r##*=}"; else v="${r#*=}"; fi
+      while [[ "$v" == [[:blank:]]* ]]; do v="${v#[[:blank:]]}"; done
+      if [ "$env" -eq 1 ] || [[ "$v" == '!'* ]]; then
+        deny "git ${sub}: an alias given in the command that runs a shell command or takes its value from the environment, which the guard does not read" \
+          "run the command it stands for directly"
+      fi
+      words_of "$v"
+      # One that is just its own name (`alias.a=a`, or `alias.$A=status` read for status) adds
+      # nothing to judge: read again, it is the same words.
+      [ "${#SPLIT_WORDS[@]}" -ne 1 ] || [ "$(printf '%s' "${SPLIT_WORDS[0]}" | LC_ALL=C tr '[:upper:]' '[:lower:]')" != "$lsub" ] || continue
+      if [[ "${SPLIT_WORDS[0]:-}" == *[\$\`]* ]]; then
+        deny "git ${sub}: an alias given in the command whose git command the shell fills in, which the guard does not read" \
+          "run the command it stands for directly"
+      fi
+      # Each reading's words, and those of git's own split of the value (quotes and backslashes off).
+      for s in 0 1; do
+        ntok=("${tok[@]:0:i-1}")
+        nraw=("${raw[@]:0:i-1}")
+        for w in ${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"}; do
+          if [ "$s" -eq 1 ]; then
+            shell_text "$w"
+            w="$ST_TEXT"
+          fi
+          ntok+=("$w")
+          nraw+=("$w")
+        done
+        [ "$s" -eq 0 ] || [ "${ntok[*]}" != "${seen[*]}" ] || continue
+        seen=("${ntok[@]}")
+        ntok+=("${tok[@]:i}")
+        nraw+=("${raw[@]:i}")
+        # In a subshell: what the second reading records (GIT_GLOBALS, GIT_SUB, a fresh repository)
+        # stays out of the first; only its deny counts.
+        (GIT_ALIAS_USED+="$k " && git_alias_reread) || exit 2
+      done
+    done
+  done
+  # A git call that carries an alias source runs only a subcommand that is one of git's built-in
+  # commands exactly as written (git matches case-sensitively, and runs a built-in before any
+  # alias; a command it runs as a program, like submodule or mergetool, loses to an alias when the
+  # program is not found). Any other subcommand may be an alias the guard does not read. With
+  # --exec-path or GIT_EXEC_PATH as well, the call is denied whatever its subcommand.
+  if [ -n "$src" ]; then
+    if [ "$GIT_EXECPATH" -eq 1 ]; then
+      deny "git ${sub}: an alias source given in the command (${src}) together with --exec-path, which changes the programs git runs; the guard does not read what then runs" \
+        "drop --exec-path, or run the command the alias stands for directly"
+    fi
+    raw_command
+    if [[ "$(printf '%s' "$RAW_COMMAND" | LC_ALL=C tr -d "\"'\\\\\$\`(){},")" == *GIT_EXEC_PATH* ]]; then
+      deny "git ${sub}: an alias source given in the command (${src}) together with GIT_EXEC_PATH, which changes the programs git runs; the guard does not read what then runs" \
+        "drop GIT_EXEC_PATH, or run the command the alias stands for directly"
+    fi
+    for s in "${wsubs[@]}"; do
+      git_builtin "$s" && continue
+      deny "git ${sub}: the command gives git an alias source (${src}) and '${s}' is not one of git's built-in commands as written, so an alias may stand for it, which the guard does not read" \
+        "run the command the alias stands for directly, or give the -c/--config-env alias, include.path or includeIf only to git's built-in commands"
+    done
+  fi
+  GIT_INLINE_SRC="$src"
+  return 0
+}
+
+# git_env_alias <subcommand as git gets it…>: a command that may give git configuration through the
+# environment (GIT_CONFIG_COUNT with GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n, GIT_CONFIG_PARAMETERS: the
+# environment forms of `git -c`; GIT_CONFIG_GLOBAL and the like, a file) and runs git with a
+# subcommand that may be an alias is denied: the guard does not read an alias from there (#327).
+# Round 7: the guard stops reading how the name is spelled. An alias never hides a git built-in (git
+# runs the command and ignores the alias), so a subcommand that is one of GIT_BUILTINS, exactly as
+# written, in every reading, passes: a commit message or a grep that mentions GIT_CONFIG_KEY_0 next
+# to `git status` is not denied. With any other subcommand, the command is read with every quote,
+# backslash, `$`, backquote, parenthesis, brace, comma and newline taken out, and each word with a
+# brace list also as the words the braces make (one with a sequence of letters counts as one more):
+# every `GIT_CONF` in that text must be one of the
+# plain assignments read here (GIT_CONFIG_COUNT=<digits>, GIT_CONFIG_VALUE_n=…, and
+# GIT_CONFIG_KEY_n=<letters, digits, . _ / : -> that names no alias and no include), or the command
+# is denied: `GIT_$"CONFIG"_…`, `GIT_CONFIG_{KEY_0=…,…}`, `+=`, `${NAME=…}`, a value with a brace or a
+# glob, a nested `bash -c`, a mention in a message all leave one. A `$'…'` in a command that also
+# holds an escape that can spell a letter (\NNN from \100, \xHH from \x40, \u, \U), at any depth of
+# quoting, is denied with it. A name built from what the shell fills in (`GIT_CO${X}NFIG…`,
+# `${N^^}`) and an alias in a git config file (HOME, XDG_CONFIG_HOME, GIT_DIR) are not read (follow-up).
+# git's built-in commands (`git --list-cmds=builtins` of git 2.43, without pack-redundant and
+# whatchanged, which newer gits drop or gate): git runs one of them before any alias of that name.
+GIT_BUILTINS=" add am annotate apply archive bisect blame branch bugreport bundle cat-file check-attr check-ignore check-mailmap check-ref-format checkout checkout--worker checkout-index cherry cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential credential-cache credential-cache--daemon credential-store describe diagnose diff diff-files diff-index diff-tree difftool fast-export fast-import fetch fetch-pack fmt-merge-msg for-each-ref for-each-repo format-patch fsck fsck-objects fsmonitor--daemon gc get-tar-commit-id grep hash-object help hook index-pack init init-db interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-ours merge-recursive merge-recursive-ours merge-recursive-theirs merge-subtree merge-tree mktag mktree multi-pack-index mv name-rev notes pack-objects pack-refs patch-id pickaxe prune prune-packed pull push range-diff read-tree rebase receive-pack reflog remote remote-ext remote-fd repack replace rerere reset restore rev-list rev-parse revert rm send-pack shortlog show show-branch show-index show-ref sparse-checkout stage stash status stripspace submodule--helper switch symbolic-ref tag unpack-file unpack-objects update-index update-ref update-server-info upload-archive upload-archive--writer upload-pack var verify-commit verify-pack verify-tag version worktree write-tree "
+GIT_ENV_ALIAS_READ=0
+git_env_alias() {
+  local s loose ln w n=0 k=0 more=""
+  for s in "$@"; do
+    [[ "$GIT_BUILTINS" == *" $s "* ]] || n=1
+  done
+  # #379: with a GIT_CONF… in the command (or a \u the JSON may spell it with), each must also be a
+  # built-in of the git on PATH (git_builtin).
+  if [ "$n" -eq 0 ] && [[ "${INPUT-}" == *GIT_CONF* || "${INPUT-}" == *'\u'* ]]; then
+    for s in "$@"; do
+      git_builtin "$s" || n=1
+    done
+  fi
+  [ "$n" -eq 1 ] || return 0
+  # The command does not change from one git to the next: read once, for the first that may be an alias.
+  [ "$GIT_ENV_ALIAS_READ" -eq 0 ] || return 0
+  raw_command
+  # Read as git in place of a command word the guard cannot read (cw_as_if: `$'\x64eclare' -n r`,
+  # #319), the escapes of that word spell the program, not git configuration: they are left out of
+  # the escape test, and the command is read again for a git written out.
+  s="$RAW_COMMAND"
+  # Only a word that reads in full as a name with no `=` (env would take one as an assignment).
+  if [ "$CW_ASIF" -eq 1 ] && [ -n "$CW_ASIF_RAW" ] && shell_text "$CW_ASIF_RAW" && [ "$ST_FILL" -eq 0 ] &&
+    [[ -n "$ST_TEXT" && "$ST_TEXT" != *[=[:space:]]* ]]; then
+    s="${s//"$CW_ASIF_RAW"/}"
+  else
+    GIT_ENV_ALIAS_READ=1
+  fi
+  if [[ "$s" == *\$\'* ]] && [[ "$s" =~ \\([1357][0-7][0-7]|x[4-7][0-9A-Fa-f]|[uU]) ]]; then
+    deny "git: a subcommand that may be an alias, in a command that spells text with \$'…' escapes, which the guard does not read for git configuration given through the environment" \
+      "run the command the alias stands for directly, or write the text without \$'\\x…'/\$'\\NNN' escapes"
+  fi
+  lines_of "$RAW_COMMAND"
+  loose="$(printf '%s' "$RAW_COMMAND" | LC_ALL=C tr -d "\"'\\\\\$\`(){},\n")"
+  case "$loose" in *GIT_CONF*)
+    n="$(printf '%s' "$loose" | grep -o GIT_CONF | wc -l)"
+    for ln in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+      case "$ln" in *GIT_CONF*) ;; *) continue ;; esac
+      words_of "$ln" $' \t;&|()'
+      for w in ${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"}; do
+        # GIT_CONFIG_NOSYSTEM only turns the system file off, and a global or system file that is
+        # /dev/null holds nothing: neither is an alias source.
+        if [[ "$w" =~ ^GIT_CONFIG_(NOSYSTEM=[A-Za-z0-9]*|GLOBAL=/dev/null|SYSTEM=/dev/null)$ ]]; then
+          k=$((k + 1))
+        elif [[ "$w" =~ ^GIT_CONFIG_(COUNT=[0-9]+|VALUE_[0-9]+=.*|KEY_[0-9]+=[A-Za-z0-9._/:-]+)$ ]] &&
+          ! [[ "$w" =~ [Aa][Ll][Ii][Aa][Ss]|[Ii][Nn][Cc][Ll][Uu][Dd][Ee] ]] && [[ "${w#*=}" != *GIT_CONF* ]]; then
+          k=$((k + 1))
+        fi
+      done
+    done
+    [ "$n" -le "$k" ] || deny "git: a subcommand that may be an alias, with git configuration given through the environment in a way the guard does not read (GIT_CONFIG_*)" \
+      "run the command the alias stands for directly, without GIT_CONFIG_KEY_n/GIT_CONFIG_PARAMETERS"
+    ;;
+  esac
+  # A name the braces make is never one of the plain assignments above.
+  for ln in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+    [[ "$ln" == *"{"* ]] || continue
+    [[ "$ln" =~ [{][A-Za-z][.][.][A-Za-z] || "$ln" =~ G.*I.*T.*_.*C.*O.*N.*F ]] || continue
+    words_of "$ln"
+    for w in ${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"}; do
+      # A sequence of letters (`{E..G}`) may make any of them; a comma list keeps the order of the
+      # characters it copies, so only a word that holds G I T _ C O N F in that order can make one.
+      if [[ "$w" =~ [{][A-Za-z][.][.][A-Za-z] ]]; then
+        more+=" GIT_CONF"
+        continue
+      fi
+      [[ "$w" == *"{"*[,.]*"}"* && "$w" =~ G.*I.*T.*_.*C.*O.*N.*F ]] || continue
+      brace_words "$w"
+      [ "$BRACE_OVER" -eq 0 ] || more+=" GIT_CONF"
+      more+=" ${BRACE_OUT[*]}"
+    done
+  done
+  loose="$(printf '%s' "$more" | LC_ALL=C tr -d "\"'\\\\\$\`(){},\n")"
+  case "$loose" in *GIT_CONF*) ;; *) return 0 ;; esac
+  deny "git: a subcommand that may be an alias, with git configuration given through the environment in a way the guard does not read (GIT_CONFIG_* made by braces)" \
+    "run the command the alias stands for directly, without GIT_CONFIG_KEY_n/GIT_CONFIG_PARAMETERS"
+}
+# git_env_unreadable <segments>: git configuration given through the environment (an assignment to
+# GIT_CONF…, however it is spelled) in a command that also holds a `$'…'` or `$"…"` string is denied,
+# whatever runs after it (#327, verification of round 7). The segment reader does not always read
+# such a command as the shell does (`env GIT_CONFIG_{PARAMETERS=$'\'alias.fb=branch\'',X=1} git fb
+# -f develop HEAD`: the `\'` inside `$'…'` hid the git from every rule), and the value it gives git
+# may be an alias the guard never sees. Read on the whole command once, before the segments, with
+# quotes, backslashes, `$`, backquotes, parentheses, braces and commas taken out; heredoc bodies that
+# are data are not in it. A mention without `=` (`git commit -m $'… GIT_CONFIG_KEY_0 …'`) passes.
+git_env_unreadable() {
+  local loose
+  [[ "$1" == *\$[\'\"]* ]] || return 0
+  loose="$(printf '%s' "$1" | LC_ALL=C tr -d "\"'\\\\\$\`(){},")"
+  [[ "$loose" =~ GIT_CONF[A-Za-z0-9_]*\+?= ]] || return 0
+  deny "git: git configuration given through the environment (GIT_CONFIG_*) in a command that also holds \$'…' or \$\"…\" text, which the guard does not read: its value may be an alias that forces or deletes a branch" \
+    "write the GIT_CONFIG_* value and the rest of the command plainly, without \$'…'/\$\"…\", or run the command the alias stands for directly"
+}
+# git_alias_reread: check_git on the words in ntok/nraw (git_inline_alias's), one level deeper.
+git_alias_reread() {
+  local -a tok=("${ntok[@]}") raw=("${nraw[@]}")
+  GIT_ALIAS_DEPTH=$((GIT_ALIAS_DEPTH + 1))
+  check_git
+}
+
+# --- #379: what still reached develop/main through git configuration or a child git ----------
+# One round, closed by broad denies rather than exact reading (the owner's call of 2026-10-14: a
+# stricter guard is the agent's choice; nothing that was denied passes now).
+
+# git_opt_word <k>: word k of a git call (a global option's name or the subcommand) as git gets it,
+# in GOW. Written with quotes or backslashes (`-c''`, `-"c"`, `\-c`, `-C''`, `--git-dir''`,
+# `b''ranch`), it is the shell's reading; one where the shell fills in part of an option's name or
+# of the subcommand is denied. A brace list in it (`{-c,alias.fb=branch}`, `{branch,-f}`) is denied
+# too: the shell makes several words of it, which the guard would read as one.
+GOW=""
+git_opt_word() {
+  local k="$1" r pre
+  GOW="${tok[k]}"
+  r="$GOW"
+  [ "${#raw[@]}" -ne "${#tok[@]}" ] || r="${raw[k]}"
+  git_brace_check "$r"
+  case "$r" in *[\'\"\\]*) ;; *) return 0 ;; esac
+  shell_text "$r"
+  if [ "$ST_FILL" -eq 0 ]; then
+    GOW="$ST_TEXT"
+    return 0
+  fi
+  # A fill after the `=` of an --option=value leaves the name readable (`--git-dir="$D"`), and a word
+  # that is all fill (`"$@"` in a wrapper function) is read as before: only a name written partly
+  # out and partly filled in (`-"$O"`, `b"$X"`) is denied.
+  pre="${r%%[\$\`]*}"
+  shell_text "$pre"
+  if [[ "$ST_TEXT" == --*=* ]]; then
+    GOW="$ST_TEXT"
+    return 0
+  fi
+  [ -n "$ST_TEXT" ] || return 0
+  # Read as git in place of a program the shell fills in (cw_as_if), the word stays as it was read
+  # before: that reading has its own denies, and this one must not add any to a command that may
+  # not be git at all.
+  [ "${CW_ASIF:-0}" -eq 0 ] || return 0
+  deny "git: an option or subcommand ('${r}') written with quotes or backslashes and something the shell fills in, which the guard does not read as git gets it" \
+    "write git's options and its subcommand plainly"
+}
+
+# git_brace_check <word as written>: denies a brace list or sequence in a git option, its value or
+# the subcommand (#379).
+git_brace_check() {
+  [[ "$1" == *'{'*'}'* ]] || return 0
+  [[ "$1" =~ \{[^}]*(,|\.\.)[^}]*\} ]] || return 0
+  deny "git: an option, its value or the subcommand written with braces ('$1'), which the shell expands into words the guard does not read in place" \
+    "write git's options and its subcommand out in full, without {…,…}"
+}
+
+# git_builtin <subcommand>: is it one of git's built-in commands, both in the list pinned to git 2.43
+# (GIT_BUILTINS) and in the one the git on PATH reports (`git --list-cmds=builtins`, read once)? An
+# older git that lacks one runs an alias of that name (#379). A git that cannot list them counts as
+# having none: every subcommand is then one an alias may stand for.
+GIT_RT_BUILTINS=""
+GIT_RT_READ=0
+git_builtin() {
+  [[ "$GIT_BUILTINS" == *" $1 "* ]] || return 1
+  if [ "$GIT_RT_READ" -eq 0 ]; then
+    GIT_RT_READ=1
+    GIT_RT_BUILTINS=" $(git --list-cmds=builtins 2>/dev/null | tr '\n' ' ') "
+  fi
+  [[ "$GIT_RT_BUILTINS" == *" $1 "* ]]
+}
+
+# git_cmd_alias_source: does the command, anywhere in it, give git configuration this guard does not
+# read, so that a git call of it may run an alias (#379)? Read once, on the whole command with
+# quotes, backslashes, `$`, backquotes, parentheses, braces and commas taken out; the source found
+# is in CMD_ALIAS_SRC (empty: none). Deliberately broad:
+# - an assignment, declaration or read of HOME, XDG_CONFIG_HOME, GIT_DIR, GIT_COMMON_DIR or a
+#   GIT_CONFIG* name (a global file of the agent's choosing; GIT_CONFIG_NOSYSTEM and a global or
+#   system file that is /dev/null are not one);
+# - a git configuration file named in it (`gitconfig`, `git/config`, `config.worktree`);
+# - the word `config` together with `alias` or `include`, or with a `\x`/`\NNN`/`\u` escape that may
+#   spell them (`git config alias.fb branch`, `printf '[alias]…' >> config`).
+CMD_ALIAS_SRC=""
+CMD_ENV_SRC=""
+CMD_ALIAS_READ=0
+git_cmd_alias_source() {
+  local t l
+  [ "$CMD_ALIAS_READ" -eq 0 ] || return 0
+  CMD_ALIAS_READ=1
+  # A cheap look first, on the hook's input with quotes, backslashes, `$` and braces out: without any
+  # of the names below (and without a \u the JSON may spell one with), there is nothing to read.
+  if [[ "${INPUT-}" != *'\u'* ]]; then
+    t="$(printf '%s' "${INPUT-}" | LC_ALL=C tr -d "\"'\\\\\$\`(){},")"
+    case "$t" in *HOME* | *GIT_DIR* | *GIT_COMMON_DIR* | *GIT_CONF*) ;; *)
+      t="$(printf '%s' "$t" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+      case "$t" in *config*) ;; *) return 0 ;; esac
+      ;;
+    esac
+  fi
+  raw_command
+  t="${RAW_COMMAND//$'\\\n'/}"
+  l="$(printf '%s' "$t" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  t="$(printf '%s' "$t" | LC_ALL=C tr '\n\t' '  ' | LC_ALL=C tr -d "\"'\\\\\$\`(){},")"
+  t="$(printf '%s' "$t" | sed -E 's#GIT_CONFIG_(GLOBAL|SYSTEM)=/dev/null([^A-Za-z0-9_./-]|$)#\2#g; s#GIT_CONFIG_NOSYSTEM=##g')"
+  local names='(HOME|XDG_CONFIG_HOME|GIT_DIR|GIT_COMMON_DIR)' decl='(export|declare|typeset|readonly|local|read|getopts|for|select|mapfile|readarray|unset|printf)'
+  # GIT_CONFIG_* is git_env_alias's to judge for the subcommand; here it only counts for the git
+  # commands a child git runs (CMD_ENV_SRC).
+  if [[ "$t" =~ (^|[^A-Za-z0-9_])GIT_CONFIG[A-Z0-9_]*(\[[^]]*\])?[:+]?= ]] ||
+    [[ "$t" =~ (^|[^A-Za-z0-9_])${decl}([^;&|]*[^A-Za-z0-9_\/.-])?GIT_CONFIG[A-Z0-9_]*([[:space:];&|]|$) ]]; then
+    CMD_ENV_SRC="${BASH_REMATCH[0]# }"
+  fi
+  if [[ "$t" =~ (^|[^A-Za-z0-9_])${names}(\[[^]]*\])?[:+]?= ]] ||
+    [[ "$t" =~ (^|[^A-Za-z0-9_])${decl}([^;&|]*[^A-Za-z0-9_\/.-])?${names}([[:space:];&|]|$) ]]; then
+    CMD_ALIAS_SRC="${BASH_REMATCH[0]# }"
+    return 0
+  fi
+  t="$(printf '%s' "$t" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  if [[ "$t" =~ gitconfig|git/config|config\.worktree ]]; then
+    CMD_ALIAS_SRC="${BASH_REMATCH[0]}"
+    return 0
+  fi
+  if [[ "$t" =~ (^|[^a-z0-9_.-])(git-)?config([^a-z0-9_.-]|$) ]] &&
+    { [[ "$t" == *alias* || "$t" == *include* ]] || [[ "$l" =~ \\(x|[0-7]{3}|u) ]]; }; then
+    CMD_ALIAS_SRC="a git config write of an alias or include"
+  fi
+  return 0
+}
+
+# git_alias_reach <subcommand as written> <as git gets it> <index after it>: the git call's
+# subcommand against the alias sources of the command (#379).
+# - With any of them (one in this call: -c/--config-env alias.*, include.path, includeIf; or one of
+#   git_cmd_alias_source's), a subcommand that may be an alias (not one of git's built-ins, as
+#   written and as git gets it) is denied, as git_inline_alias already did for the first kind.
+# - With any of them, a subcommand that runs other git commands, which inherit the call's -c
+#   (GIT_CONFIG_PARAMETERS) and its environment, is denied: rebase (-x/--exec, the todo list),
+#   bisect (run), for-each-repo, submodule--helper (foreach), difftool (-x), hook, maintenance.
+# - Without any: the commands those run, written in the call, are judged as commands (git_child_cmds).
+GIT_CHILD_SUBS=" rebase bisect for-each-repo submodule--helper submodule difftool mergetool hook maintenance "
+git_alias_reach() {
+  local w="$1" s="$2" i="$3" src="$GIT_INLINE_SRC" x env=""
+  # Not on the reading as git of a program the shell fills in (cw_as_if), which may not be git.
+  if [ -z "$src" ] && [ "${CW_ASIF:-0}" -eq 0 ]; then
+    git_cmd_alias_source
+    src="$CMD_ALIAS_SRC"
+    env="$CMD_ENV_SRC"
+  fi
+  if [ -n "$src" ]; then
+    for x in "$w" "$s"; do
+      git_builtin "$x" && continue
+      deny "git ${x}: the command also gives git configuration the guard does not read (${src}), and '${x}' is not one of git's built-in commands, so an alias may stand for it" \
+        "run the command the alias stands for directly, in a command of its own that sets no git configuration, HOME or XDG_CONFIG_HOME"
+    done
+  fi
+  [ -n "$src" ] || src="$env"
+  if [ -n "$src" ]; then
+    if [[ "$GIT_CHILD_SUBS" == *" $s "* ]]; then
+      deny "git ${s}: it runs other git commands, which inherit the configuration this command gives git (${src}) and may run an alias of it the guard does not read" \
+        "run git ${s} in a command of its own that sets no git configuration, alias, include, HOME or XDG_CONFIG_HOME"
+    fi
+  fi
+  git_child_cmds "$s" "$i"
+  return 0
+}
+
+# git_child_cmds <subcommand> <index after it>: what a git subcommand runs as a command, written in
+# the call (`rebase -x <cmd>`, `bisect run <cmd>…`, `submodule foreach <cmd>…`, `difftool -x <cmd>`),
+# judged as a command, as the shell that runs it reads it (#379: `git bisect run git branch -f
+# develop HEAD` and `git submodule foreach git branch -f develop HEAD` were judged by no rule). One
+# the shell fills in is denied. for-each-repo runs a git command in each repository of a list the
+# guard does not read: only the housekeeping ones pass.
+git_child_cmds() {
+  local s="$1" i="$2" k n=${#tok[@]} a ctext="" after=0
+  case "$s" in
+    rebase | difftool)
+      # Each word as the shell makes it (`-x git\ branch\ -f\ develop` is one word).
+      k=$i
+      while [ "$k" -lt "$n" ]; do
+        git_word "$k"
+        k=$GW_NEXT
+        a="$GW_RAW"
+        case "$a" in *[\'\"\\]*) shell_text "$a" && a="$ST_TEXT" ;; esac
+        case "$a" in
+          --) break ;;
+          -x | --e | --ex | --exe | --exec | --ext | --extc | --extcm | --extcmd)
+            [ "$s" = rebase ] || [[ "$a" != --e* ]] || continue
+            [ "$k" -lt "$n" ] || break
+            git_word "$k"
+            k=$GW_NEXT
+            git_child_judge "$s" "$GW_RAW"
+            ;;
+          -x?* | --exec=* | --exe=* | --ex=* | --e=* | --extcmd=* | --extcm=* | --extc=* | --ext=*)
+            [ "$s" = rebase ] || [[ "$a" != --e* ]] || continue
+            a="$GW_RAW"
+            case "$a" in
+              -x*) a="${a#-x}" ;;
+              *) a="${a#*=}" ;;
+            esac
+            git_child_judge "$s" "$a"
+            ;;
+        esac
+      done
+      ;;
+    bisect | submodule | submodule--helper)
+      for ((k = i; k < n; k++)); do
+        git_opt_word_quiet "$k"
+        a="$GOW"
+        if [ "$after" -eq 0 ]; then
+          case "$a" in
+            run) [ "$s" = bisect ] && after=1 ;;
+            foreach) [ "$s" != bisect ] && after=1 ;;
+            -*) ;;
+            *) [ "$s" = bisect ] && return 0 ;;
+          esac
+          continue
+        fi
+        # submodule foreach takes its own options before the command.
+        if [ "$s" != bisect ] && [ -z "$ctext" ]; then
+          case "$a" in --recursive | -q | --quiet | --) continue ;; esac
+        fi
+        if [ "${#raw[@]}" -eq "${#tok[@]}" ]; then ctext+="${raw[k]} "; else ctext+="${tok[k]} "; fi
+      done
+      [ -z "$ctext" ] || git_child_judge "$s" "${ctext% }" words
+      ;;
+    for-each-repo)
+      for ((k = i; k < n; k++)); do
+        git_opt_word_quiet "$k"
+        case "$GOW" in
+          --config) k=$((k + 1)) ;;
+          --config=* | --keep-going | --) ;;
+          gc | maintenance | commit-graph | multi-pack-index | pack-refs | prune | repack) return 0 ;;
+          *)
+            deny "git for-each-repo: it runs '${GOW}' as a git command in each repository of a list the guard does not read" \
+              "run that git command in each repository yourself, with git -C <repository>"
+            ;;
+        esac
+      done
+      ;;
+  esac
+  return 0
+}
+# git_opt_word_quiet <k>: GOW as git_opt_word reads it, without its denies (a later word of the call).
+git_opt_word_quiet() {
+  local r="${tok[$1]}"
+  GOW="$r"
+  [ "${#raw[@]}" -ne "${#tok[@]}" ] || r="${raw[$1]}"
+  case "$r" in *[\'\"\\]*) shell_text "$r" && GOW="$ST_TEXT" ;; esac
+  return 0
+}
+# git_child_judge <subcommand> <text> [words]: the command a git subcommand runs, judged as the
+# shell that runs it reads it, in a subshell (what it records stays out of this git call). With
+# `words`, <text> is several words as written, each taken as the shell hands it to git.
+git_child_judge() {
+  local s="$1" ctext="$2" w out=""
+  if [ "${3-}" = words ]; then
+    words_of "$ctext"
+    for w in ${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"}; do
+      shell_text "$w"
+      [ "$ST_FILL" -eq 0 ] || git_child_fill "$s"
+      out+="$ST_TEXT "
+    done
+    ctext="${out% }"
+  else
+    shell_text "$ctext"
+    [ "$ST_FILL" -eq 0 ] || git_child_fill "$s"
+    ctext="$ST_TEXT"
+  fi
+  [ -n "$ctext" ] || return 0
+  [[ "$ctext" != *$'\n'* ]] || deny "git ${s}: the command it runs spans several lines, which the guard does not read as a command" \
+    "write the command on one line, or run it directly"
+  (
+    CW_DEPTH=$((CW_DEPTH + 1))
+    check_segment "$ctext"
+    parallel_job "$ctext"
+  ) || exit 2
+  return 0
+}
+git_child_fill() {
+  deny "git ${1}: the command it runs holds something the shell fills in, which the guard does not read" \
+    "write the command it runs out in full"
+}
+
+# check_git_dashed <command word>: `git-<builtin>` (`/usr/lib/git-core/git-branch -f develop HEAD`)
+# is that git command: judged as `git <builtin> …` (#379).
+check_git_dashed() {
+  local s="${1#git-}"
+  [[ "$GIT_BUILTINS" == *" $s "* ]] || return 0
+  local -a tok=("git" "$s" "${tok[@]:1}") raw=("git" "$s" "${raw[@]:1}")
+  check_git
 }
 
 # --- Where does a push go? ---------------------------------------------------
@@ -794,6 +1547,393 @@ push_head_branch() {
   git_clean -C "$CMD_GIT_DIR" branch --show-current 2>/dev/null || true
 }
 
+# --- Moving a long-lived LOCAL branch with fetch or push (#394) -------------
+# `git fetch . HEAD:develop`, `git fetch . +HEAD:develop` and `git push . HEAD:develop` move a
+# long-lived branch of this repository to any commit, like a forced `git branch` (#327): the remote
+# is this very repository, so nothing reviewed the commit. Measured with git 2.43: `.`, `./`, the
+# repository's path, its .git directory and file://<path> all move develop. A refspec destination that
+# names a long-lived branch (is_long_lived_branch, the list `git branch -f` uses) is denied when:
+#   - the remote is this repository, or the guard cannot tell (a remote the shell fills in, a
+#     directory or a path it cannot follow), for fetch, pull and push alike;
+#   - a fetch or pull forces it (`+` in front, --force, -f), from any remote; push already denies
+#     every `+` and --force;
+#   - a fetch or pull with --prune maps a pattern onto it.
+# Only when that branch exists (or may) where the command runs (local_branch_may_exist, as #327):
+# a repository this command makes keeps nothing to move. What the guard cannot read is read as the
+# worst case (local_refspec_names): a destination the shell fills in may be any long-lived name, a
+# fill where the `+` goes may force, and the refspecs of --stdin may be anything. A configured
+# remote is resolved by git where the command runs; when that directory cannot be told (a cd into a
+# variable or into a directory the command makes, git -C $d), a network URL or a remote written as a
+# plain name (`origin`) is another repository, and a path or `.` is this one. What keeps passing: `git fetch origin develop`, `git fetch origin develop:develop` (it
+# only moves forward, to what origin holds), `git fetch origin develop:refs/remotes/origin/develop`,
+# `git fetch origin "$B"`, `git pull`, `git push origin <branch>`.
+
+# local_refspec_names <refspec as written>: the long-lived names its destination may be, in
+# LR_NAMES (each one listed once at most), and LR_FORCED=1 when it forces (a leading `+`, or a
+# fill where the `+` would be). A refspec with no ':' moves no local branch (fetch: only
+# FETCH_HEAD; push to this repository: a branch onto itself), unless the shell fills it in: then
+# LR_WEAK=1, and the caller reads it as any long-lived name only when the remote is this
+# repository as written (`.`, a path, file://) or as resolved, or is filled in too.
+# A fill (`$x`, `${x}`, `$(…)`, a backquote) with a ':' outside it splits there: a value with
+# another ':' would not be a refspec git takes (`+refs/pull/$n/head:refs/remotes/pr/$n` names no
+# long-lived branch; `HEAD:$B` may name any). $'…' escapes, {a..b} sequences and braces next to a
+# fill are not read: any long-lived name, forced.
+LR_NAMES=()
+LR_FORCED=0
+LR_WEAK=0
+local_refspec_names() {
+  local r="$1" q m w s
+  LR_NAMES=()
+  LR_FORCED=0
+  LR_WEAK=0
+  long_lived_names
+  q="${r//\$\"/\"}"
+  q="${q//[\"\'\\]/}"
+  if [[ "$r" == *"\$'"* ]] || [[ "$r" =~ \{[^{},]*\.\.[^{},]*\} ]] ||
+    { [[ "$q" == *[\$\`]* ]] && [[ "$q" == *[{}]* ]] && fill_mask "$q" && [[ "$FM_OUT" == *[{}]* ]]; }; then
+    LR_FORCED=1
+    LR_NAMES=("${LONG_LIVED_NAMES[@]}")
+    return 0
+  fi
+  if [[ "$q" == *[\$\`]* ]]; then
+    fill_mask "$q"
+    m="$FM_OUT"
+    if [[ "$m" != *:* ]]; then
+      LR_WEAK=1
+      LR_NAMES=("${LONG_LIVED_NAMES[@]}")
+      return 0
+    fi
+    case "$m" in [+\$]*) LR_FORCED=1 ;; esac
+    s="${m%%:*}"
+    lr_add_dst "${m:${#s}+1}"
+    return 0
+  fi
+  # Braces anywhere in it make more refspecs (`{a:develop,b}`); past what brace_words reads, any
+  # long-lived name, forced.
+  brace_words "$q"
+  if [ "$BRACE_OVER" -eq 1 ]; then
+    LR_FORCED=1
+    LR_NAMES=("${LONG_LIVED_NAMES[@]}")
+    return 0
+  fi
+  for w in "${BRACE_OUT[@]}"; do
+    case "$w" in +*) LR_FORCED=1 ;; esac
+    w="${w#+}"
+    [[ "$w" == *:* ]] || continue
+    lr_add_dst "${w#*:}"
+  done
+  return 0
+}
+
+# lr_add_dst <destination>: adds to LR_NAMES the long-lived names it may be. A pattern
+# (`refs/heads/*`), a shell glob or what fill_mask marked (`$`) reads as every long-lived name that
+# starts like the text before it.
+lr_add_dst() {
+  local d="$1" pre np x
+  local -a add=()
+  [ -n "$d" ] || return 0
+  if [[ "$d" == *[\*\?\[\(\$\`]* ]]; then
+    pre="${d%%[\*\?\[\(\$\`]*}"
+    case "$pre" in
+      refs/heads/*) np="${pre#refs/heads/}" ;;
+      heads/*) np="${pre#heads/}" ;;
+      *)
+        np="$pre"
+        if [[ "refs/heads/" == "$pre"* || "heads/" == "$pre"* ]]; then np=""; fi
+        ;;
+    esac
+    for x in "${LONG_LIVED_NAMES[@]}"; do
+      [ -n "$x" ] && [[ "$x" == "$np"* ]] && add+=("$x")
+    done
+  else
+    push_dest_branch "$d"
+    is_long_lived_branch "$PUSH_BRANCH" && add+=("$PUSH_BRANCH")
+  fi
+  for x in ${add[@]+"${add[@]}"}; do
+    identity_in "$x" "$(printf '%s\n' ${LR_NAMES[@]+"${LR_NAMES[@]}"})" || LR_NAMES+=("$x")
+  done
+  return 0
+}
+
+# fill_mask <word without quotes>: the word with every character the shell fills in replaced by
+# `$`, in FM_OUT (as long as the word): `$name`, `$1`/`$@`/…, `${…}`, `$(…)` and `$((…))` (nested
+# ones counted) and a backquoted part. The rest is kept as written.
+FM_OUT=""
+fill_mask() {
+  local w="$1" n=${#1} k=0 c nx depth=0 bt=0
+  FM_OUT=""
+  while [ "$k" -lt "$n" ]; do
+    c="${w:k:1}"
+    if [ "$bt" -eq 1 ]; then
+      FM_OUT+='$'
+      [ "$c" = '`' ] && bt=0
+      k=$((k + 1))
+      continue
+    fi
+    if [ "$depth" -gt 0 ]; then
+      FM_OUT+='$'
+      case "$c" in
+        '{' | '(') depth=$((depth + 1)) ;;
+        '}' | ')') depth=$((depth - 1)) ;;
+      esac
+      k=$((k + 1))
+      continue
+    fi
+    case "$c" in
+      '`')
+        bt=1
+        FM_OUT+='$'
+        ;;
+      '$')
+        nx="${w:k+1:1}"
+        case "$nx" in
+          '{' | '(')
+            FM_OUT+='$$'
+            depth=1
+            k=$((k + 2))
+            continue
+            ;;
+          [A-Za-z_])
+            FM_OUT+='$'
+            k=$((k + 1))
+            while [ "$k" -lt "$n" ] && [[ "${w:k:1}" == [A-Za-z0-9_] ]]; do
+              FM_OUT+='$'
+              k=$((k + 1))
+            done
+            continue
+            ;;
+          [0-9@*#?\$!-])
+            FM_OUT+='$$'
+            k=$((k + 2))
+            continue
+            ;;
+          *) FM_OUT+='$' ;;
+        esac
+        ;;
+      *) FM_OUT+="$c" ;;
+    esac
+    k=$((k + 1))
+  done
+  return 0
+}
+
+# remote_is_other_repo <remote as written> <fetch|push>: 0 only when every URL the remote reaches is
+# provably NOT this repository (the one the git command runs in): a network URL (scheme://host or
+# [user@]host:path), or a local path or file:// URL of another repository. 1 for this repository and
+# for everything the guard cannot tell (a remote the shell fills in, a directory it cannot follow, a
+# path that does not resolve, --config-env). Asked of git where the command runs, with the command's
+# own -c (insteadOf rewriting, a remote's url and pushurl). No remote: every configured one.
+# RIO_SELF is 1 when git said, for one of its URLs, that it is this repository.
+RIO_SELF=0
+remote_is_other_repo() {
+  local r="$1" kind="$2" w d="" self="" urls="" out="" u p id rr k known=1
+  local -a cfg=() getopt=(--all)
+  RIO_SELF=0
+  [ "$kind" = push ] && getopt=(--push --all)
+  case "$r" in *[\$\`]*) return 1 ;; esac
+  w="${r//[\"\'\\]/}"
+  case "$w" in *[\{\*\?\[~]*) return 1 ;; esac
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    case "${GIT_GLOBALS[k]}" in
+      -c)
+        cfg+=(-c "${GIT_GLOBALS[k + 1]}")
+        k=$((k + 1))
+        ;;
+      --config-env | --config-env=*) return 1 ;;
+    esac
+  done
+  if command_moves_git || dir_readings_differ || ! command_git_dir; then
+    known=0
+  else
+    d="$CMD_GIT_DIR"
+    # Outside a repository remote_identity would still name the directory: not a repository.
+    if git_clean -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+      self="$(remote_identity "$d")" || self=""
+    fi
+    [ -n "$self" ] || known=0
+  fi
+  if [ "$known" -eq 0 ]; then
+    # Where the command runs is not known (or is not a repository): only a URL that is plainly
+    # another host, or a remote written as a plain name (`origin`), with no -c that may rewrite
+    # it, is not this repository. A configured remote that points back at this repository is only
+    # caught where git can be asked: reading every `git push origin HEAD:develop` from a directory
+    # the guard cannot follow as this repository would deny the everyday push to the remote.
+    [ "${#cfg[@]}" -eq 0 ] || return 1
+    case "$w" in
+      file://*) return 1 ;;
+      *://*) return 0 ;;
+      */*:* | '' | . | .. | ./* | ../* | /*) return 1 ;;
+      *:*) return 0 ;;
+      */*) return 1 ;;
+    esac
+    return 0
+  fi
+  if [ -z "$w" ]; then
+    out="$(git_clean -C "$d" ${cfg[@]+"${cfg[@]}"} remote 2>/dev/null)" || return 1
+    [ -n "$out" ] || return 1
+    for rr in $out; do
+      urls+="$(git_clean -C "$d" ${cfg[@]+"${cfg[@]}"} remote get-url "${getopt[@]}" "$rr" 2>/dev/null)"$'\n' || return 1
+    done
+  elif out="$(git_clean -C "$d" ${cfg[@]+"${cfg[@]}"} remote get-url "${getopt[@]}" "$w" 2>/dev/null)"; then
+    urls="$out"
+  else
+    out="$(git_clean -C "$d" ${cfg[@]+"${cfg[@]}"} ls-remote --get-url "$w" 2>/dev/null)" || return 1
+    urls="$out"
+  fi
+  [ -n "${urls//$'\n'/}" ] || return 1
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    case "$u" in
+      file://*)
+        p="${u#file://}"
+        case "$p" in /*) ;; *) return 1 ;; esac
+        ;;
+      *://*) continue ;;
+      */*:*) p="$u" ;;
+      *:*) continue ;;
+      *) p="$u" ;;
+    esac
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+    id="$(remote_identity "$p")" || id=""
+    [ -n "$id" ] || return 1
+    if [ "$id" = "$self" ]; then
+      RIO_SELF=1
+      return 1
+    fi
+  done <<<"$urls"
+  return 0
+}
+
+# remote_written_local <remote as written>: is it written as a local path (`.`, `..`, `./x`, `/x`,
+# `~/x`, file://) or filled in by the shell?
+remote_written_local() {
+  local w="${1//[\"\'\\]/}"
+  case "$1" in *[\$\`]*) return 0 ;; esac
+  case "$w" in
+    . | .. | ./* | ../* | /* | '~'* | file://*) return 0 ;;
+  esac
+  return 1
+}
+
+# judge_local_refspecs <fetch|pull|push> <remote as written> <forced: 0|1> <prune: 0|1> <unread: 0|1>
+# <refspec>...: the rule above, for every refspec. <unread> is 1 when git reads more refspecs from
+# stdin (fetch --stdin).
+judge_local_refspecs() {
+  local sub="$1" remote="$2" force="$3" prune="$4" unread="$5" r x rk="" kind=fetch
+  shift 5
+  [ "$sub" = push ] && kind=push
+  if [ "$unread" -eq 1 ]; then
+    long_lived_names
+    for x in "${LONG_LIVED_NAMES[@]}"; do
+      [ -n "$x" ] || continue
+      local_branch_may_exist "$x" || continue
+      deny "git ${sub} --stdin reads its refspecs from the input, which the guard does not read, and one may move or force '${x}', a long-lived branch of this flow that exists (or may) where the command runs" \
+        "write the refspecs in the command (git ${sub} origin <branch>, or git fetch origin ${x}:${x} to bring a stale copy up to date)"
+    done
+  fi
+  for r in "$@"; do
+    local_refspec_names "$r"
+    [ "${#LR_NAMES[@]}" -gt 0 ] || continue
+    for x in "${LR_NAMES[@]}"; do
+      [ -n "$x" ] || continue
+      local_branch_may_exist "$x" || continue
+      # remote_is_other_repo asked once, and only when a refspec names a long-lived branch.
+      if [ -z "$rk" ]; then
+        rk=1
+        remote_is_other_repo "$remote" "$kind" && rk=0
+      fi
+      # A filled refspec with no ':' (LR_WEAK) only where the remote is this repository as git
+      # resolved it, or as written: `.`, a path, file://, or a remote the shell fills in.
+      if [ "$rk" -eq 1 ] && { [ "$LR_WEAK" -eq 0 ] || [ "$RIO_SELF" -eq 1 ] || remote_written_local "$remote"; }; then
+        deny "git ${sub} ${remote:+$remote }${r}: the remote is this repository (or the guard cannot tell), so it moves '${x}', a long-lived branch of this flow that exists (or may) where the command runs, to a commit of its own, like a forced git branch" \
+          "a long-lived branch only moves through merged PRs: to bring a stale local copy up to date, git fetch origin ${x}:${x} (it only moves forward); to keep this work, give it a branch of its own (git branch <type>/<name> <commit>); moving a long-lived branch is the user's call"
+      fi
+      [ "$sub" = push ] && continue
+      if [ "$force" -eq 1 ] || [ "$LR_FORCED" -eq 1 ]; then
+        deny "git ${sub} ${remote:+$remote }${r}: forcing a fetch into '${x}' (a leading '+', --force or -f, or a refspec the shell fills in) replaces a long-lived branch of this flow that exists (or may) where the command runs" \
+          "drop the force: git fetch origin ${x}:${x} only moves it forward; replacing a long-lived branch is the user's call"
+      fi
+      if [ "$prune" -eq 1 ] && [[ "$r" == *[\*\$\`]* ]]; then
+        deny "git ${sub} --prune ${remote:+$remote }${r}: the pattern maps onto local branches, so pruning may delete '${x}', a long-lived branch of this flow" \
+          "fetch into refs/remotes/ (git fetch --prune origin), and delete a finished branch by name"
+      fi
+    done
+  done
+  return 0
+}
+
+# git fetch / git pull: the refspecs and --refmap values (and the remote.<name>.fetch the command
+# sets with -c), judged by judge_local_refspecs.
+check_git_fetch() {
+  local i="$1" sub="$2" a o k force=0 prune=0 unread=0 kv key
+  local -a positional=() extra=() vals=()
+  vals=(upload-pack jobs depth shallow-since shallow-exclude deepen refmap server-option negotiation-tip filter recurse-submodules-default submodule-prefix)
+  [ "$sub" = pull ] && vals=(upload-pack depth shallow-since shallow-exclude deepen refmap server-option negotiation-tip cleanup strategy strategy-option)
+  while [ "$i" -lt "${#tok[@]}" ]; do
+    a="${tok[i]}"
+    i=$((i + 1))
+    case "$a" in
+      --)
+        positional+=(${tok[@]+"${tok[@]:i}"})
+        break
+        ;;
+      --refmap=*) extra+=("${a#--refmap=}") ;;
+      --?*=*)
+        o="${a#--}"
+        o="${o%%=*}"
+        ;;
+      --?*)
+        o="${a#--}"
+        if push_long_is "$o" force; then
+          force=1
+        elif push_long_is "$o" prune; then
+          prune=1
+        elif push_long_is "$o" stdin; then
+          unread=1
+        elif push_long_is "$o" refmap; then
+          extra+=("${tok[i]:-}")
+          i=$((i + 1))
+        else
+          for k in "${vals[@]}"; do
+            if push_long_is "$o" "$k"; then
+              i=$((i + 1))
+              break
+            fi
+          done
+        fi
+        ;;
+      -?*)
+        # A short cluster: -f is --force, -p --prune; -o, -j (fetch), -s and -X (pull) take the rest
+        # of the cluster, or the next word, as their value.
+        for ((k = 1; k < ${#a}; k++)); do
+          case "${a:k:1}" in
+            f) force=1 ;;
+            p) prune=1 ;;
+            S) break ;;
+            o | s | X | j)
+              if [ "${a:k:1}" != j ] || [ "$sub" = fetch ]; then
+                [ "$k" -eq $((${#a} - 1)) ] && i=$((i + 1))
+                break
+              fi
+              ;;
+          esac
+        done
+        ;;
+      *) positional+=("$a") ;;
+    esac
+  done
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    [ "${GIT_GLOBALS[k]}" = -c ] || continue
+    kv="${GIT_GLOBALS[k + 1]}"
+    k=$((k + 1))
+    key="$(printf '%s' "${kv%%=*}" | tr '[:upper:]' '[:lower:]')"
+    case "$key" in remote.*.fetch) [[ "$kv" == *=?* ]] && extra+=("${kv#*=}") ;; esac
+  done
+  judge_local_refspecs "$sub" "${positional[0]:-}" "$force" "$prune" "$unread" \
+    ${positional[@]+"${positional[@]:1}"} ${extra[@]+"${extra[@]}"}
+  return 0
+}
+
 check_git_push() {
   local i="$1"
   local force=0 noverify=0 lease=0 del=0 a o k repo_opt=""
@@ -977,6 +2117,9 @@ check_git_push() {
     done
   fi
 
+  # A long-lived branch of this repository moved by a push to this repository (#394).
+  judge_local_refspecs push "${positional[0]:-$repo_opt}" 0 0 0 ${refspecs[@]+"${refspecs[@]}"}
+
   # Everything below is the protected-branch rule, which is the policy of the repository
   # the push LANDS IN. The checks above stay unconditional: they are rules about the agent,
   # not about any repository.
@@ -1077,41 +2220,330 @@ check_git_merge() {
 # every repository: the name is what counts, wherever the command runs. With -r the names are
 # remote-tracking (`origin/main`): the part after the remote is judged. A name the shell fills in
 # later is not judged, as for a push. Renaming one away (`git branch -m/-M <long-lived> <new>`, or
-# `-m <new>` while on it) leaves no branch by that name either: denied too (#306). Renaming another
-# branch TO a long-lived name (`git branch -M main` after `git init`) is not touched.
+# `-m <new>` while on it) leaves no branch by that name either: denied too (#306), as is an old name
+# written as a shell glob (`dev*`, `dev?lop`) that may match a file named like one (#327). Renaming
+# another branch TO a long-lived name (`git branch -M main` after `git init`) is not touched, unless
+# the rename, copy or creation is forced over one that already exists locally (`git branch -f
+# develop x`, `-M x develop`, `-C x develop`, `-c -f x develop`): that replaces what it points to,
+# like deleting it and making it again elsewhere (#327, see deny_long_lived_overwrite).
+# seg_continuation: the words of this segment (tok, and raw as written), followed by those of the
+# segments after it that the extractor cut off at the `&` of a `>&`, `<&` or `&>` (`git branch 2>&1
+# -f develop x` reaches the rules as `git branch 2>` and `1 -f develop x`; `git branch &> f -f
+# develop x` as `git branch` and `> f -f develop x`), in SEG_WORDS and SEG_RAWW. A segment that ends
+# in a redirection with no target, or a next one that starts with a redirection, was cut there: the
+# next segment is the rest of the same command (#327, independent review, round 3), but only when
+# the command as written has the `&` of a `>&`, `<&` or `&>` right before the next segment
+# (cut_at_amp): across a `;`, a newline or `&&` it is another command (`git branch -M a b 2>&1;
+# >/dev/null git checkout main`, round 4). Where the guard cannot read the offsets (a heredoc or a
+# character outside ASCII before it, a nested script), it is read as the same command: more names
+# to judge, never fewer. The extractor itself is left as it is (the follow-up issue covers every
+# rule).
+SEG_WORDS=()
+SEG_RAWW=()
+seg_continuation() {
+  local k last t npos re_op='^([0-9]*|[{][A-Za-z_][A-Za-z0-9_]*[}])[<>]'
+  SEG_WORDS=("${tok[@]}")
+  SEG_RAWW=("${raw[@]}")
+  [ -n "${JS_IDX:-}" ] || return 0
+  k=$((JS_IDX + 1))
+  while :; do
+    npos=""
+    while [ "$k" -lt "${#JS_LINES[@]}" ] && [[ "${JS_LINES[k]}" == $'\x01'* ]]; do
+      npos="${JS_LINES[k]#$'\x01'}"
+      npos="${npos%% *}"
+      k=$((k + 1))
+    done
+    [ "$k" -lt "${#JS_LINES[@]}" ] || return 0
+    words_of "${JS_LINES[k]}"
+    [ "${#SPLIT_WORDS[@]}" -gt 0 ] || return 0
+    last="${SEG_RAWW[${#SEG_RAWW[@]} - 1]}"
+    [[ "$last" =~ ${re_op}$ || "${SPLIT_WORDS[0]}" =~ $re_op ]] || return 0
+    cut_at_amp "$npos" || return 0
+    for t in "${SPLIT_WORDS[@]}"; do
+      SEG_RAWW+=("$t")
+      [[ "$t" == \"* ]] && t="${t:1}"
+      [[ "$t" == *\" ]] && t="${t:0:${#t}-1}"
+      [[ "$t" == \'* ]] && t="${t:1}"
+      [[ "$t" == *\' ]] && t="${t:0:${#t}-1}"
+      SEG_WORDS+=("$t")
+    done
+    k=$((k + 1))
+  done
+}
+
+# cut_at_amp <offset of the next segment>: did the extractor cut there at the `&` of a `>&`, `<&` or
+# `&>` (the text before it ends in `>&`/`<&`, or in a lone `&` with the segment starting at `>`)?
+# Yes too where the offset cannot be read (see seg_continuation).
+cut_at_amp() {
+  local LC_ALL=C o="$1" s
+  [[ "$o" =~ ^[0-9]+$ ]] || return 0
+  raw_command
+  s="${RAW_COMMAND:0:o}"
+  [[ "${s//<<</}" != *'<<'* && "$s" != *[![:ascii:]]* ]] || return 0
+  while [[ "$s" == *[[:blank:]] ]]; do s="${s%[[:blank:]]}"; done
+  case "$s" in
+    *'>&' | *'<&') return 0 ;;
+    *'&&') return 1 ;;
+    *'&') [ "${RAW_COMMAND:o:1}" = '>' ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# opt_tail <text>: <text>, the part of a double-quoted word after one fill (re_tail in
+# check_git_branch), may make an option of git branch: read alone (the fill empty) as a cluster of
+# short options or a long one, or after a dash (the fill `-`) as a long one. A cluster may when every
+# letter before a -u or -t is one of git branch's short options; a long one, when its name (up to
+# an `=`) is empty or begins --force, --move, --copy or --delete. Any other fill leaves a word git
+# rejects (`-f-bak`, `--force.old`). True when it may.
+opt_tail() {
+  local t="$1" l c
+  case "$t" in -*) ;; *) return 1 ;; esac
+  for l in "${t#--}" "${t#-}"; do
+    [ "$l" != "$t" ] || continue
+    case "$t:$l" in --*:"${t#-}") continue ;; esac
+    l="${l%%=*}"
+    [ -n "$l" ] || return 0
+    for c in force move copy delete; do
+      [[ "$c" == "$l"* ]] && return 0
+    done
+  done
+  case "$t" in
+    --*) ;;
+    *)
+      c="${t#-}"
+      c="${c%%[ut]*}"
+      [[ "$c" =~ ^[acCdDfilmMqrv]*$ ]] && return 0
+      ;;
+  esac
+  return 1
+}
+
 check_git_branch() {
-  local i="$1" a del=0 rem=0 mv=0 b
-  local -a names=()
+  local i="$1" a del=0 rem=0 mv=0 cp=0 force=0 other=0 neg=0 b d="" xall=0 smv=0 sdel=0 sp e isp=0
+  local -a names=() fnames=() tok=("${tok[@]}") rw=() popt=() snames=() sread=() soptw=()
+  # A double-quoted word that is one thing the shell fills in followed by text that starts with a
+  # character no option of git branch takes there (`"$(…)-bak"`, `"${USER}-scratch"`): git gets one
+  # word, which is never -f, -M or -C (`-f-bak` and `--force-bak` are errors), so it is not read as
+  # one (round 6). Unquoted, the fill may split into several words: still read as one.
+  # Round 7: only when the text after the fill is no option either when the fill is empty (`"$O-f"`
+  # is -f) or is a dash (`"$O-force"` is --force): opt_tail.
+  local re_tail='^"([$]__GUARD_SUBST__|[$][{][A-Za-z_][A-Za-z0-9_]*[}]|[$][A-Za-z_][A-Za-z0-9_]*)([-./:@+][^$`"\\]*)"$'
+  seg_continuation
+  tok=("${SEG_WORDS[@]}")
+  rw=("${SEG_RAWW[@]}")
   while [ "$i" -lt "${#tok[@]}" ]; do
     a="${tok[i]}"
     i=$((i + 1))
+    # Round 5: an option word the shell spells (`--forc\e`, `$'-f'`) is read as git gets it too: one
+    # that forces (-f, -M, -C, --force) forces, and with a mode read this way every name is judged
+    # (xall), never fewer than before. Nothing read this way turns a rule off (a delete would).
+    # One the shell fills in (`$O`, `"${O:--f}"`, `-$F`, `$(…)`) may be -f, -M or -C: noted in popt.
+    # Round 6: a spelled -m/-M/--move (`$'-m'`, `$'\55m'`) also judges the names as a rename
+    # (smv), and a spelled -d/-D/--delete as a delete (sdel), on the names without the spelled
+    # options (snames), as well as the reading by position that takes them for names. A word the
+    # shell expands with braces (`{-f,}`, `{-M,feature,develop}`) is read the same way, each word it
+    # makes: an option among them counts as a spelled one, the rest are names.
+    sp=0
+    if [[ "$a" == *[\"\'\\\$\`]* ]]; then
+      shell_text "$a"
+      d="$ST_TEXT"
+      if [ "$ST_FILL" -eq 1 ] && [[ "$d" == [\$\`\\-]* ]]; then
+        if ! [ "${#rw[@]}" -eq "${#tok[@]}" ] || ! [[ "${rw[i - 1]}" =~ $re_tail ]] || opt_tail "${BASH_REMATCH[2]}"; then
+          popt+=("$a")
+        fi
+      elif [ "$d" != "$a" ]; then
+        sread=("$d")
+        sp=1
+      fi
+    fi
+    # Round 7: braces are expanded before the quotes come off (`{"-f",}`, `{\-f,}`, `{$'-f',}`):
+    # each word they make is read as the shell then gives it to git, whatever the word holds.
+    if [[ "$a" == *"{"*[,.]*"}"* ]]; then
+      brace_words "$a"
+      if [ "${#BRACE_OUT[@]}" -gt 1 ]; then
+        # The reading of the whole word without its quotes (sp 1) stays among them.
+        [ "$sp" -eq 1 ] || sread=()
+        for e in "${BRACE_OUT[@]}"; do
+          if [[ "$e" == *[\"\'\\\$\`]* ]]; then
+            shell_text "$e"
+            [ "$ST_FILL" -eq 0 ] || popt+=("$a")
+            e="$ST_TEXT"
+          fi
+          sread+=("$e")
+        done
+        sp=2
+      fi
+    fi
+    # Round 7: an unquoted glob that may match a file named like an option (`[-]f`, `?f`, `-?`
+    # with a file `-f` where it runs) may be -f, -M or -C.
+    e="${a//[\"\']/}"
+    if [[ "$e" == *[\*\?\[]* ]] && [[ "${e%%[\*\?\[]*}" == "" || "$e" == -* ]]; then
+      popt+=("$a")
+    fi
+    if [ "$sp" -gt 0 ]; then
+      for e in "${sread[@]}"; do
+        case "$e" in
+          --forc | --force)
+            force=1
+            xall=1
+            ;;
+          --m | --mo | --mov | --move)
+            xall=1
+            smv=1
+            ;;
+          --cop | --copy) xall=1 ;;
+          --d | --de | --del | --dele | --delet | --delete) sdel=1 ;;
+          --*) ;;
+          -?*)
+            b="${e%%u*}"
+            [[ "$b" == *[fMC]* ]] && force=1
+            [[ "$b" == *[fmMcC]* ]] && xall=1
+            [[ "$b" == *[mM]* ]] && smv=1
+            [[ "$b" == *[dD]* ]] && sdel=1
+            ;;
+          *) [ "$sp" -eq 1 ] || snames+=("$e") ;;
+        esac
+      done
+    fi
     case "$a" in
       --)
         names+=("${tok[@]:i}")
+        snames+=("${tok[@]:i}")
         break
         ;;
       # git takes any unambiguous prefix of a long option (`--mo` is --move, `--del` --delete).
       --d | --de | --del | --dele | --delet | --delete) del=1 ;;
       --m | --mo | --mov | --move) mv=1 ;;
+      --cop | --copy) cp=1 ;;
+      --forc | --force) force=1 ;;
       --rem | --remo | --remot | --remote | --remotes) rem=1 ;;
-      -u) i=$((i + 1)) ;;
+      # Modes that name a branch without moving it (#327): with them `-f` forces nothing.
+      --l* | --uns* | --ed* | --sh*) other=1 ;;
+      -u)
+        other=1
+        i=$((i + 1))
+        ;;
       # A long option that takes its value as the next word (`--format X`, `--sort X`): skipped.
-      --*=*) ;;
+      --*=*)
+        case "$a" in --set-u* | --poi* | --con* | --no-con* | --mer* | --no-mer*) other=1 ;; esac
+        case "$a" in --no-*) neg=1 ;; esac
+        ;;
       --*)
         case "$a" in
           --f | --fo | --for | --form | --forma | --format | --so | --sor | --sort | --poi* | --con* | --no-con* | \
             --mer* | --no-mer* | --set-u*) i=$((i + 1)) ;;
         esac
+        case "$a" in --set-u* | --poi* | --con* | --no-con* | --mer* | --no-mer*) other=1 ;; esac
+        case "$a" in --no-*) neg=1 ;; esac
         ;;
       -?*)
         [[ "$a" == *[dD]* ]] && del=1
         [[ "$a" == *[mM]* ]] && mv=1
         [[ "$a" == *r* ]] && rem=1
+        # #327: `-u` takes the rest of the word as its value (`-uorigin/feat`): the letters after
+        # it are not options, and the mode sets an upstream.
+        b="${a%%u*}"
+        [[ "$b" == *[cC]* ]] && cp=1
+        [[ "$b" == *[fMC]* ]] && force=1
+        [[ "$b" == *l* ]] && other=1
+        [ "$b" = "$a" ] || other=1
         ;;
-      *) names+=("$a") ;;
+      *)
+        names+=("$a")
+        case "$sp:$d" in
+          2:*) ;;
+          1:-?*) soptw+=("$a") ;;
+          *) snames+=("$a") ;;
+        esac
+        ;;
     esac
   done
-  if [ "$mv" -eq 1 ] && [ "$del" -eq 0 ]; then
+  # Forced over a long-lived branch that already exists (#327): the new name of a forced rename or
+  # copy (the last of one or two names; every name when there are more), the branch a forced
+  # creation makes (the first name). Judged before the rename's own rule, on the names as written,
+  # without the redirections the shell takes out (`2>&1`, `> /dev/null`; the words after a `>&` come
+  # from seg_continuation). A redirection whose target the guard's split may have cut (a quote left
+  # open, a trailing backslash: `> "o u t"`, `>o\ u`) leaves its rest among the names: then every
+  # name is judged (round 3). A mode that moves nothing (--list, -u…) does not count once a `--no-…`
+  # may have cancelled it (`-l --no-l`).
+  [ "$neg" -eq 0 ] || other=0
+  local skip=0 all=0 t sq dq k re_r='^([0-9]*|[{][A-Za-z_][A-Za-z0-9_]*[}]|&)(>>?|<<?<?|>&|<&|<>|>[|]|&>>?)(.*)$'
+  for b in ${names[@]+"${names[@]}"}; do
+    if [ "$skip" -eq 1 ]; then
+      skip=0
+      continue
+    fi
+    if [[ "$b" =~ $re_r ]]; then
+      [ -n "${BASH_REMATCH[3]}" ] || skip=1
+      continue
+    fi
+    fnames+=("$b")
+  done
+  # The redirections' targets as written (quotes in): one with a quote left open or a trailing
+  # backslash goes on into the next word.
+  skip=0
+  for ((k = $1; k < ${#rw[@]}; k++)); do
+    t=""
+    if [ "$skip" -eq 1 ]; then
+      skip=0
+      t="${rw[k]}"
+    elif [[ "${rw[k]}" =~ $re_r ]]; then
+      t="${BASH_REMATCH[3]}"
+      [ -n "$t" ] || skip=1
+    fi
+    [ -n "$t" ] || continue
+    sq="${t//[!\']/}"
+    dq="${t//[!\"]/}"
+    if [ $((${#sq} % 2)) -eq 1 ] || [ $((${#dq} % 2)) -eq 1 ] || [[ "$t" == *\\ ]]; then
+      all=1
+    fi
+  done
+  # Under xargs or parallel the names may come from the input (`echo develop | xargs -I{} git branch
+  # -f {} x`, or appended after the last word): any long-lived one (#327, independent review).
+  if [ "$force" -eq 1 ] && [ "$del" -eq 0 ] && [ "$SEG_XARGS" -eq 1 ] && { [ "$mv" -eq 1 ] || [ "$cp" -eq 1 ] || [ "$other" -eq 0 ]; }; then
+    deny_long_lived_overwrite '*'
+  fi
+  # A word the shell fills in that may be an option (popt): read as -f, -M or -C, every name written
+  # out may be the one forced (round 5). The filled words themselves keep the reading by position
+  # below: two of them (`git branch $b $sha`, often a line of a log message the guard reads as a
+  # command) are not read as an option and a long-lived name at once.
+  if [ "${#popt[@]}" -gt 0 ] && [ "$del" -eq 0 ] && [ "$other" -eq 0 ]; then
+    for b in ${fnames[@]+"${fnames[@]}"}; do
+      isp=0
+      for d in "${popt[@]}"; do [ "$b" != "$d" ] || isp=1; done
+      [ "$isp" -eq 1 ] || deny_long_lived_overwrite "$b"
+    done
+  fi
+  if [ "$force" -eq 1 ] && [ "$del" -eq 0 ] && [ "${#fnames[@]}" -gt 0 ]; then
+    if [ "$all" -eq 1 ] || [ "$xall" -eq 1 ]; then
+      # A word the shell spells as an option, nothing left to fill in (`$'\55f'`), is the option
+      # git gets, not a name: not judged as one here (round 6).
+      for b in "${fnames[@]}"; do
+        isp=0
+        for d in ${soptw[@]+"${soptw[@]}"}; do [ "$b" != "$d" ] || isp=1; done
+        [ "$isp" -eq 1 ] || deny_long_lived_overwrite "$b"
+      done
+    elif [ "$mv" -eq 1 ] || [ "$cp" -eq 1 ]; then
+      case "${#fnames[@]}" in
+        1 | 2) deny_long_lived_overwrite "${fnames[${#fnames[@]} - 1]}" ;;
+        *) for b in "${fnames[@]}"; do deny_long_lived_overwrite "$b"; done ;;
+      esac
+    elif [ "$other" -eq 0 ]; then
+      deny_long_lived_overwrite "${fnames[0]}"
+    fi
+  fi
+  # Two readings of a rename (round 6): the names by position when -m/-M is written out (mv), and
+  # the names without the spelled options when one is spelled (smv). Either may deny.
+  local -a allnames=(${names[@]+"${names[@]}"})
+  local rd
+  for rd in 0 1; do
+    if [ "$rd" -eq 0 ]; then
+      [ "$mv" -eq 1 ] && [ "$del" -eq 0 ] || continue
+      names=(${allnames[@]+"${allnames[@]}"})
+    else
+      [ "$smv" -eq 1 ] && [ "$del" -eq 0 ] || continue
+      names=(${snames[@]+"${snames[@]}"})
+    fi
     # Counted after the shell's brace expansion: `develop{,-old}` is two names, develop the first.
     local -a exp=()
     local n=0
@@ -1122,19 +2554,31 @@ check_git_branch() {
       # out (`feature/$TICKET`). The current branch's name printed by git is the current branch.
       # The new name (the last of two) may be anything, unless braces make it more than one
       # (independent review of #311).
-      local bare="${b//[\"\']/}"
+      local bare="${b//[\"\']/}" gf=0
+      git_may_fill "$b" && gf=1
       case "$bare" in
         '$(git branch --show-current)' | '`git branch --show-current`' | '$(git rev-parse --abbrev-ref HEAD)' | '`git rev-parse --abbrev-ref HEAD`')
           bare="$(current_branch)"
           b="$bare"
           ;;
       esac
-      if [[ "$bare" == *[\$\\]* ]] && { [ "$n" -lt "${#names[@]}" ] || [ "${#names[@]}" -gt 2 ] || [[ "${bare//\$\{/}" == *"{"* ]]; }; then
-        local pre="${bare%%[\$\\\{]*}" x
+      # A name written as a glob (`dev*`, `dev?lop`, `[d]evelop`, `@(develop)` under extglob) is
+      # the files it matches where the command runs, which may be one named develop, and as many
+      # words as it matches: judged in every position (#327). The text before the first character
+      # the shell reads there is what it must start with.
+      # The guard's reader ends the word at an extglob's `(`, leaving its operator last (`@`).
+      # A name git fills in itself (`@{-1}`, the branch checked out before; `@{u}`, an upstream
+      # that is a local branch) may be any long-lived one, read like one the shell fills in (round 4).
+      # Round 5: what git gets may hold an `@{` the written word hides (`feat@\{u}`, `feat@$'{u}'`,
+      # `feat@$X`; git_may_fill): then the name may be any long-lived one, whatever text comes before.
+      if { [[ "$bare" == *[\$\\\`]* || "$bare" == *@\{* || "$gf" -eq 1 ]] && { [ "$n" -lt "${#names[@]}" ] || [ "${#names[@]}" -gt 2 ] || [[ "${bare//\$\{/}" == *"{"* ]]; }; } ||
+        [[ "$bare" == *[\*\?\[\(]* || "$bare" == *[\+\@\!] ]]; then
+        local pre="${bare%%[\$\\\{\*\?\[\(\+\@\!]*}" x
+        [[ "$bare" != *@\{* && "$gf" -eq 0 ]] || pre=""
         long_lived_names
         for x in "${LONG_LIVED_NAMES[@]}"; do
           if [[ "$x" == "$pre"* ]]; then
-            deny "git branch (renaming) a branch whose name the shell fills in (${b}), which may be a long-lived branch of this flow" \
+            deny "git branch (renaming) a branch whose name the shell or git fills in or the shell matches against files (${b}), which may be a long-lived branch of this flow" \
               "name the branch in full (the current one: git branch -m <new name>); renaming a long-lived branch away is the user's call"
           fi
         done
@@ -1146,14 +2590,16 @@ check_git_branch() {
     names=(${exp[@]+"${exp[@]}"})
     # With more names than git takes, every one is judged rather than guess which it renames.
     case "${#names[@]}" in
-      0) return 0 ;;
+      0) ;;
       1) deny_long_lived_delete "git branch (renaming)" "$(current_branch)" ;;
       2) deny_long_lived_delete "git branch (renaming)" "${names[0]}" ;;
       *) for b in "${names[@]}"; do deny_long_lived_delete "git branch (renaming)" "$b"; done ;;
     esac
-    return 0
-  fi
-  [ "$del" -eq 1 ] || return 0
+  done
+  names=(${allnames[@]+"${allnames[@]}"} ${snames[@]+"${snames[@]}"})
+  if [ "$mv" -eq 1 ] && [ "$del" -eq 0 ] && [ "$sdel" -eq 0 ]; then return 0; fi
+  # A delete written out (del) or spelled (sdel): every name of both readings.
+  [ "$del" -eq 1 ] || [ "$sdel" -eq 1 ] || return 0
   for b in ${names[@]+"${names[@]}"}; do
     [ "$rem" -eq 1 ] && b="${b#*/}"
     deny_long_lived_delete "git branch" "$b"
@@ -1162,24 +2608,63 @@ check_git_branch() {
 }
 
 # The same deletion through the plumbing: `git update-ref -d refs/heads/<branch>`.
+# #379: and the same overwrite. `git update-ref refs/heads/develop <x>` points the branch at x, as
+# `git branch -f` does, whether or not it exists: a long-lived branch named in any spelling (also
+# `heads/develop`, or HEAD while on one, unless --no-deref), a name the shell fills in, matches or
+# expands from braces, and --stdin (refs the guard does not read) are denied.
 check_git_update_ref() {
-  local i="$1" a del=0 ref=""
+  local i="$1" a del=0 ref="" refw="" stdin=0 noderef=0 b
   while [ "$i" -lt "${#tok[@]}" ]; do
-    a="${tok[i]}"
+    git_opt_word_quiet "$i"
+    a="$GOW"
     i=$((i + 1))
     case "$a" in
       -d | --delete) del=1 ;;
+      --stdin) stdin=1 ;;
+      --no-deref) noderef=1 ;;
       -m) i=$((i + 1)) ;;
       -*) ;;
       *)
-        [ -n "$ref" ] || ref="$a"
+        if [ -z "$ref" ]; then
+          ref="$a"
+          refw="${tok[i - 1]}"
+          [ "${#raw[@]}" -ne "${#tok[@]}" ] || refw="${raw[i - 1]}"
+        fi
         ;;
     esac
   done
-  [ "$del" -eq 1 ] && [ -n "$ref" ] || return 0
-  case "$ref" in
-    refs/heads/*) deny_long_lived_delete "git update-ref -d" "${ref#refs/heads/}" ;;
-  esac
+  if [ "$del" -eq 1 ]; then
+    [ -n "$ref" ] || return 0
+    case "$ref" in
+      refs/heads/*) deny_long_lived_delete "git update-ref -d" "${ref#refs/heads/}" ;;
+    esac
+  fi
+  if [ "$stdin" -eq 1 ]; then
+    deny "git update-ref --stdin: it moves or deletes the refs it reads from stdin, which the guard does not read, and one may be a long-lived branch" \
+      "update each ref in a command of its own (git update-ref refs/heads/<branch> <commit>), never a long-lived one"
+  fi
+  [ -n "$ref" ] || return 0
+  # A name filled in or matched is denied when it may be a branch's: what is written before the fill
+  # is a start of refs/heads/ or goes on from it (refs/remotes/… and refs/tmp/… are not). A deletion
+  # keeps its reading of before.
+  b="${refw%%[\$\`\*\?\[\{]*}"
+  b="${b//[\"\']/}"
+  if [ "$del" -eq 0 ] && { [[ "$refw" == *[\$\`\*\?\[]* ]] || [[ "$refw" =~ \{[^}]*(,|\.\.)[^}]*\} ]]; } &&
+    { [[ "refs/heads/" == "$b"* ]] || [[ "$b" == refs/heads/* ]] || [[ "$b" != refs/* ]]; }; then
+    deny "git update-ref: a ref the shell fills in, matches against files or expands from braces (${refw}), which may be a long-lived branch of this flow" \
+      "name the ref in full; moving a long-lived branch is the user's call"
+  fi
+  b="$ref"
+  if [ "$b" = HEAD ]; then
+    [ "$noderef" -eq 0 ] && [ "$del" -eq 0 ] || return 0
+    b="$(current_branch)"
+  fi
+  b="${b#refs/}"
+  b="${b#heads/}"
+  if is_long_lived_branch "$b"; then
+    deny "git update-ref ${ref}: it moves '${b}', a long-lived branch of this flow, wherever the ref pointed before" \
+      "work on a branch of your own; moving a long-lived branch is the user's call"
+  fi
   return 0
 }
 
@@ -1201,6 +2686,817 @@ deny_long_lived_delete() {
   return 0
 }
 
+# git_may_fill <branch as written>: may git get an `@{` in it (`@{-1}`, `x@{u}`), which makes it
+# another branch, though the word as written does not show one (#327, round 5)? Yes when the word
+# with every quote and backslash off (`feat@\{u}`, `"feat@"\{u}`) or as the shell decodes it
+# (`feat@$'\x7b'u}`) holds `@{`, or when the shell fills in or matches what comes right after an
+# `@` (`feat@$X`, `feat@${E:-\{}u}`, `feat@[{]u}`). A fill elsewhere in the name (`feature/$T`)
+# keeps the reading #311 gave it: the text before is what the name starts with.
+git_may_fill() {
+  local l="${1//\$[\"\']/}"
+  l="${l//[\"\'\\]/}"
+  [[ "$l" == *@\{* || "$l" == *@[\$\`\*\?\[\(]* ]] && return 0
+  [[ "$1" == *@* || "$1" == *\$\'* ]] || return 1
+  shell_text "$1"
+  [[ "$ST_TEXT" == *@\{* ]]
+}
+
+# deny_long_lived_overwrite <branch as written>: denies when a forced `git branch` (-f, -M, -C,
+# -c -f) would make <branch> point elsewhere and it is a long-lived branch that already exists
+# locally where the command runs (#327): that replaces what the branch points to, like deleting it
+# and making it again elsewhere. The name is read as deny_long_lived_delete reads it (quotes out,
+# braces expanded); one the shell fills in, decodes or matches against files (`$X`, `$(…)`, `ma\in`,
+# `dev*`, `[d]evelop`) may be every long-lived name that starts with the text before that, and one
+# git fills in itself (`@{-1}`, `@{upstream}`, `@{push}`) may be any long-lived name. A
+# long-lived name with no local branch yet (`git branch -M main` right after `git init`) passes:
+# nothing is replaced, as #306 decided.
+deny_long_lived_overwrite() {
+  local b="${1//[\"\']/}" w x pre
+  # A name git fills in itself (`@{-1}`, the branch checked out before; `@{u}`/`@{push}`, the
+  # upstream when it is a local branch; `x@{u}`): any long-lived name (round 4). Round 5: also when
+  # the `@{` is what git gets but not what was written (`feat@\{u}`, `feat@$'{u}'`, `"feat@"\{u}`):
+  # read on the word with every quote and backslash off, and as the shell decodes it.
+  if [[ "$b" == *@\{* ]] || git_may_fill "$1"; then
+    long_lived_names
+    for x in "${LONG_LIVED_NAMES[@]}"; do
+      [ -n "$x" ] || continue
+      local_branch_may_exist "$x" || continue
+      deny "git branch forcing a branch whose name git fills in (${b}: the branch checked out before, or an upstream), which may be '${x}', a long-lived branch of this flow that exists (or may: the guard cannot always tell) where the command runs" \
+        "name the branch in full; replacing a long-lived branch is the user's call"
+    done
+  fi
+  brace_words "$b"
+  if [ "$BRACE_OVER" -eq 1 ]; then
+    deny "git branch forcing a branch whose braces make more names than the guard reads, which may be a long-lived branch of this flow" \
+      "name the branch in full; replacing a long-lived branch is the user's call"
+  fi
+  for w in "${BRACE_OUT[@]}"; do
+    if [[ "$w" == *[\$\`\\\*\?\[\(]* || "$w" == *[\+\@\!] ]]; then
+      pre="${w%%[\$\`\\\{\*\?\[\(\+\@\!]*}"
+      long_lived_names
+      for x in "${LONG_LIVED_NAMES[@]}"; do
+        [ -n "$x" ] && [[ "$x" == "$pre"* ]] || continue
+        local_branch_may_exist "$x" || continue
+        deny "git branch forcing a branch whose name the shell fills in or matches against files (${w}), which may be '${x}', a long-lived branch of this flow that exists (or may: the guard cannot always tell) where the command runs" \
+          "name the branch in full; replacing a long-lived branch is the user's call"
+      done
+    elif is_long_lived_branch "$w" && local_branch_may_exist "$w"; then
+      deny "git branch forcing '${w}' (-f, -M, -C or -c -f) replaces a long-lived branch of this flow that exists (or may: the guard cannot always tell) where the command runs: it leaves the name pointing somewhere else, like deleting it and making it again" \
+        "to bring a stale local copy up to date, git fetch origin ${w}:${w} (it only moves forward), or work from origin/${w} in a worktree; to keep this work, give it a name of its own (git branch <type>/<name> <commit>); in a repository this command makes, in a directory that does not exist yet or a new temporary one, join the git init or git clone, each cd and the git branch with && alone (git init -q x && cd x && git branch -M main, or D=\$(mktemp -d) && cd \"\$D\" && git init -q && git branch -M main); replacing a long-lived branch is the user's call"
+    fi
+  done
+  return 0
+}
+
+# local_branch_may_exist <name>: may a local branch by that name exist, now, in the repository
+# where this git command runs (command_git_dir: the session's directory, the command's cd/pushd/popd
+# and git -C)? No only when git, asked in the one directory every reading of the path gives (see
+# dir_readings_differ), says it does not; the name asked is the one git acts on, as a name git fills
+# in (`@{-1}`) is read as any long-lived name before it gets here. Everything else reads as yes (#327,
+# independent review): the directory cannot be told (a cd into a variable, --git-dir/--work-tree,
+# GIT_DIR & co., env -C, sudo -D, or anything command_moves_git reads as moving git), git cannot
+# answer (unreadable, dubious ownership), or the directory is not inside a repository: the guard may
+# have followed the cd wrongly (CDPATH, a reassigned HOME, a cd function, `source`, find -execdir),
+# and outside a repository a forced `git branch` fails anyway, so reading it as "may exist" costs
+# nothing. The one exception keeps the #306 case allowed (`git init && git branch -M main`, `D=$(mktemp
+# -d) && cd "$D" && git init && … && git branch -M main`): a repository a `git init`/`git clone` of
+# this same command made, where nothing existed to replace (see fresh_repo_here).
+local_branch_may_exist() {
+  local name="$1" out rc=0
+  command_moves_git && return 0
+  dir_readings_differ && return 0
+  if command_git_dir; then
+    out="$(LC_ALL=C git_clean -C "$CMD_GIT_DIR" rev-parse --git-dir 2>&1)" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rc=0
+      LC_ALL=C git_clean -C "$CMD_GIT_DIR" show-ref --verify --quiet "refs/heads/${name}" 2>/dev/null || rc=$?
+      # 0: it exists; 1: it does not; anything else: git could not tell.
+      [ "$rc" -ne 1 ]
+      return
+    fi
+    case "$out" in *"not a git repository"*) ;; *) return 0 ;; esac
+  fi
+  fresh_repo_here && return 1
+  return 0
+}
+
+# dir_readings_differ: does a `..` in the way to where this git command runs (a cd/pushd target or a
+# git -C, counted as command_git_dir counts them) leave more than one place it may be? The shell's cd
+# reads `..` against the path as written (after `cd lnk`, `cd ..` is back where it was), `cd -P` and
+# `set -P` against the directory the link points to, and git -C always the second way; command_git_dir
+# reads each step from the physical directory of the one before (independent review of #327, round
+# 4: a symlink in the path made it ask a repository the command does not run in). With a `..`
+# anywhere, the guard asks for two more readings, every cd logical and every cd physical (git -C
+# physical in both), and when either cannot be told or any of the three differs, the place is not
+# known: yes, so a forced long-lived branch reads as "may exist" (also where the command makes the
+# repository: `cd .. && git init x && cd x && git branch -M main` is denied, by design). With no
+# `..`, every reading is the same directory.
+dir_readings_differ() {
+  local t="" a b c
+  for t in ${SEG_CDS[@]+"${SEG_CDS[@]}"} ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"}; do
+    case "$t" in *..*) break ;; esac
+    t=""
+  done
+  [ -n "$t" ] || return 1
+  command_git_dir || return 0
+  a="$CMD_GIT_DIR"
+  walk_git_dir logical || return 0
+  b="$WALKED_DIR"
+  walk_git_dir physical || return 0
+  c="$WALKED_DIR"
+  [ "$a" = "$b" ] && [ "$a" = "$c" ] && return 1
+  return 0
+}
+
+# walk_git_dir <logical|physical>: the directory this git command runs in, with every cd read the
+# way given and git -C physically, in WALKED_DIR (see dir_readings_differ); exit 1 when unknown.
+WALKED_DIR=""
+walk_git_dir() {
+  local mode="$1" l p t k kind po pp prevl="" prevp="" nl np
+  local -a stackl=() stackp=()
+  WALKED_DIR=""
+  load_session_cwd
+  case "$SESSION_CWD" in /*) ;; *) return 1 ;; esac
+  l="$(logical_path "$SESSION_CWD")"
+  p="$(cd -P -- "$l" 2>/dev/null && pwd -P)" || return 1
+  [ "$mode" = logical ] || l="$p"
+  for t in ${SEG_CDS[@]+"${SEG_CDS[@]}"}; do
+    po="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    pp="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    seg_counts "$po" "$pp" || continue
+    kind="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    if [ "$kind" = popd ]; then
+      [ "${#stackl[@]}" -gt 0 ] || return 1
+      nl="${stackl[${#stackl[@]} - 1]}"
+      np="${stackp[${#stackp[@]} - 1]}"
+      unset 'stackl[${#stackl[@]}-1]' 'stackp[${#stackp[@]}-1]'
+    elif [ "$t" = "-" ]; then
+      [ "$kind" = cd ] && [ -n "$prevl" ] || return 1
+      nl="$prevl"
+      np="$prevp"
+    else
+      walk_target "$t" || return 1
+      t="$WALKED_DIR"
+      case "$t" in /*) ;; *) t="$l/$t" ;; esac
+      if [ "$mode" = logical ]; then
+        nl="$(logical_path "$t")"
+        np="$(cd -P -- "$nl" 2>/dev/null && pwd -P)" || return 1
+      else
+        case "$WALKED_DIR" in /*) ;; *) t="$p/$WALKED_DIR" ;; esac
+        np="$(cd -P -- "$t" 2>/dev/null && pwd -P)" || return 1
+        nl="$np"
+      fi
+      if [ "$kind" = pushd ]; then
+        stackl+=("$l")
+        stackp+=("$p")
+      fi
+    fi
+    prevl="$l"
+    prevp="$p"
+    l="$nl"
+    p="$np"
+  done
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    case "${GIT_GLOBALS[k]}" in
+      -C)
+        walk_target "${GIT_GLOBALS[k + 1]}" || return 1
+        t="$WALKED_DIR"
+        case "$t" in /*) ;; *) t="$p/$t" ;; esac
+        p="$(cd -P -- "$t" 2>/dev/null && pwd -P)" || return 1
+        l="$p"
+        k=$((k + 1))
+        ;;
+      -c) k=$((k + 1)) ;;
+      --git-dir | --work-tree | --git-dir=* | --work-tree=* | --bare) return 1 ;;
+    esac
+  done
+  WALKED_DIR="$p"
+  return 0
+}
+
+# walk_target <path as recorded>: `~`, $HOME and ${HOME} expanded as resolve_dir does, in
+# WALKED_DIR; exit 1 on an expansion the guard cannot read.
+walk_target() {
+  local t="$1" h="${BASH_GUARD_HOME:-${HOME:-}}"
+  WALKED_DIR=""
+  # shellcheck disable=SC2088,SC2016 # the patterns are the LITERAL spellings, as a command writes them
+  case "$t" in
+    "~") t="$h" ;;
+    "~/"*) t="$h/${t#\~/}" ;;
+    '$HOME' | '${HOME}') t="$h" ;;
+    '$HOME/'*) t="$h/${t#\$HOME/}" ;;
+    '${HOME}/'*) t="$h/${t#\$\{HOME\}/}" ;;
+  esac
+  case "$t" in '' | *'$'* | *'`'*) return 1 ;; esac
+  WALKED_DIR="$t"
+  return 0
+}
+
+# logical_path <absolute path>: the path with `.`, `..` and repeated slashes taken out as text, the
+# way the shell's cd reads it.
+logical_path() {
+  local IFS=/ c out=""
+  local -a parts=() kept=()
+  set -f
+  # shellcheck disable=SC2206 # splitting on / is the point; globbing is off
+  parts=($1)
+  set +f
+  for c in ${parts[@]+"${parts[@]}"}; do
+    case "$c" in
+      '' | .) ;;
+      ..) [ "${#kept[@]}" -eq 0 ] || unset 'kept[${#kept[@]}-1]' ;;
+      *) kept+=("$c") ;;
+    esac
+  done
+  for c in ${kept[@]+"${kept[@]}"}; do out+="/$c"; done
+  printf '%s' "${out:-/}"
+}
+
+# Does the command point git at another repository, or move the directory, in a way the guard does
+# not follow? GIT_DIR & co. anywhere in it, also with the name quoted or escaped (GIT_"DIR"=, GIT_D\IR)
+# or assembled (`export "$n"=…`, GIT_$X); a wrapper that runs its command elsewhere (env -C, sudo -D,
+# nsenter/unshare -w, --chdir); and what makes a cd land somewhere else than it says or runs one the
+# guard does not see: CDPATH, HOME assigned, cdable_vars and autocd, a function, an alias or eval
+# outside quotes (`cd() { builtin cd /x; }`), `source`/`.`, find -execdir/-okdir. Deliberately
+# broad: a match reads the repository as unknown, which only denies a forced long-lived branch
+# (#327, independent review). Read once per command (MOVES_GIT).
+MOVES_GIT=""
+command_moves_git() {
+  if [ -z "$MOVES_GIT" ]; then
+    MOVES_GIT=0
+    command_moves_git_read && MOVES_GIT=1
+  fi
+  [ "$MOVES_GIT" -eq 1 ]
+}
+command_moves_git_read() {
+  local re_env='GIT_(DIR|WORK_TREE|COMMON_DIR|NAMESPACE|OBJECT_DIRECTORY|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM|[^A-Z0-9_]|$)'
+  local re_name='(^|[^A-Za-z0-9_-])(export|declare|typeset|readonly|local|env)([[:space:]][^;&|]*)?[[:space:]][^[:space:]=;&|]*[$`]'
+  local re_chdir='(^|[[:space:]])(--chdir|--wd|env([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*C|sudo([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*D|(nsenter|unshare)([[:space:]]+-[^[:space:]]*)*[[:space:]]+-[A-Za-z]*w)([=[:space:]]|$)'
+  local re_cd='CDPATH|cdable_vars|autocd|-execdir|-okdir|(^|[^A-Za-z0-9_])HOME\+?='
+  local re_code='(^|[^A-Za-z0-9_-])(alias|eval|function)([[:space:]]|$)|[A-Za-z0-9_:.-][[:space:]]*\([[:space:]]*\)'
+  local re_src='^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*((builtin|command)[[:space:]]+)?(source|\.)([[:space:]]|$)' bare line
+  raw_command
+  bare="${RAW_COMMAND//[\"\'\\]/}"
+  [[ "$bare" =~ $re_env ]] && return 0
+  [[ "$bare" =~ $re_name ]] && return 0
+  [[ "$RAW_COMMAND" =~ $re_chdir ]] && return 0
+  [[ "$bare" =~ $re_cd ]] && return 0
+  code_text
+  [[ "$CODE_TEXT" =~ $re_code ]] && return 0
+  segment_lines
+  for line in ${SEGMENT_LINES[@]+"${SEGMENT_LINES[@]}"}; do
+    line="${line#[$'\v\t']}"
+    line="${line#[$'\v\t']}"
+    [[ "$line" =~ $re_src ]] && return 0
+  done
+  return 1
+}
+
+# code_text: the command as written with what stands inside quotes (`echo "void main() {}"` holds
+# no function) and the bodies of heredocs (a script or a file written with cat) taken out, in
+# CODE_TEXT. Read by node, in one pass: a loop in the shell took time quadratic in the length of the
+# command (a heredoc of 150 KB took 10 s, independent review of #327, round 2).
+CODE_TEXT=""
+CODE_TEXT_READ=0
+code_text() {
+  [ "$CODE_TEXT_READ" -eq 0 ] || return 0
+  CODE_TEXT_READ=1
+  raw_command
+  CODE_TEXT="$(printf '%s' "$RAW_COMMAND" | node -e '
+const s = require("fs").readFileSync(0, "utf8");
+let out = "", q = "", delims = [];
+for (let k = 0; k < s.length; k++) {
+  const c = s[k];
+  if (q) {
+    if (q === "\"" && c === "\\") k++;
+    else if (c === q) { q = ""; out += "_"; }
+    continue;
+  }
+  if (c === "\"" || c === "'\''") q = c;
+  else if (c === "\\") { out += s.substr(k, 2); k++; }
+  else if (c === "<") {
+    out += c;
+    // A heredoc: its delimiter, read now; its body skipped at the end of the line.
+    if (s[k + 1] === "<" && s[k + 2] !== "<") {
+      const rest = s.slice(k + 2, k + 2 + 512).replace(/^-/, "").replace(/^[ \t]+/, "");
+      const m = /^["'\'']?([A-Za-z_][A-Za-z0-9_.-]*)["'\'']?/.exec(rest);
+      if (m) delims.push(m[1]);
+    }
+  } else if (c === "\n") {
+    out += c;
+    for (const dl of delims) {
+      while (k < s.length) {
+        let e = s.indexOf("\n", k + 1);
+        if (e < 0) e = s.length;
+        const line = s.slice(k + 1, e).replace(/^[ \t]+/, "");
+        k = e;
+        if (line === dl) break;
+      }
+    }
+    delims = [];
+  } else out += c;
+}
+process.stdout.write(out);
+' 2>/dev/null || printf '%s' "$RAW_COMMAND")"
+  return 0
+}
+
+# --- A repository this command makes (#327) -----------------------------------------------------
+# A forced `git branch` over a long-lived name passes where the command itself made the repository
+# it runs in, from nothing, and only when every step that leads there must have worked for the
+# branch to run (independent review, rounds 1 and 2: a step written but not run, or one that failed,
+# left the branch running in the session's repository). All of these, or no exemption:
+#   - a `git init`/`git clone` at that same place (location_key: each cd/pushd and git -C as
+#     written, quotes out), at the top level, joined to the branch by `&&` alone (and_joined): a
+#     clone or init that fails, exits early (-h) or sits in an if, a function or a subshell stops
+#     the chain or does not count;
+#   - every cd that leads there in that same `&&` chain (a cd that fails leaves the command where it
+#     was);
+#   - the place has no repository now (fresh_place): it does not exist yet, or it exists outside
+#     every repository, or it is a new temporary directory (`D=$(mktemp -d …) && …`, with the
+#     assignment at the top level and in the chain: an empty `$D` is a `cd ""` that stays);
+#   - nothing before the branch could have put an existing repository there (MAKER_TAINT, see
+#     note_maker): every earlier segment is one of a short list of commands that cannot (no mv, cp,
+#     ln, rsync, tar, git worktree, interpreters…), and the branch has no substitution of its own,
+#     which runs before it but is read after it;
+#   - nothing in the command can give a variable a value its text does not show (may_reassign:
+#     printf -v, arithmetic, ANSI-C quoting), and no GIT_DIR & co. in the environment.
+# One shape needs no `&&`: with no directory change anywhere in the command, an init in the
+# session's own directory, outside every repository, before the branch (no_dir_change).
+# Not followed, so not exempted: anything command_moves_git reads, xargs and parallel, a quoted
+# span, a comment. Left out on purpose (documented residual): writing git's own files by hand
+# (`echo 'gitdir: …' > x/.git`, `cat > x/.git/HEAD`) with a command on the list.
+FRESH_REPOS=()
+MAKER_TAINT=()
+LOC_KEY=""
+LOC_ELEMS=()
+LOC_POS=()
+
+# location_key: where this segment stands, as written: the directory changes that hold here (see
+# seg_counts) and git's -C, in LOC_ELEMS (quotes out), LOC_KEY (joined), and for each cd its
+# position (LOC_POS). Fails on what does not name a place the same way twice: popd, `cd -`, pushd's
+# rotations, a target the guard did not read, --git-dir/--work-tree/--bare.
+location_key() {
+  local t po pp kind k pre
+  LOC_KEY="" LOC_ELEMS=() LOC_POS=()
+  [ "$SEG_POS_O" != "!" ] || return 1
+  for t in ${SEG_CDS[@]+"${SEG_CDS[@]}"}; do
+    po="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    pp="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    seg_counts "$po" "$pp" || continue
+    kind="${t%%$'\t'*}"
+    t="${t#*$'\t'}"
+    [ "$kind" != popd ] || return 1
+    case "$t" in '' | -* | +*) return 1 ;; esac
+    pre="$LOC_KEY"
+    loc_add "$t"
+    [ "$LOC_KEY" != "$pre" ] || continue
+    LOC_POS+=("$po"$'\t'"$pp")
+  done
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    case "${GIT_GLOBALS[k]}" in
+      -C)
+        loc_add "${GIT_GLOBALS[k + 1]}"
+        k=$((k + 1))
+        ;;
+      -c) k=$((k + 1)) ;;
+      --git-dir | --work-tree | --git-dir=* | --work-tree=* | --bare) return 1 ;;
+    esac
+  done
+  return 0
+}
+loc_add() {
+  unquoted "$1"
+  local w="$UNQUOTED"
+  while [ "${#w}" -gt 1 ] && [[ "$w" == */ ]]; do w="${w%/}"; done
+  case "$w" in '' | . | ./) return 0 ;; esac
+  LOC_ELEMS+=("$w")
+  LOC_KEY+="$w"$'\x1f'
+  return 0
+}
+
+# loc_literal_tail <word>: a path the shell reads as written, relative, with no `..`: what comes
+# after a fresh directory and stays inside it.
+loc_literal_tail() {
+  case "$1" in /* | '~'* | -* | +* | *[\$\`\*\?\[\]\{\}\\\(\)]* | .. | ../* | */.. | */../*) return 1 ;; esac
+  return 0
+}
+
+# var_stable <name>: is the variable assigned once in the command, before every use, and named
+# nowhere else (read, for, export, a function's local…)? The offset of that assignment in VAR_AT.
+# This reads text only: a builtin that takes the name as data (`printf -v $'\x44'`, arithmetic in
+# `[[ … -eq … ]]`, a subscript) assigns it without writing it, so each `$name` is the same value only
+# together with may_reassign, which fresh_repo_here asks first (independent review of #327, round 3).
+VAR_AT=0
+var_stable() {
+  local v="$1" s rest m pre n=0 first=0 off=0 pat u
+  local re="(^|[^A-Za-z0-9_\${])(${v})([^A-Za-z0-9_]|\$)"
+  raw_command
+  s="$RAW_COMMAND"
+  rest="$s"
+  while [[ "$rest" =~ $re ]]; do
+    m="${BASH_REMATCH[0]}"
+    n=$((n + 1))
+    [ "$n" -eq 1 ] && [ "${BASH_REMATCH[3]}" = "=" ] || return 1
+    pre="${rest%%"$m"*}"
+    first=$((off + ${#pre} + ${#BASH_REMATCH[1]}))
+    off=$((off + ${#pre} + ${#m}))
+    rest="${rest:${#pre}+${#m}}"
+  done
+  [ "$n" -eq 1 ] || return 1
+  # shellcheck disable=SC2016 # the literal `$` and `${` in front of the name, as the command writes them
+  for pat in '$'"$v" '${'"$v"; do
+    u="${s%%"$pat"*}"
+    [ "${#u}" -gt "$first" ] || return 1
+  done
+  VAR_AT=$first
+  return 0
+}
+
+# mktemp_dir_var <name>: is the variable's one assignment a new temporary directory, made where the
+# git command runs and before it, without fail: `D=$(mktemp -d …) && …`, a whole command at the
+# top level (after the start, `;`, a newline or `&&`; not in a subshell, a pipeline, after `||` or
+# as a prefix), joined to the git command by `&&` alone (and_joined)? A mktemp that fails, or an
+# assignment that does not reach this shell, leaves `$D` empty, and `cd ""` stays where it was
+# (independent review of #327, round 2).
+mktemp_dir_var() {
+  local v="$1" s pre m re
+  re="^${v}=\"?(\\\$\\(|\`)[[:blank:]]*mktemp(([[:blank:]]+[^[:space:]()\$\`\"'\\\;&|<>]+)*)[[:blank:]]*(\\)|\`)\"?[[:blank:]]*&&"
+  var_stable "$v" || return 1
+  raw_command
+  s="${RAW_COMMAND:VAR_AT}"
+  [[ "$s" =~ $re ]] || return 1
+  m="${BASH_REMATCH[0]}"
+  [[ "${BASH_REMATCH[2]} " =~ [[:blank:]](-[A-Za-z]*d[A-Za-z]*|--directory)[[:blank:]] ]] || return 1
+  pre="${RAW_COMMAND:0:VAR_AT}"
+  while [[ "$pre" == *[[:blank:]] ]]; do pre="${pre%[[:blank:]]}"; done
+  case "$pre" in '' | *';' | *$'\n' | *'&&') ;; *) return 1 ;; esac
+  case "$pre" in *';;') return 1 ;; esac
+  and_joined $((VAR_AT + ${#m} - 2))
+}
+
+# fresh_place: is the place in LOC_ELEMS a directory with no repository now that only this command
+# could make one in? Read from the session's directory, element by element: a new temporary
+# directory (`$D`, see mktemp_dir_var) or a path written plainly that does not exist yet starts
+# something fresh, and what follows it must stay inside it; a place that exists all the way must not
+# be inside a repository. A directory the command empties first (rm -r) is not fresh: the rm may
+# not run (`[ -d x/.git ] || rm -rf x`, independent review of #327, round 2).
+fresh_place() {
+  local d el fresh=0 e v out rc=0
+  load_session_cwd
+  resolve_dir "$SESSION_CWD" "" || return 1
+  d="$RESOLVED_DIR"
+  for el in ${LOC_ELEMS[@]+"${LOC_ELEMS[@]}"}; do
+    if [ "$fresh" -eq 1 ]; then
+      loc_literal_tail "$el" || return 1
+      continue
+    fi
+    if [[ "$el" =~ ^\$([A-Za-z_][A-Za-z0-9_]*)(/.*)?$ || "$el" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*)\}(/.*)?$ ]]; then
+      v="${BASH_REMATCH[1]}"
+      e="${BASH_REMATCH[2]#/}"
+      if mktemp_dir_var "$v" && { [ -z "$e" ] || loc_literal_tail "$e"; }; then
+        fresh=1
+        continue
+      fi
+      return 1
+    fi
+    # `~` and `~/…`: the home, or a directory named `~` here if the shell did not expand it (it was
+    # quoted, and the quotes are out of LOC_ELEMS): both readings, so no `~` may stand here (round 3).
+    # shellcheck disable=SC2088 # the literal `~` as the command writes it
+    case "$el" in
+      '~' | '~/'*) [ ! -e "$d/~" ] && [ ! -L "$d/~" ] || return 1 ;;
+      '~'*) return 1 ;;
+    esac
+    if resolve_dir "$el" "$d"; then
+      d="$RESOLVED_DIR"
+      continue
+    fi
+    # Not there: a path written plainly from a directory that is known, which does not exist yet.
+    # shellcheck disable=SC2088 # the literal `~/` as the command writes it
+    case "$el" in
+      '~/'*)
+        [ -n "${BASH_GUARD_HOME:-${HOME:-}}" ] || return 1
+        el="${BASH_GUARD_HOME:-${HOME:-}}/${el#\~/}"
+        ;;
+    esac
+    case "$el" in /?*) ;; *) [[ "$el" != '~'* ]] || return 1 ;; esac
+    loc_literal_tail "${el#/}" || return 1
+    case "$el" in /*) e="$el" ;; *) e="$d/$el" ;; esac
+    [ ! -e "$e" ] && [ ! -L "$e" ] || return 1
+    fresh=1
+  done
+  [ "$fresh" -eq 1 ] && return 0
+  out="$(LC_ALL=C git_clean -C "$d" rev-parse --git-dir 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] && [[ "$out" == *"not a git repository"* ]]
+}
+
+# record_fresh_repo <init|clone> <index of the first word after it>: a `git init`/`git clone` at the
+# top level adds "<its offset>\t<where it lands>" to FRESH_REPOS; whether it made something from
+# nothing is read when a forced branch asks (fresh_repo_here). One with --separate-git-dir, or any
+# prefix git takes for it (`--se`, `--sep=`…; the repository's own directory somewhere else, which
+# may be an existing one), or that git runs
+# somewhere the guard does not follow counts against the exemption instead (MAKER_TAINT).
+record_fresh_repo() {
+  local sub="$1" i="$2" a n=0 first="" second="" dest opts=1
+  [ "$QUOTED" -eq 0 ] && [ "$PARTIAL" -eq 0 ] && [ "$SEG_XARGS" -eq 0 ] && [ "$PFX_PARALLEL" -eq 0 ] || return 0
+  while [ "$i" -lt "${#tok[@]}" ]; do
+    a="${tok[i]}"
+    i=$((i + 1))
+    if [ "$opts" -eq 1 ]; then
+      # Round 5: the option as git gets it (`--s\e=`, `--s"e"=`, `-\-se=`), and one the shell fills in
+      # where an option may stand (`--$X`, `-$X`), count against the exemption too.
+      if [[ "$a" == *[\"\'\\\$\`]* ]]; then
+        shell_text "$a"
+        case "$ST_TEXT" in
+          --s | --s=* | --se*)
+            MAKER_TAINT+=("git $sub $a")
+            return 0
+            ;;
+          -*)
+            if [ "$ST_FILL" -eq 1 ]; then
+              MAKER_TAINT+=("git $sub $a")
+              return 0
+            fi
+            ;;
+        esac
+      fi
+      case "$a" in
+        --) opts=0; continue ;;
+        # git takes any unambiguous prefix of a long option: `--se=X` is --separate-git-dir for
+        # git init (round 4). Every word that could start it counts, and for clone --server-option
+        # with it (stricter, not judged apart).
+        --s | --s=* | --se*)
+          MAKER_TAINT+=("git $sub $a")
+          return 0
+          ;;
+        -h | --help) return 0 ;;
+        --template | -b | --initial-branch | --object-format | --ref-format | -o | --origin | -u | --upload-pack | \
+          --reference | --reference-if-able | --depth | --shallow-since | --shallow-exclude | -c | --config | -j | \
+          --jobs | --filter | --bundle-uri | --branch | --revision) i=$((i + 1)); continue ;;
+        -*) continue ;;
+      esac
+    fi
+    n=$((n + 1))
+    [ "$n" -eq 1 ] && first="$a"
+    [ "$n" -eq 2 ] && second="$a"
+  done
+  # Only at the top level of the command: not in a subshell, a script span, a heredoc fed to a
+  # shell, a quoted span or a comment.
+  [ "$SEG_POS_P" = "/" ] && [[ "$SEG_POS_O" =~ ^[0-9]+$ ]] || return 0
+  if [ "$sub" = init ]; then
+    dest="$first"
+  else
+    [ -n "$first" ] || return 0
+    dest="$second"
+    if [ -z "$dest" ]; then
+      dest="${first%/}"
+      dest="${dest%.git}"
+      dest="${dest##*[/:]}"
+      [ -n "$dest" ] || return 0
+    fi
+  fi
+  location_key || return 0
+  [ -z "$dest" ] || loc_add "$dest"
+  FRESH_REPOS+=("$SEG_POS_O"$'\t'"$LOC_KEY")
+  return 0
+}
+
+# note_maker <command word>: a segment that might put an existing repository where a fresh one is
+# expected (moving, copying or linking one there, a worktree, a script) adds itself to MAKER_TAINT,
+# and no forced branch after it is exempted (fresh_repo_here). The list is of what cannot: judged
+# by the command word, so it errs toward the taint. It is also of what cannot assign a variable
+# whose name it is not shown, except printf (`printf -v`), which may_reassign reads; `[[` (arithmetic)
+# and export (`export $'\x44=…'`) are off it (round 3). A quoted span that may be data is not read: the
+# command that holds it is (`bash -c '…'` is bash, `xargs mv` is mv).
+note_maker() {
+  [ "$QUOTED" -eq 0 ] || return 0
+  case "$1" in
+    # (the words that print come last: lint-pipefail-pipes reads `printf … | head` as a pipeline)
+    head | tail | wc | grep | cd | pushd | popd | mkdir | mktemp | rm | rmdir | cat | touch | true | false | : | \
+      test | '[' | pwd | ls | sleep | set | shopt | chmod | echo | printf) return 0 ;;
+    git)
+      if [ "${#GIT_GLOBALS[@]}" -eq 0 ] || [[ " ${GIT_GLOBALS[*]} " != *" --git-dir"* && " ${GIT_GLOBALS[*]} " != *" --work-tree"* && " ${GIT_GLOBALS[*]} " != *" --bare "* ]]; then
+        case "$GIT_SUB" in
+          init | clone | config | add | commit | status | log | branch | checkout | switch | remote | rev-parse | show | \
+            diff | fetch | symbolic-ref | tag | reset | restore) return 0 ;;
+        esac
+      fi
+      ;;
+  esac
+  MAKER_TAINT+=("$1")
+  return 0
+}
+
+# fresh_repo_here: does this git command run in a repository a git init/clone of this command made
+# from nothing, by steps that all had to work for it to run (see the head of this section)?
+fresh_repo_here() {
+  local k found=0 p po pp w
+  [ "$SEG_XARGS" -eq 0 ] && [ "$PFX_PARALLEL" -eq 0 ] && [ "$QUOTED" -eq 0 ] && [ "$PARTIAL" -eq 0 ] || return 1
+  [ "${#MAKER_TAINT[@]}" -eq 0 ] || return 1
+  # git pointed elsewhere by the environment the command inherits.
+  [ -z "${GIT_DIR:-}${GIT_WORK_TREE:-}${GIT_COMMON_DIR:-}" ] || return 1
+  may_reassign && return 1
+  [ "$SEG_POS_P" = "/" ] && [[ "$SEG_POS_O" =~ ^[0-9]+$ ]] || return 1
+  # A substitution of its own runs before it, and the guard reads it after.
+  for w in ${raw[@]+"${raw[@]}"}; do
+    # shellcheck disable=SC2016 # the literal `$(` as the command writes it
+    case "$w" in *'$('* | *'`'* | *'<('* | *'>('* | *__GUARD_SUBST__*) return 1 ;; esac
+  done
+  # Nothing that runs alongside it: a job sent to the background anywhere in the command (`… &`,
+  # also a group `{ …; } &`), or a pipeline the branch stands in (`git branch … | x`).
+  code_text
+  [[ ! "$CODE_TEXT" =~ (^|[^\&\<\>])\&([^\&\>]|$) ]] || return 1
+  after_pipe && return 1
+  location_key || return 1
+  for k in ${FRESH_REPOS[@]+"${FRESH_REPOS[@]}"}; do
+    [ "${k#*$'\t'}" = "$LOC_KEY" ] || continue
+    and_joined "${k%%$'\t'*}" && found=1 && break
+    # Where the branch runs in the session's own directory, with no directory change anywhere in
+    # the command (no cd, pushd or popd, in any scope; no git -C), an init there need not be joined
+    # by `&&`: if it fails, the branch fails too, in a directory fresh_place finds outside every
+    # repository (GitHub's `git init` … `git branch -M main` on separate lines, round 3).
+    if [ -z "$LOC_KEY" ] && no_dir_change && pos_le "${k%%$'\t'*}" "$SEG_POS_O"; then
+      found=1
+      break
+    fi
+  done
+  [ "$found" -eq 1 ] || return 1
+  for ((k = 0; k < ${#LOC_POS[@]}; k++)); do
+    p="${LOC_POS[k]}"
+    po="${p%%$'\t'*}"
+    pp="${p#*$'\t'}"
+    and_chain "$po" "$pp" || return 1
+  done
+  fresh_place
+}
+
+# no_dir_change: does the command change directory nowhere, in any scope (no cd, pushd or popd
+# recorded, none written outside quotes, no git -C here)?
+no_dir_change() {
+  [ "$CDS_SEEN" -eq 0 ] && [ "${#LOC_ELEMS[@]}" -eq 0 ] || return 1
+  code_text
+  [[ ! "$CODE_TEXT" =~ (^|[^A-Za-z0-9_.-])(cd|pushd|popd)([^A-Za-z0-9_.-]|$) ]]
+}
+
+# may_reassign: could the command give a variable a value its text does not show? var_stable reads a
+# name's assignments by their text, and command_moves_git reads CDPATH, HOME and GIT_DIR the same
+# way; a builtin that takes the name as data assigns it without the name being written (independent
+# review of #327, round 3: `printf -v $'\x44' %s .` sets D, `[[ $'\x44=0' -eq 0 ]]` too). Read on
+# the command as written, quotes included, so it errs toward yes: printf whose first word may be -v
+# (one that starts with `-` once quotes are out, or one the shell fills in or expands), arithmetic
+# (`((`, `$[`, `[[`, an array subscript assigned, a `${…}` other than a plain `${name}`), and ANSI-C
+# quoting (`$'…'`), which spells any name. export, declare, read, let and the rest are not on
+# note_maker's list, so any of them already ends the exemption.
+may_reassign() {
+  local LC_ALL=C s re
+  raw_command
+  s="$RAW_COMMAND"
+  case "$s" in *'(('* | *'$['* | *'[['* | *"\$'"*) return 0 ;; esac
+  re='[A-Za-z_][A-Za-z0-9_]*\[[^]]*\]\+?='
+  [[ ! "$s" =~ $re ]] || return 0
+  # shellcheck disable=SC2016 # the literal `${` as the command writes it
+  re='\$\{[A-Za-z_][A-Za-z0-9_]*\}'
+  while [[ "$s" =~ $re ]]; do s="${s/"${BASH_REMATCH[0]}"/}"; done
+  # shellcheck disable=SC2016 # the literal `${`
+  case "$s" in *'${'*) return 0 ;; esac
+  s="$RAW_COMMAND"
+  re='(^|[^A-Za-z0-9_.-])printf[[:blank:]]+([^[:space:]]*)'
+  while [[ "$s" =~ $re ]]; do
+    s="${s#*"${BASH_REMATCH[0]}"}"
+    case "${BASH_REMATCH[2]}" in *'$'* | *'`'* | *'{'* | *'*'* | *'?'* | *'['*) return 0 ;; esac
+    case "${BASH_REMATCH[2]//[\"\'\\]/}" in -* | '') return 0 ;; esac
+  done
+  return 1
+}
+
+# after_pipe: is the segment followed by a pipe (`|`, `|&`) before the end of its command (`&&`,
+# `||`, `;`, a newline or the end)? Read on the command as written, from where the segment starts,
+# outside quotes; anything else the guard does not read there counts as a pipe.
+after_pipe() {
+  local LC_ALL=C s m c re_s="^[^']*" re_d='^[^"\\`]*' re_u=$'^[^"\'\\\\&;|(){}`\n]*'
+  raw_command
+  s="${RAW_COMMAND:SEG_POS_O}"
+  while [ -n "$s" ]; do
+    [[ "$s" =~ $re_u ]]
+    m="${BASH_REMATCH[0]}"
+    s="${s:${#m}}"
+    [ -n "$s" ] || return 1
+    c="${s:0:1}"
+    s="${s:1}"
+    case "$c" in
+      \')
+        [[ "$s" =~ $re_s ]]
+        s="${s:${#BASH_REMATCH[0]}}"
+        [ -n "$s" ] || return 0
+        s="${s:1}"
+        ;;
+      \")
+        while :; do
+          [[ "$s" =~ $re_d ]]
+          s="${s:${#BASH_REMATCH[0]}}"
+          [ -n "$s" ] || return 0
+          c="${s:0:1}"
+          s="${s:1}"
+          case "$c" in
+            \") break ;;
+            \\) s="${s:1}" ;;
+            *) return 0 ;;
+          esac
+        done
+        ;;
+      \\) s="${s:1}" ;;
+      '&')
+        # `>&2`, `&>f`, `<&0` are redirections; `&&` ends it.
+        [ "${s:0:1}" = '&' ] && return 1
+        [ "${s:0:1}" = '>' ] || [ "${m: -1}" = '>' ] || [ "${m: -1}" = '<' ] || return 0
+        ;;
+      '|') [ "${s:0:1}" = '|' ] && return 1 || return 0 ;;
+      ';' | $'\n') return 1 ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# and_chain <offset> <scopes>: is the segment at that offset a cd that reaches this segment through
+# `&&` alone, both at the top level (and_joined)?
+and_chain() {
+  local po="$1" pp="$2" s
+  [ "$pp" = "/" ] || return 1
+  [[ "$po" =~ ^[0-9]+$ ]] || return 1
+  raw_command
+  s="${RAW_COMMAND:po:16}"
+  while [[ "$s" == [[:space:]]* ]]; do s="${s:1}"; done
+  case "$s" in cd[[:space:]]* | pushd[[:space:]]* | 'builtin cd'[[:space:]]* | 'command cd'[[:space:]]*) ;; *) return 1 ;; esac
+  and_joined "$po"
+}
+
+# and_joined <offset>: does what starts at that offset reach this segment through `&&` alone, this
+# segment at the top level of the command (no subshell, no script span, no heredoc)? Read on the
+# command as written, outside quotes: anything else between them (`;`, a newline, `||`, `|`, `&`, a
+# group, a subshell, a substitution, a comment) fails, so whatever stands there ran, and worked,
+# before this segment runs.
+and_joined() {
+  local LC_ALL=C po="$1" s c q="" pc="" m
+  local re_s="^[^']*" re_d='^[^"\\`$]*' re_u=$'^[^"\'\\\\&;|(){}`#\n]*'
+  [ "$SEG_POS_P" = "/" ] || return 1
+  [[ "$po" =~ ^[0-9]+$ ]] && [[ "$SEG_POS_O" =~ ^[0-9]+$ ]] && [ "$po" -lt "$SEG_POS_O" ] || return 1
+  raw_command
+  # The offsets are the extractor's: in the text without the heredoc bodies it took out, counted in
+  # UTF-16 units. They are this text's only when nothing before the segment is a heredoc or outside
+  # ASCII; otherwise not read (no exemption).
+  s="${RAW_COMMAND:0:SEG_POS_O}"
+  s="${s//<<</}"
+  [[ "$s" != *'<<'* && "$s" != *[![:ascii:]]* ]] || return 1
+  s="${RAW_COMMAND:po:SEG_POS_O-po}"
+  # From one character that matters to the next (a loop over every character took seconds on a
+  # long quoted text).
+  while [ -n "$s" ]; do
+    case "$q" in
+      "'") [[ "$s" =~ $re_s ]] ;;
+      '"') [[ "$s" =~ $re_d ]] ;;
+      *) [[ "$s" =~ $re_u ]] ;;
+    esac
+    m="${BASH_REMATCH[0]}"
+    [ -z "$m" ] || pc="${m: -1}"
+    s="${s:${#m}}"
+    [ -n "$s" ] || break
+    c="${s:0:1}"
+    s="${s:1}"
+    if [ -n "$q" ]; then
+      case "$c" in
+        "$q") q="" ;;
+        \\) s="${s:1}" ;;
+        '`') return 1 ;;
+        '$') [ "${s:0:1}" != '(' ] || return 1 ;;
+      esac
+      pc="$c"
+      continue
+    fi
+    case "$c" in
+      \" | \') q="$c" ;;
+      \\) s="${s:1}" ;;
+      '&')
+        if [ "${s:0:1}" = '&' ]; then
+          s="${s:1}"
+          # A newline right after && only continues the line.
+          while [[ "$s" == [[:space:]]* ]]; do s="${s:1}"; done
+        elif [ "${s:0:1}" != '>' ] && [ "$pc" != '>' ] && [ "$pc" != '<' ]; then
+          return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+    pc="$c"
+  done
+  [ -z "$q" ]
+}
+
 # --- One worktree per task (policy: one_worktree_per_task) --------------------
 # With `one_worktree_per_task: true`, switching branches in a SHARED checkout is denied: every
 # session working in that checkout sees its files change under it. A task gets its own worktree
@@ -1215,6 +3511,8 @@ deny_long_lived_delete() {
 # stands (see seg_counts), and by git's own `-C`. A directory the guard cannot resolve (a `cd` into a
 # variable or a substitution, `--git-dir`/`--work-tree`) is not judged.
 SEG_CDS=()
+# Set once any cd, pushd or popd is read, in any scope (no_dir_change).
+CDS_SEEN=0
 # The nesting past which the extractor does not read scopes (SCOPE_DEPTH_MAX in EXTRACT_JS).
 SCOPE_DEPTH_MAX=400
 # Where the segment being judged stands, from the extractor's position lines ("\x01<o> <p>", see
@@ -1663,13 +3961,6 @@ published_policy_tsv() {
   printf '%s' "$tsv"
 }
 
-# Half of the merges this guard could not resolve in the 30 days to 2026-09-30 (20 of 38) were
-# not merges at all: `gh pr merge <n>` as TEXT inside another command — a sed pattern editing a
-# doc, a grep, a python string. The guard reads every quoted span as a possible command too,
-# because `bash -c "…"` does run it, and it cannot tell a pattern from a script without letting
-# some script through. So those stay denied, and the message says how to do the edit instead.
-MERGE_MENTION_HINT="If this is text that is not meant to run (a sed or grep pattern, a doc being edited), the guard reads quoted text as a possible command too: make the edit with the Edit tool instead"
-
 # A `gh pr merge` attempt. Three independent negatives, in this order:
 #   1. the policy does not grant agent_may_merge;
 #   2. the base is the protected branch (human-only, per contract) — this one
@@ -1741,7 +4032,7 @@ check_pr_merge() {
       ;;
     *)
       deny "gh pr merge$([ -n "$repo" ] && printf " --repo %s" "$repo"): cannot tell which repository this PR belongs to, so the policy that governs it is unknown" \
-        "name it explicitly, without moving the shell first: gh pr merge <n> --repo <owner>/<name>. ${MERGE_MENTION_HINT}"
+        "name it explicitly, without moving the shell first: gh pr merge <n> --repo <owner>/<name>."
       ;;
   esac
 
@@ -1757,7 +4048,7 @@ check_pr_merge() {
     # on the integration branch used to be denied with "base is main", which
     # sends the reader to look at the wrong thing.
     deny "gh pr merge could not resolve PR '${pr}'$([ -n "$repo" ] && printf " in %s" "$repo"), so the base branch is unknown" \
-      "pass the PR's repository explicitly (gh pr merge <n> --repo <owner>/<name>) and check the number exists. ${MERGE_MENTION_HINT}"
+      "pass the PR's repository explicitly (gh pr merge <n> --repo <owner>/<name>) and check the number exists."
   fi
   if [ "$base" = "$PROTECTED_BRANCH" ]; then
     deny_human_merge "gh pr merge would merge a PR whose base is ${PROTECTED_BRANCH} (protected)"
@@ -3497,19 +5788,485 @@ shell_words() {
   return 0
 }
 
+# ci_glob_words <word as written>: a word in a name position of env, a wrapper or the builtins whose
+# name part is not a name, for a glob outside quotes (`?`, `*`, `[…]`), is no assignment as written:
+# the shell expands it into the files it matches, and a file may be named `GITHUB_ACTIONS=1` (`env
+# GITHUB_ACTION?=1 node x`, `export GITHUB_ACT*`). Read narrowly, so as to deny no ordinary word:
+# the name part (before the first `=`, or the whole word) as written holds only a name's characters
+# and glob syntax, with a glob outside quotes and at least one letter, digit or `_` outside the glob
+# syntax (`*`, `[A-Z_]*` or a quoted `'*30` are not read; `**Bold**` is, and matches neither). Then, with a `=`, its name
+# part read as a pattern matches one of the two names; without one, the word matches the name
+# (export, declare -x, read), or a prefix of it holding such a literal matches `NAME=` (`env
+# GITHUB_A* node`). That name or `NAME=` is added to SHELL_WORDS, and the caller judges it as written.
+# A pattern with nothing literal of the name (`export *`, `[A-Z_]*`) is not read: out of scope.
+CI_GLOB_PART_RE='^[][A-Za-z0-9_?*!^-]+$'
+ci_glob_literal() {
+  local p="$1"
+  p="$(printf '%s\n' "$p" | sed -E 's/\[!?\]?[^]]*\]//g; s/[?*]//g')"
+  [[ "$p" == *[A-Za-z0-9_]* ]]
+}
+ci_glob_words() {
+  local LC_ALL=C bare="$1" w np name i
+  [[ "$bare" == *[?*[]* ]] || return 0
+  bare="$(printf '%s\n' "$bare" | sed -E "s/\\\\.|'[^']*'|\"([^\"\\\\]|\\\\.)*\"//g")"
+  bare="${bare%%=*}"
+  [[ "$bare" == *[?*[]* && "$bare" =~ $CI_GLOB_PART_RE ]] || return 0
+  for w in "${SHELL_WORDS[@]}"; do
+    np="${w%%=*}"
+    [[ "$np" == *[?*[]* && "$np" =~ $CI_GLOB_PART_RE ]] || continue
+    ci_glob_literal "$np" || continue
+    for name in GITHUB_ACTIONS MWG_WRITE_TOKEN_KIND; do
+      if [[ "$w" == *=* ]]; then
+        # shellcheck disable=SC2053 # the name part is read as a pattern on purpose
+        [[ "$name" == $np ]] && SHELL_WORDS+=("$name=")
+        continue
+      fi
+      # shellcheck disable=SC2053
+      [[ "$name" == $w ]] && SHELL_WORDS+=("$name")
+      for ((i = 1; i <= ${#w}; i++)); do
+        # shellcheck disable=SC2053
+        if [[ "$name=" == ${w:0:i} ]] && ci_glob_literal "${w:0:i}"; then SHELL_WORDS+=("$name="); break; fi
+      done
+    done
+  done
+  return 0
+}
+
 deny_ci_identity() {
   deny "the command sets ${1} in the session: it is what tells the merge step of merge-when-green (pr-merge.sh merge) that it runs as that GitHub Actions job, holding the merge App's token, and a session never stands in for that job" \
     "leave ${1} to the GitHub Actions runner; a test sets it inside its own script (the merge-when-green suites do), and env -u ${1} clears it for one command"
+}
+
+# ci_name_unreadable <word> <name|assign>: deny a name the guard cannot read (#319). unquoted() takes
+# the quotes of `$'…'` off but does not decode its escapes, so `$'\x47'ITHUB_ACTIONS` (or `\107`, a
+# `\u` escape, mixed quoting) never reads as GITHUB_ACTIONS; nor does a `$"…"` locale string, which
+# the shell may translate. A variable's name never needs either: in the name part of the word (what
+# comes before its first `=` as written, or the whole word) a `$'` with a backslash after it, or a
+# `$"`, is denied, as check_git_push does for a refspec. An array's subscript is a key, not the name
+# (`m[$'\t']=1`, `declare -A m=([$'\n']=nl)`): when what stands before the first `[` is a name written
+# plainly, or nothing, only that part is the name. Mode `name` (the builtins' names, printf -v, read,
+# a nameref) reads every word so; mode `assign` (the words in front of the command word, which hold
+# wrappers' options like `xargs -d $'\n'`) denies a word with no `=` as written only when one of its
+# escapes may write the `=` and something that may be a name stands before it (`env
+# $'GITHUB_ACTIONS\x3d1' run`): `xargs -d $'\x3d'` and `-d$'\x3d'` assign nothing.
+# It covers the escapes and `$"…"` only: a name the shell fills in from a variable or a substitution
+# (`export ${G}ITHUB_ACTIONS=1`) is another class, left for its own issue. So are two more: under
+# `set -a` every variable the shell assigns is exported, a `for`, `select` or `getopts` variable
+# included, and the rule does not read a loop's variable as an export (#366). An assignment that
+# xargs or parallel builds from its input for the env it runs is denied by check_xargs_filled (#331). A glob
+# with nothing literal of the name (`export *`) is left out too (ci_glob_words). It only adds denials.
+CI_NAME_EQ_ESCAPE_RE='\\(x3[dD]|[uU]0{0,6}3[dD]|0?75)'
+CI_NAME_SUBSCRIPT_RE='^\(?([A-Za-z_][A-Za-z0-9_]*)?$'
+# Something before the escape that is neither quoting nor an option's dash: it may be a name.
+CI_NAME_BEFORE_EQ_RE=$'^[$\'"]*[^-$\'"]'
+ci_name_unreadable() {
+  local LC_ALL=C w="$1" name pre
+  # Linear first test: most words hold neither.
+  [[ "$w" == *\$[\'\"]* ]] || return 0
+  if [[ "$w" == *=* ]] || [ "$2" = name ]; then
+    name="${w%%=*}"
+    if [[ "$name" == *\[* ]]; then
+      pre="${name%%\[*}"
+      [[ "$pre" =~ $CI_NAME_SUBSCRIPT_RE ]] && name="$pre"
+    fi
+    if [[ "$name" == *"\$'"*\\* || "$name" == *'$"'* ]]; then deny_ci_name_unreadable "$w"; fi
+  elif [[ "$w" == *"\$'"* && "$w" =~ $CI_NAME_EQ_ESCAPE_RE ]]; then
+    pre="${w%%"${BASH_REMATCH[0]}"*}"
+    [[ "$pre" =~ $CI_NAME_BEFORE_EQ_RE ]] && deny_ci_name_unreadable "$w"
+  fi
+  return 0
+}
+
+# ci_value_may_name <word>: true when the word holds a `$"…"`, or escapes that may write a letter
+# (`\x`, `\NNN`, `\u`, `\U`) and each of them that stands before the first `[` (a subscript, written
+# or escaped) writes a character of a name ([A-Za-z0-9_]): a nameref to `\x1f` or `\033[31m` names
+# no variable, and bash refuses it; one to `GITHUB_ACTIONS[\x2b0]` names an element of it.
+CI_VALUE_ESC_RE='^(([^\\]|\\[^0-7xuU])*)\\(x[0-9A-Fa-f]{1,2}|0?[0-7]{1,3}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8})(.*)$'
+ci_value_may_name() {
+  local LC_ALL=C v="$1" e c
+  [[ "$v" == *'$"'* ]] && return 0
+  [[ "$v" =~ $CI_VALUE_ESC_RE ]] || return 1
+  while [[ "$v" =~ $CI_VALUE_ESC_RE ]]; do
+    [[ "${BASH_REMATCH[1]}" == *\[* ]] && return 0
+    e="${BASH_REMATCH[3]}"
+    v="${BASH_REMATCH[4]}"
+    case "$e" in
+      x*) c=$((16#${e#x})) ;;
+      [uU]*) c=$((16#${e#[uU]})) ;;
+      *) c=$((8#$e)) ;;
+    esac
+    # `[`, or a letter, a digit or `_`.
+    ((c == 91)) && return 0
+    ((c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 95)) || return 1
+  done
+  return 0
+}
+
+deny_ci_name_unreadable() {
+  deny "the command writes a variable's name with \$'…' escapes or a \$\"…\" string (${1}), which the guard does not decode: it may be GITHUB_ACTIONS or MWG_WRITE_TOKEN_KIND, which tell the merge step of merge-when-green that it runs as that GitHub Actions job" \
+    "write the variable's name out plainly (escapes and \$\"…\" belong in the value, after the =)"
+}
+
+# ci_split_string <k>: the string env's -S/--split-string (at the word k in front of the command word,
+# its value attached or in the words after it) splits into the assignments and the command env runs.
+# env reads that string with quotes, escapes (`\_` and `\t` are blanks there), `${VAR}` and `#`
+# of its own, and its value as written may span several of the guard's words; rather than model
+# env exactly, the rest of the segment is read both ways: every backslash and the character after it
+# a blank, and every backslash dropped (quotes dropped in both). A word of either reading that
+# assigns GITHUB_ACTIONS or MWG_WRITE_TOKEN_KIND, or whose name part holds a `$` or a backtick (env
+# fills `${VAR}` in), is denied; and so is a `$"…"`, or a `$'…'` with an escape that may write any
+# character (`\x`, `\NNN`, `\u`, `\U`, `\c`), anywhere in it: it may write the name, or the blank that
+# makes one (`$'A=1\x20GITHUB_ACTIONS=1 run'`). The other escapes (`$'node\t--version'`) write a blank
+# or a sign, and the two readings above take them as either.
+CI_SPLIT_NUMERIC_RE=$'\\$\'.*\\\\[0-7xuUc]'
+ci_split_string() {
+  local LC_ALL=C k="$1" text j w line
+  local -a lines=()
+  text="${raw[k]}"
+  # The option's own letters off: what is left of its word is the start of the string.
+  unquoted "$text"
+  case "$UNQUOTED" in
+    --*=*) text="${text#*=}" ;;
+    --*) text="" ;;
+    *) text="${text#*S}" ;;
+  esac
+  for ((j = k + 1; j < ${#raw[@]}; j++)); do text+=" ${raw[j]}"; done
+  if [[ "$text" =~ $CI_SPLIT_NUMERIC_RE || "$text" == *'$"'* ]]; then deny_ci_split_unreadable; fi
+  lines_of "$(printf '%s\n' "$text" | tr '\n' ' ' | sed -E -e "s/[\$]'/'/g" -e 'h' -e 's/\\./ /g' -e "s/['\"]//g" -e 'p' -e 'g' -e "s/[\\\\'\"]//g")"
+  lines=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
+  for line in ${lines[@]+"${lines[@]}"}; do
+    words_of "$line"
+    for w in ${SPLIT_WORDS[@]+"${SPLIT_WORDS[@]}"}; do
+      if [[ "$w" =~ $CI_IDENTITY_ASSIGN_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
+      if [[ "$w" == *=* && "${w%%=*}" == *[\$\`]* ]]; then deny_ci_split_unreadable; fi
+    done
+  done
+  return 0
+}
+
+deny_ci_split_unreadable() {
+  deny "the string env -S splits holds a \$'…' escape, a \$\"…\" string or a name filled in later, which the guard does not decode: it may assign GITHUB_ACTIONS or MWG_WRITE_TOKEN_KIND, which tell the merge step of merge-when-green that it runs as that GitHub Actions job" \
+    "write env's assignments and command as plain words, without -S"
+}
+
+# ci_escaped_identity: the whole command (SEGMENTS), with its quotes taken out, spelling GITHUB_ACTIONS
+# or MWG_WRITE_TOKEN_KIND with a letter written as an escape (`\x47`, `\107`, a `\u` or `\U` escape)
+# is denied, wherever it stands: inside a `bash -c` string (`bash -c 'export $'\''\x47'\''ITHUB_ACTIONS=1'`),
+# an env -S string or a word the rules read whole, the shell, printf or echo -e may decode it into the
+# name. One sed over the command, only when it holds a backslash before a digit, x, u or U.
+# What it reads is the escape standing in the text among the name's other letters. A name that
+# printf puts together at run time from separate arguments (`printf 'export %bITHUB_ACTIONS=1'
+# '\x47' | bash`) is not read: that is the splicing of a format, which the guard does not read with
+# plain letters either (`printf 'export %sITHUB_ACTIONS=1' G | bash`), a class older than #319.
+# It is denied as text too (`git commit -m '… \x47ITHUB_ACTIONS …'`, a gh --body, an echo), on
+# purpose: the guard cannot tell a text from a script the shell, printf or a later step decodes, and
+# such a text belongs in a file (git commit -F, gh --body-file), which the guard does not read.
+# Each letter of the two names, as itself (an unquoted backslash before it is dropped, `\I`), or as
+# an escape that writes that very letter: `\x47`, `\107` (`\0107` for printf), a `\u` or `\U` escape
+# (any other escape is not that letter, so a run of bytes written in hex is not read as the name).
+# Between two letters stands anything the shell may expand to nothing (`${a}`, `$1`, `$@`, `$(…)`, a
+# backtick substitution, a backslash and a newline): read as empty, it joins the letters.
+CI_ESC_GAP=$'(\$\{[^}]*\}|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`|\\\\\n)*'
+CI_ESC_NAME_RE=""
+for CI_ESC_N in GITHUB_ACTIONS MWG_WRITE_TOKEN_KIND; do
+  [ -z "$CI_ESC_NAME_RE" ] || CI_ESC_NAME_RE+="|"
+  for ((CI_ESC_J = 0; CI_ESC_J < ${#CI_ESC_N}; CI_ESC_J++)); do
+    [ "$CI_ESC_J" -eq 0 ] || CI_ESC_NAME_RE+="$CI_ESC_GAP"
+    CI_ESC_C="${CI_ESC_N:CI_ESC_J:1}"
+    printf -v CI_ESC_H '%02X' "'$CI_ESC_C"
+    printf -v CI_ESC_O '%03o' "'$CI_ESC_C"
+    # The hex digits in either case (`\x4d`, `\x4D`).
+    CI_ESC_HX=""
+    for ((CI_ESC_K = 0; CI_ESC_K < 2; CI_ESC_K++)); do
+      case "${CI_ESC_H:CI_ESC_K:1}" in
+        A) CI_ESC_HX+="[Aa]" ;;
+        B) CI_ESC_HX+="[Bb]" ;;
+        C) CI_ESC_HX+="[Cc]" ;;
+        D) CI_ESC_HX+="[Dd]" ;;
+        E) CI_ESC_HX+="[Ee]" ;;
+        F) CI_ESC_HX+="[Ff]" ;;
+        *) CI_ESC_HX+="${CI_ESC_H:CI_ESC_K:1}" ;;
+      esac
+    done
+    CI_ESC_NAME_RE+="(\\\\?${CI_ESC_C}|\\\\([xX]${CI_ESC_HX}|0?${CI_ESC_O}|u0{0,2}${CI_ESC_HX}|U0{0,6}${CI_ESC_HX}))"
+  done
+done
+unset CI_ESC_N CI_ESC_J CI_ESC_K CI_ESC_C CI_ESC_H CI_ESC_O CI_ESC_HX CI_ESC_GAP
+# The gaps above are a list, and the shell has more ways to write nothing (`$a`, `"$a"`, `{,}`,
+# `${a:-${b}}`, `$( (true) )`, `${a:+"} "}`, …), even inside the escape itself (`\x4$(:)7`,
+# `\'"$a"'x47`: printf or echo -e decode `\x47` once the shell has dropped the gap). So the whole
+# command as the harness sent it (RAW_COMMAND, heredoc bodies included, whether or not the extractor
+# made segments of them), with its quotes and its plain names taken out and its lines joined, is also
+# read with no limit on what stands between two letters, in five versions: (A) as written; (B) with
+# every expansion and substitution (`${…}` nested, `$(…)` nested, `$[…]`, a backtick, `$NAME`, `$1`,
+# `$@`) taken out; (C) as B, with every brace's content taken out too (`{X,}`); (D) and (E) as B, with
+# each brace replaced by its first or by its last alternative (`\x4{7,}`). Each version then has its
+# escapes decoded (those of the two names' letters and those of the characters that write an escape:
+# `\`, `x`, `X`, `u`, `U`, the digits, `a`-`f`, `F`; again and again until nothing changes, so
+# `$'\x5cx47'` writes `\x47` and then G) and keeps only its capital letters and `_`: any other
+# character drops out (a quote, a blank, a brace, a separator, a lowercase name). No word is cut out
+# of the command, so no quoting between two letters cuts the name in two. These versions model only
+# two outcomes of a gap, as written and empty, and their removal of expansions does not follow quoting
+# (a quoted `)` or `}` ends one early): a gap inside an escape that writes its digit or its backslash
+# (`\x4${a:-7}`, `\1'$?'7`, `{6..7}`), or one cut short by a quote, is not modelled here but read as
+# unfinished (the `?` reading in ci_escaped_identity), which denies whatever it may write. Each
+# version is decoded twice, once with the letters and once with a `#` for
+# each of the names' letters, and it is denied when the first holds a name more times than the
+# second: an escape writes one of its letters. `printf '\x41'; grep -E 'GITHUB_|ACTIONS' f` passes,
+# as on main, and so it does inside `$( )`: that A is not one of the name's letters.
+CI_ESC_DECODE=(-e ':a')
+CI_ESC_HIDE=(-e ':a')
+for CI_ESC_C in G I T H U B _ A C O N S M W R E K D '\' x X u U 0 1 2 3 4 5 6 7 8 9 a b c d e f F; do
+  printf -v CI_ESC_H '%02X' "'$CI_ESC_C"
+  printf -v CI_ESC_O '%o' "'$CI_ESC_C"
+  # The hex digits in either case (`\x4d`, `\x4D`), without ${x,,}, which the bash 3.2 of macOS lacks.
+  CI_ESC_HX=""
+  for ((CI_ESC_K = 0; CI_ESC_K < 2; CI_ESC_K++)); do
+    case "${CI_ESC_H:CI_ESC_K:1}" in
+      A) CI_ESC_HX+="[Aa]" ;;
+      B) CI_ESC_HX+="[Bb]" ;;
+      C) CI_ESC_HX+="[Cc]" ;;
+      D) CI_ESC_HX+="[Dd]" ;;
+      E) CI_ESC_HX+="[Ee]" ;;
+      F) CI_ESC_HX+="[Ff]" ;;
+      *) CI_ESC_HX+="${CI_ESC_H:CI_ESC_K:1}" ;;
+    esac
+  done
+  # Octal with up to one leading zero more than its three digits (`\101`, `\0101`; `\60`, `\060`, `\0060`).
+  if [ "${#CI_ESC_O}" -eq 3 ]; then CI_ESC_O="0?${CI_ESC_O}"; else CI_ESC_O="0{0,2}${CI_ESC_O}"; fi
+  CI_ESC_R="$CI_ESC_C"
+  [ "$CI_ESC_C" != '\' ] || CI_ESC_R='\\'
+  CI_ESC_DECODE+=(-e "s/\\\\([xX]${CI_ESC_HX}|${CI_ESC_O}|u0{0,2}${CI_ESC_HX}|U0{0,6}${CI_ESC_HX})/${CI_ESC_R}/g")
+  # The hidden version writes a `#` for each of the names' letters, and the same for the rest.
+  case "$CI_ESC_C" in [A-Z_]) CI_ESC_R='#' ;; esac
+  CI_ESC_HIDE+=(-e "s/\\\\([xX]${CI_ESC_HX}|${CI_ESC_O}|u0{0,2}${CI_ESC_HX}|U0{0,6}${CI_ESC_HX})/${CI_ESC_R}/g")
+done
+# ci_wild_re2 <name>: the name with one or two of its letters a wildcard and any number of wildcards
+# between two letters (each one writing nothing), where a wildcard is a `?` (a hard escape the guard
+# cannot finish: a backslash left before a digit, x, u or U) or a `@` (a weak one: a backslash before
+# what starts a gap — `$`, a backtick, a brace, a parenthesis, a bracket). The name's LAST letter may
+# be a `?` only, never a `@`: an escaped `$`/brace/paren that stands before a plain identifier
+# (`\$GITHUB_ACTION`, a regex's `(…)\(`) writes a literal character, not the name's final letter, so
+# it does not complete the name. A letter written in the middle or at the front still counts either
+# way (`\x4${a:-7}ITHUB_ACTIONS`, `$(printf '\\')x47ITHUB_ACTIONS`). The cap of two keeps a run of
+# backslashes (a JSON string escaped twice, a byte string in hex) from reading as the name on its
+# own; three or more letters each written by a gap are judged by the tail reading below instead.
+ci_wild_re2() {
+  local n="$1" j k i re2="" alt cls last
+  last=$((${#n} - 1))
+  for ((j = 0; j < ${#n}; j++)); do
+    for ((k = j; k < ${#n}; k++)); do
+      alt=""
+      for ((i = 0; i < ${#n}; i++)); do
+        # Between two letters only a hard `?` may stand (a backslash writing nothing); a weak `@` is a
+        # literal `$`/brace/paren really in the output, so it cannot vanish between two letters.
+        [ "$i" -eq 0 ] || alt+="[?]*"
+        if [ "$i" -eq "$j" ] || [ "$i" -eq "$k" ]; then
+          if [ "$i" -eq "$last" ]; then cls="[?]"; else cls="[?@]"; fi
+          alt+="$cls"
+        else
+          alt+="${n:i:1}"
+        fi
+      done
+      [ -z "$re2" ] || re2+="|"
+      re2+="$alt"
+    done
+  done
+  CI_WILD2_V2="$re2"
+}
+ci_wild_re2 GITHUB_ACTIONS
+CI_ESC_V2_GH_RE="$CI_WILD2_V2"
+ci_wild_re2 MWG_WRITE_TOKEN_KIND
+CI_ESC_V2_MWG_RE="$CI_WILD2_V2"
+unset CI_WILD2_V2
+# The two names' letters, for the `?` reading's projection: any other capital drops out, so a capital
+# the shell throws away between the escape and the name (`\x4${a:+\}X}7ITHUB_ACTIONS` leaves an `X`,
+# the `Z=1` of a `case` leaves a `Z`) does not break the name. `F J L P Q V X Y Z` are in neither.
+CI_ESC_NAME_LETTERS='ABCDEGHIKMNORSTUW_'
+# ci_wild_lead_re <name>: three or more hard wildcards (`?`) in a row — each writing nothing or one
+# letter — then the name with its first three letters gone, all written out. It catches the name whose
+# first three letters are each an escape the guard cannot finish (`\x4${a:-7}\x4${a:-9}\x5${a:-4}HUB_ACTIONS`),
+# which the cap of two in ci_wild_re2 leaves out. The tail (`HUB_ACTIONS`, `_WRITE_TOKEN_KIND`) is long
+# and specific: a run of hard escapes before any other text does not reach it, and the name written out
+# in full (its first letters not escapes) has no run of `?` before that tail. Four or more first letters
+# each by an escape is the older fill-in class (`${a:-GITH}UB_ACTIONS`), left for its own issue.
+CI_ESC_LEAD_GH_RE="[?][?]*[?][?]*[?][?]*HUB_ACTIONS"
+CI_ESC_LEAD_MWG_RE="[?][?]*[?][?]*[?][?]*_WRITE_TOKEN_KIND"
+CI_ESC_DECODE+=(-e 'ta')
+CI_ESC_HIDE+=(-e 'ta')
+unset CI_ESC_C CI_ESC_H CI_ESC_O CI_ESC_HX CI_ESC_K CI_ESC_R
+ci_escaped_identity() {
+  local LC_ALL=C t="$1" i r h rn hn name d w
+  local m proj
+  local -a versions_r=() versions_h=()
+  if [[ "$t" == *\\[0-7xXuU]* ]]; then
+    # A quote escaped or not is taken out (`'\''` splices a quote into a single-quoted string), with
+    # the `$` of a `$'…'`, and so is the name written plainly, which the other rules read.
+    t="$(printf '%s\n' "$t" | sed -E -e "s/[\$](\\\\?['\"])/\\1/g" -e "s/\\\\(['\"])/\\1/g" -e "s/['\"]//g" -e 's/GITHUB_ACTIONS|MWG_WRITE_TOKEN_KIND/#/g')"
+    if [[ "$t" =~ $CI_ESC_NAME_RE ]]; then
+      deny_ci_escaped_identity "${BASH_REMATCH[0]}"
+    fi
+  fi
+  raw_command
+  # An escape, or a backslash before what may start a gap (a quote, an expansion, a brace, another
+  # backslash: `\'"$a"'x47`, `\\$(:)x47`).
+  [[ "$RAW_COMMAND" == *\\[0-7xXuU\'\"\$\`\{\\]* ]] || return 0
+  # One line: a backslash and a newline are nothing, any other newline a blank.
+  t="${RAW_COMMAND//$'\\\n'/}"
+  t="${t//$'\n'/ }"
+  # The same quotes and plain names taken out; a quote leaves a \001 in its place, which ends the
+  # name of an expansion before it (`$_'ITHUB…'` is `$_`, then ITHUB…), and is dropped before
+  # decoding (`\x4'"$a"'7` is `\x47` once $a is out). A backslash before a quote is read both ways:
+  # as escaping it (`'\''` splices a quote into a single-quoted string) and as a backslash of its own
+  # (`'export \'"$a"'x47…'`, where the single quotes keep it). Each of those two lines is then
+  # written as it is, with only its variables taken out (`$NAME`, `$1`, `${…}`), and after each round
+  # of taking out the innermost expansions and substitutions (`${…}`, `$[…]`, `$(…)`, a backtick,
+  # a subshell's parentheses) until none is left: `$(printf '\x4'"$a"'7…')` is read with $a out and
+  # the substitution kept, `\x4$(:)7` with `$(:)` out. Each of those, as it is and with every brace
+  # taken out or replaced by its first or by its last alternative. One version a line.
+  t="$({
+    printf '%s\n' "$t" | sed -E -e "s/[\$](\\\\?['\"])/\\1/g" -e "s/\\\\(['\"])/\\1/g"
+    printf '%s\n' "$t" | sed -E -e "s/[\$](['\"])/\\1/g"
+  } | sed -E -e "s/['\"]/"$'\001'"/g" -e 's/GITHUB_ACTIONS|MWG_WRITE_TOKEN_KIND/#/g' -e 'p' \
+    -e 's/\$[A-Za-z_][A-Za-z0-9_]*//g' -e 's/\$[0-9@*#?!$-]//g' -e ':v' -e 's/\$\{(\\.|[^{}])*\}//g' -e 'tv' -e 'p' \
+    -e ':b' -e "s/\`[^\`]*\`//g" -e 's/\$\{(\\.|[^{}])*\}//g' -e 's/\$\[[^][]*\]//g' -e 's/\$\((\\.|[^()])*\)//g' -e 's/(^|[^$])\(([^()]*)\)/\1\2/g' \
+    -e 'tp' -e 'bq' -e ':p' -e 'p' -e 'bb' -e ':q' -e 'd' |
+    sed -E -e 'p' -e 'h' \
+      -e ':c' -e 's/\{[^{}]*\}//g' -e 'tc' -e 'p' -e 'g' \
+      -e ':d' -e 's/\{([^{},]*)(,[^{}]*)?\}/\1/g' -e 'td' -e 'p' -e 'g' \
+      -e ':e' -e 's/\{([^{}]*,)?([^{},]*)\}/\2/g' -e 'te' | tr -d '\001')"
+  # Each line starts with a `#`, so that none is empty and line i is the version i in both.
+  d="$(printf '%s\n' "$t" | sed -E "${CI_ESC_DECODE[@]}")"
+  lines_of "$(printf '%s\n' "$d" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  versions_r=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
+  # A backslash left once the escapes are decoded is read as a wildcard that may write a letter,
+  # whatever the gap writes or however its quoting ends it. A backslash before a digit, x, u or U is
+  # a hard wildcard (`\002`, shown `?`): an unfinished numeric/hex/unicode escape (`\x4${a:-7}`,
+  # `\1'$?'7`, `\x4$((3+4))`, `\x4{6..7}`, `\x4$(: ')' )7`, `\x4"$'\0'"7`) that writes exactly one
+  # character. A backslash before what starts a gap (`$`, a backtick, a brace, a parenthesis, a
+  # bracket: `$(printf '\\')x47`, `${b:-\\}x47`) is a weak wildcard (`\003`, shown `@`): it may stand
+  # for a letter only where a gap really follows. The line is then kept as the two names' letters and
+  # the markers only (any other capital drops out, so a capital the shell throws away between the
+  # escape and the name does not break it: `\x4${a:+\}X}7ITHUB_ACTIONS`, the `Z=1` of a `case`), and
+  # read two ways: ci_wild_re2 (the name with one or two letters a wildcard, its last a hard one only,
+  # so `\$GITHUB_ACTION` and a regex's `(…)\(` do not complete it through their escaped `$`/`(`), and
+  # ci_wild_lead_re (three or more hard wildcards then the name with its first three letters gone, for
+  # the name whose first letters are each an escape the cap of two leaves out). The name written in
+  # full with no escape of its own (`sed 's/(GITHUB)_(ACTIONS)/\1/'`, `printf '\x41'; grep GITHUB_ f |
+  # grep ACTIONS`) has every letter plain, so neither reading finds a wildcard standing for one; a run
+  # of bytes in hex (`\x01\x02…`) has no name letters; a substitution that writes the backslash with
+  # none in the text (`$(xxd -r -p <<< 5c)`, `$(awk 'BEGIN{printf "%c",92}')`) is the older fill-in
+  # class (the shell, not a text escape, puts the character there). The last three are left for #319's
+  # own follow-up, out of this round.
+  if [[ "$d" == *\\* ]]; then
+    m="$(printf '%s\n' "$d" |
+      sed -E -e "s/\\\\([0-7xXuU])/"$'\002'"\\1/g" -e "s/\\\\([\$\`{}()]|\\[|\\])/"$'\003'"\\1/g")"
+    while IFS= read -r w; do
+      [[ "$w" == *$'\002'* || "$w" == *$'\003'* ]] || continue
+      proj="$(printf '%s' "$w" | tr -cd "${CI_ESC_NAME_LETTERS}"$'\002\003' | tr $'\002\003' '?@')"
+      [[ "$proj" == *[?@]* ]] || continue
+      if [[ "$proj" =~ $CI_ESC_V2_GH_RE || "$proj" =~ $CI_ESC_LEAD_GH_RE ]]; then
+        deny_ci_escaped_identity "GITHUB_ACTIONS, read with an escape the guard cannot finish as any letter"
+      fi
+      if [[ "$proj" =~ $CI_ESC_V2_MWG_RE || "$proj" =~ $CI_ESC_LEAD_MWG_RE ]]; then
+        deny_ci_escaped_identity "MWG_WRITE_TOKEN_KIND, read with an escape the guard cannot finish as any letter"
+      fi
+    done <<< "$m"
+  fi
+  lines_of "$(printf '%s\n' "$t" | sed -E "${CI_ESC_HIDE[@]}" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  versions_h=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
+  # Should the two not line up, nothing counts as hidden: the stricter reading.
+  [ "${#versions_h[@]}" -eq "${#versions_r[@]}" ] || versions_h=()
+  for ((i = 0; i < ${#versions_r[@]}; i++)); do
+    for name in GITHUB_ACTIONS MWG_WRITE_TOKEN_KIND; do
+      r="${versions_r[i]}"
+      h="${versions_h[i]-}"
+      # How much of each line the name takes up (a count of it times its length).
+      rn="${r//"$name"/}"
+      hn="${h//"$name"/}"
+      if [ $((${#r} - ${#rn})) -gt $((${#h} - ${#hn})) ]; then
+        deny_ci_escaped_identity "${name}, read with what may expand to nothing taken out"
+      fi
+    done
+  done
+  return 0
+}
+
+deny_ci_escaped_identity() {
+  deny "the command spells GITHUB_ACTIONS or MWG_WRITE_TOKEN_KIND with an escape (${1}), which the shell, printf or echo -e may decode into the name: those tell the merge step of merge-when-green that it runs as that GitHub Actions job" \
+    "write the variable's name out plainly, and leave it to the GitHub Actions runner; a text that must spell it so (a commit message, an issue or PR body) goes in a file: git commit -F, gh --body-file"
+}
+
+# check_ci_identity_loop: the variable of a `for`, `select` or `getopts` loop is assigned on every
+# turn, and under `set -a` (`set -o allexport`) exported to every program the loop runs (#366). Like
+# a bare `NAME=…`, it is denied with one of the two names whether or not allexport is on: the guard
+# does not follow which options are set by then (`set -a`, `bash -a`, SHELLOPTS=allexport). For and
+# select are keywords only as written; getopts takes the name after its option string (after `--`).
+# Not read: an arithmetic assignment written with blanks (`set -a; (( GITHUB_ACTIONS = 1 ))`), which
+# the extractor leaves as a segment whose command word is the name; noted in #366.
+# Reads tok, raw and PFX_END (see check_segment).
+check_ci_identity_loop() {
+  local k=$PFX_END w cw
+  [ "$k" -lt "${#tok[@]}" ] || return 0
+  cw="${raw[k]-${tok[k]}}"
+  unquoted "$cw"
+  base_name "$UNQUOTED"
+  case "$cw" in
+    for | select) k=$((k + 1)) ;;
+    *)
+      [ "$BASE_NAME" = getopts ] || return 0
+      k=$((k + 1))
+      [ "${tok[k]-}" = -- ] && k=$((k + 1))
+      k=$((k + 1))
+      ;;
+  esac
+  [ "$k" -lt "${#tok[@]}" ] || return 0
+  ci_name_unreadable "${tok[k]}" name
+  shell_words "${tok[k]}" "${raw[k]-}"
+  ci_glob_words "${raw[k]-${tok[k]}}"
+  for w in "${SHELL_WORDS[@]}"; do
+    if [[ "$w" =~ $CI_IDENTITY_NAME_RE ]]; then deny_ci_identity "$w"; fi
+  done
+  return 0
 }
 
 # The words in front of the command word (assignments, wrappers and theirs) and the command word
 # itself, which is where a bare `NAME=…` or `NAME+=…` statement stands; and the `${NAME:=…}`
 # expansion, which assigns as it expands. Reads tok and PFX_END (see check_segment).
 check_ci_identity_prefix() {
-  local k w last=$PFX_END
+  local k w last=$PFX_END env=0 envarg=0
+  check_ci_identity_loop
   [ "$last" -lt "${#tok[@]}" ] || last=$((${#tok[@]} - 1))
   for ((k = 0; k <= last; k++)); do
+    ci_name_unreadable "${tok[k]}" assign
+    # After env, its -S/--split-string (in a cluster, as --s…, or an option word the guard cannot
+    # read) starts the string env splits into assignments and a command (see ci_split_string).
+    # env's words end at its program, the first word that is neither its option (nor the value of
+    # -u, -C or -P) nor an assignment: a later wrapper's -S (`env A=1 sudo -S …`) is not env's.
+    unquoted "${raw[k]-${tok[k]}}"
+    if [ "$env" -eq 1 ]; then
+      if [ "$envarg" -eq 1 ]; then
+        envarg=0
+      elif [[ "$UNQUOTED" == -* ]]; then
+        if [[ "$UNQUOTED" =~ ^-[A-Za-z0-9]*S || "$UNQUOTED" == --s* || "${raw[k]-}" == *"\$'"*\\* || "${raw[k]-}" == *'$"'* ]]; then
+          ci_split_string "$k"
+        fi
+        [[ "$UNQUOTED" =~ ^-[A-Za-z0-9]*[uCP]$ || "$UNQUOTED" == --unset || "$UNQUOTED" == --chdir ]] && envarg=1
+      elif [[ "$UNQUOTED" == *=* ]]; then
+        :
+      elif [[ "${raw[k]-}" == *"\$'"*\\* || "${raw[k]-}" == *'$"'* ]]; then
+        # A word the guard cannot read (`$'\x2dS'`) may be the -S.
+        ci_split_string "$k"
+      else
+        env=0
+      fi
+    fi
+    base_name "$UNQUOTED"
+    [ "$BASE_NAME" = env ] && env=1
     shell_words "${tok[k]}" "${raw[k]-}"
+    # A wrapper's word (env's, sudo's) may be an assignment a glob writes (ci_glob_words); the guard
+    # takes `GITHUB_ACTION?=1` for env's program, so the command word counts too, but not the first.
+    [ "$k" -gt 0 ] && ci_glob_words "${raw[k]-${tok[k]}}"
     for w in "${SHELL_WORDS[@]}"; do
       if [[ "$w" =~ $CI_IDENTITY_ASSIGN_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
     done
@@ -3521,7 +6278,10 @@ check_ci_identity_prefix() {
 # The builtins that set or export a variable they name: export, declare/typeset (with -x, a bare
 # name is exported), readonly, local and let (with a value), printf -v and read.
 check_ci_identity_builtin() {
-  local k n=${#tok[@]} a w opts=""
+  local k n=${#tok[@]} a w opts="" optx=0 mode=name
+  # Read as one of the programs an unreadable command word may be (cw_as_if), its words may be any
+  # program's arguments (`$CMD -t $'\t'`): only an assignment's name is judged unreadable there.
+  [ "$CW_ASIF" -eq 1 ] && mode=assign
   case "$cmd0" in
     printf)
       for ((k = 1; k < n; k++)); do
@@ -3531,7 +6291,9 @@ check_ci_identity_builtin() {
           -v?*) a="${a#-v}" ;;
           *) continue ;;
         esac
+        ci_name_unreadable "$a" "$mode"
         shell_words "$a" "${raw[k]-}${raw[k + 1]-}"
+        ci_glob_words "${raw[k]-}${raw[k + 1]-}"
         for w in "${SHELL_WORDS[@]}"; do
           w="${w%%\[*}"
           if [[ "$w" =~ $CI_IDENTITY_NAME_RE ]]; then deny_ci_identity "$w"; fi
@@ -3548,7 +6310,9 @@ check_ci_identity_builtin() {
           # -d, -i, -n, -N, -p, -t and -u take the next word as their value (-a names an array).
           -*[dinNptu]) k=$((k + 1)) ;;
           *)
+            ci_name_unreadable "$a" "$mode"
             shell_words "$a" "${raw[k]-}"
+            ci_glob_words "${raw[k]-$a}"
             for w in "${SHELL_WORDS[@]}"; do
               if [[ "$w" =~ $CI_IDENTITY_NAME_RE ]]; then deny_ci_identity "$w"; fi
             done
@@ -3560,24 +6324,53 @@ check_ci_identity_builtin() {
   esac
   for ((k = 1; k < n; k++)); do
     a="${tok[k]}"
-    case "$a" in
+    # An option as the shell reads it: `$'-n'` and `"-x"` are -n and -x. One the guard cannot read
+    # (`$'-\x6e'`, `"$O"`) may be any of them: optx, read as -n and as -x but not as -p, for every
+    # word after it (and the word itself is still judged as a name).
+    unquoted "${raw[k]-$a}"
+    case "$UNQUOTED" in
       -*)
-        opts+="${a#-}"
+        opts+="${UNQUOTED#-}"
+        w="${raw[k]-$a}"
+        # A glob or a brace (`-?`, `-[x]`, `-{n,}`) may be any option too.
+        [[ "$UNQUOTED" == *[\$\`?*[{]* || "$w" == *"\$'"*\\* || "$w" == *'$"'* ]] && optx=1
         continue
         ;;
       +*) continue ;;
+      # A word the shell fills in (`"$O"`, `${X}`, a substitution) may be an option too: -n or -x.
+      [\$\`]*) [[ "$UNQUOTED" == *=* ]] || optx=1 ;;
+      # So may a brace or a glob (`{-n,}`, `''{-x,}`, `?n`, `[-]n`, `*`): brace expansion writes the
+      # option, a glob may match a file named -n or -x.
+      [{?*[]*) optx=1 ;;
     esac
+    # Read as declare (cw_as_if), a word after -x, -n or an option the guard cannot read is judged as
+    # a name when its escapes write only a name's characters (ci_value_may_name).
+    w="$mode"
+    [[ "$w" = assign && "$a" != *=* && ("$opts" == *[xn]* || "$optx" -eq 1) ]] && ci_value_may_name "$a" && w=name
+    ci_name_unreadable "$a" "$w"
+    # A nameref's value is a name too (`declare -n r=$'\x47'ITHUB_ACTIONS`), and is judged as one. With
+    # an option the guard cannot read (optx), or read as declare (cw_as_if), only a value whose
+    # escapes write only a name's characters (`\x47`, not `\x1f` or `\033`) or a `$"…"`: `local "$O"
+    # sep=$'\t'` and `local $opt sep=$'\x1f'` name no variable either way.
+    if [[ "$cmd0" != export && "$a" == *=* ]]; then
+      if [[ "$opts" == *n* || "$optx" -eq 1 ]] && ci_value_may_name "${a#*=}"; then
+        ci_name_unreadable "${a#*=}" name
+      elif [[ "$opts" == *n* ]]; then
+        ci_name_unreadable "${a#*=}" "$mode"
+      fi
+    fi
     shell_words "$a" "${raw[k]-}"
+    ci_glob_words "${raw[k]-$a}"
     for a in "${SHELL_WORDS[@]}"; do
       if [[ "$a" =~ $CI_IDENTITY_ASSIGN_RE ]]; then deny_ci_identity "${BASH_REMATCH[1]}"; fi
       # A nameref (declare/typeset/local -n) to one of them sets it through another name.
-      if [[ "$opts" == *n* && "$cmd0" != export && "${a#*=}" =~ $CI_IDENTITY_NAME_RE ]]; then
+      if [[ ("$opts" == *n* || "$optx" -eq 1) && "$cmd0" != export && "${a#*=}" =~ $CI_IDENTITY_NAME_RE ]]; then
         deny_ci_identity "${a#*=}"
       fi
       if [[ "$a" =~ $CI_IDENTITY_NAME_RE ]]; then
         case "$cmd0" in
           export) [[ "$opts" == *[np]* ]] || deny_ci_identity "$a" ;;
-          declare | typeset) [[ "$opts" == *x* && "$opts" != *p* ]] && deny_ci_identity "$a" ;;
+          declare | typeset) [[ ("$opts" == *x* || "$optx" -eq 1) && "$opts" != *p* ]] && deny_ci_identity "$a" ;;
         esac
       fi
     done
@@ -4923,11 +7716,20 @@ cw_judge() {
 # cw_as_if <the command word, as shown>: judge this segment as each program an unreadable command
 # word may stand for (see the top of this section). Not again inside one of them.
 CW_ASIF=0
+# The command word cw_as_if stands in for, as written (git_env_alias leaves its escapes out).
+CW_ASIF_RAW=""
 cw_as_if() {
   local cand saved_c="$CW_CONTEXT" saved_h="$CW_HINT"
   CW_ASIF=1
   CW_HINT="write the program's name in the command, or give the name a literal value earlier in this same command (NAME=gh; \$NAME …), which the guard reads"
-  for cand in "" git gh cat; do
+  # export, declare and env: the builtins and the wrapper that set GITHUB_ACTIONS or
+  # MWG_WRITE_TOKEN_KIND (`$'\x64eclare' -x GITHUB_ACTIONS=1`, #319), only for a word written with
+  # escapes or as `$"…"`: read as them, any program's arguments (`"$DOCKER" run -e GITHUB_ACTIONS=1`,
+  # `"$CURL" -sS -d "${k}=1"`) would be their assignments or env's -S; a program held in a variable
+  # is the class #319 leaves for its own issue.
+  local cands=("" git gh cat)
+  if [[ "$1" == *"\$'"*\\* || "$1" == *'$"'* ]]; then cands+=(export declare env); fi
+  for cand in "${cands[@]}"; do
     if [ -z "$cand" ]; then
       CW_CONTEXT="the program ${1} is filled in by the shell, which the guard cannot read; read as empty (or as a wrapper, so the next word runs), this is denied"
       cw_judge
@@ -4951,7 +7753,7 @@ CW_RULE_PROGRAMS="git gh curl wget find pr-merge.sh pr_merge.py source bash sh d
 # exit status: a function called as a condition runs without `set -e`, and so would every rule.)
 CW_DONE=0
 cw_read() {
-  local w="${raw[0]}" v shown saved="$CW_CONTEXT" ev
+  local w="${raw[0]}" v shown saved="$CW_CONTEXT" ev cw_k cw_asg=0
   local -a vals=()
   CW_DONE=0
   cw_end=1
@@ -4975,9 +7777,23 @@ cw_read() {
     # word once, and what one reading leaves (`\"git\"`, `\$G`, `\{a,b\}`) is part of the name. Not
     # after eval, which reads its words once more: `G=gh; eval \$G pr merge 5 --admin` runs gh
     # (found 2026-10-02, verifying this change), so there the reading goes on.
+    # #327, round 7: a NAME=value the braces make (`env GIT_CONFIG_{PARAMETERS="'alias.x=…'",X=1}
+    # git x …`) is an assignment to env, whatever its value holds: it is written back with its
+    # value single-quoted, so the segment is read with the assignment and the program after it.
     ev=0
     for v in ${pre_raw[@]+"${pre_raw[@]}"}; do [ "$v" = eval ] && ev=1; done
-    for v in ${CW_WORDS[@]+"${CW_WORDS[@]}"}; do
+    if [ "${#CW_WORDS[@]}" -gt 1 ]; then
+      for ((cw_k = 0; cw_k < ${#CW_WORDS[@]}; cw_k++)); do
+        v="${CW_WORDS[cw_k]}"
+        [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || break
+        [[ "$v" == *[[:space:]\$\`\\\'\"\{\*\?\[]* ]] || continue
+        w="${v#*=}"
+        CW_WORDS[cw_k]="${v%%=*}='${w//\'/\'\\\'\'}'"
+        cw_asg=$((cw_k + 1))
+      done
+    fi
+    for ((cw_k = cw_asg; cw_k < ${#CW_WORDS[@]}; cw_k++)); do
+      v="${CW_WORDS[cw_k]}"
       [[ -z "$v" || "$v" == *[[:space:]]* ]] && return 0
       [ "$ev" -eq 0 ] && [[ "$v" == *[\$\`\\\'\"\{]* ]] && return 0
     done
@@ -4987,7 +7803,7 @@ cw_read() {
     # arguments: a `case` arm's pattern (`*)`, `[a-z]*)`) arrives as a segment of its own, and 120
     # real commands of the 31 days to 2026-10-02 hold one; a program run bare does nothing any rule
     # denies but read commands from stdin (parallel), which a pattern for it would be a long way to.
-    if [[ "${CW_WORDS[0]-}" == *[\*\?\[]* ]] && { [ "${#CW_WORDS[@]}" -gt 1 ] || [ "$cw_end" -lt "${#raw[@]}" ]; }; then
+    if [ "$cw_asg" -eq 0 ] && [[ "${CW_WORDS[0]-}" == *[\*\?\[]* ]] && { [ "${#CW_WORDS[@]}" -gt 1 ] || [ "$cw_end" -lt "${#raw[@]}" ]; }; then
       for v in $CW_RULE_PROGRAMS; do
         # shellcheck disable=SC2053 # matching the pattern is the point
         [[ "$v" == ${CW_WORDS[0]} ]] || continue
@@ -5018,7 +7834,9 @@ cw_read() {
   fi
   # Inside one of the readings of cw_as_if, a second unreadable word is read as written.
   [ "$CW_ASIF" -eq 0 ] || return 0
+  CW_ASIF_RAW="$w"
   cw_as_if "$shown"
+  CW_ASIF_RAW=""
   CW_DONE=1
   return 0
 }
@@ -5094,6 +7912,8 @@ parallel_inputs() {
     esac
   done
   [ "$sep" -eq 1 ] || return 0
+  # Inputs check_xargs_filled found readable are read here: the commands judged again hold them.
+  local XF_IN_PARALLEL_INPUTS="$XF_PAR_READ"
   # With its replace string in the command (`parallel gh api -X DELETE {} ::: <endpoint>`), parallel
   # puts each input there and appends nothing: each command it runs is judged, when the inputs are
   # one group of plain words, at most 16 (found 2026-10-03, verifying this change: read as appended
@@ -5214,6 +8034,281 @@ deny_parallel_input() {
     "write the command after parallel's options (parallel <command> ::: <inputs>), or run the commands one by one"
 }
 
+# --- What xargs or parallel fills in, for git, gh and env (#331) -------------------------------
+# xargs and parallel add words the command line does not show: appended (no replace string, or one
+# that -L/-n/--max-* may cancel), or put where the replace string stands. The git and gh rules read
+# the branch, the ref, the PR or the subcommand as written, so one that xargs fills in was judged by
+# no rule (`echo develop | xargs git branch -D`, `echo branch -f develop HEAD | xargs git`). The guard
+# cannot know what xargs will read, so it fails closed (decided 2026-10-14, a stricter guard is the
+# agent's call): a git command in XF_GIT_SENSITIVE, `gh pr merge`, a `gh api` call that writes, and a
+# git or gh subcommand, are denied when xargs or parallel fills in any of their words. Also:
+#   - empty input: GNU xargs runs the command once with nothing appended, so `xargs git checkout
+#     develop --` switches branch. The only checkout or reset kept is the file restore whose filled
+#     words all stand after a literal `--` with nothing but HEAD before it (`xargs git checkout --`,
+#     `xargs -I{} git checkout HEAD -- {}`): with no input it changes nothing (measured, git 2.43);
+#   - a parse the guard may have got wrong is judged as if every word were filled in: more than one
+#     xargs or parallel in the chain (each has its own replace string, the guard keeps one), an
+#     option of the chain written with a quote, a backslash or an expansion (`--"max-args" 1`,
+#     `-n' 1'`: its name or its value is not what the guard reads), a git or gh that is not the
+#     command word the guard found, and xargs hidden behind a wrapper option it did not read;
+#   - parallel with a replace string the command does not hold appends what it reads;
+#   - an env launched by xargs gets its assignments from the input when nothing follows it, or from
+#     the replace string: it may assign GITHUB_ACTIONS or MWG_WRITE_TOKEN_KIND (#331, 2026-10-14).
+# Harmless forms stay allowed: `xargs git add`, `git rm`, `log`, `show`, `diff`, `blame`, `gh pr
+# view`, a `gh api` read with its path filled in.
+XF_PAR_READ=0
+XF_GIT_SENSITIVE=" push send-pack branch merge checkout switch reset update-ref "
+XF_UNTRUSTED=0
+XF_APPEND=0
+XF_REPL=""
+XF_END=0
+# xf_filled <word>: may xargs or parallel fill in this word?
+xf_filled() {
+  [ "$XF_UNTRUSTED" -eq 0 ] || return 0
+  [ -n "$XF_REPL" ] && [[ "$1" == *"$XF_REPL"* ]] && return 0
+  return 1
+}
+# xf_any_filled <from> <to>: is any word in [from, to) filled in, or does xargs append one?
+xf_any_filled() {
+  local k
+  [ "$XF_UNTRUSTED" -eq 0 ] && [ "$XF_APPEND" -eq 0 ] || return 0
+  for ((k = $1; k < $2; k++)); do
+    xf_filled "${PFX_W[k]}" && return 0
+  done
+  return 1
+}
+deny_xargs_filled() {
+  deny "${1} takes ${2} from what xargs or parallel reads (appended to the command, or put where its replace string stands), which the guard cannot read: the branch, ref, PR or option it fills in is judged by no rule" \
+    "write ${2} in the command itself, one command per value (git branch -d feature/a feature/b, gh pr merge 12)${3:+; ${3}}"
+}
+check_xargs_filled() {
+  [ "${QUOTED:-0}" -eq 0 ] || return 0
+  # parallel_inputs judging again, with its inputs written in, a command whose inputs this read.
+  [ "${XF_IN_PARALLEL_INPUTS:-0}" -eq 1 ] && [ "$PFX_PARALLEL" -eq 1 ] && return 0
+  XF_PAR_READ=0
+  local n=${#PFX_W[@]} k x=-1 chain=0 odd=0 par=0 last j w keep_base="$BASE_NAME"
+  for ((k = 0; k < n && k <= PFX_END; k++)); do
+    w="${PFX_W[k]//[\"\'\\]/}"
+    base_name "$w"
+    case "$BASE_NAME" in
+      xargs | parallel)
+        [ "$x" -ge 0 ] || x=$k
+        chain=$((chain + 1))
+        [ "$BASE_NAME" = xargs ] || par=1
+        ;;
+    esac
+  done
+  BASE_NAME="$keep_base"
+  [ "$x" -ge 0 ] || return 0
+  for ((k = 0; k < n && k < PFX_END; k++)); do
+    if [[ "${PFX_W[k]}" == -* && "${PFX_RAW[k]:-}" =~ $XARGS_OPAQUE_RE ]]; then odd=1; fi
+  done
+  # Where the command ends: parallel's inputs (`::: a b`) are not its words.
+  XF_END=$n
+  if [ "$par" -eq 1 ]; then
+    for ((k = x + 1; k < n; k++)); do
+      case "${PFX_W[k]}" in ::: | :::: | :::+ | ::::+) XF_END=$k; break ;; esac
+    done
+  fi
+  # With an option the guard may have misread, git or gh may stand past the command word it found.
+  last=$PFX_END
+  [ "$odd" -eq 0 ] || last=$((XF_END - 1))
+  [ "$last" -lt "$XF_END" ] || last=$((XF_END - 1))
+  for ((j = x + 1; j <= last; j++)); do
+    w="${PFX_W[j]//[\"\'\\]/}"
+    base_name "$w"
+    case "$BASE_NAME" in git | gh | env | sh | bash | dash | zsh | ksh | ash | mksh) ;; *) continue ;; esac
+    XF_UNTRUSTED=1 XF_APPEND=1 XF_REPL=""
+    # Read as the guard parsed it only when that parse is sure; env is a wrapper, before the command word.
+    if [ "$PFX_XARGS" -eq 1 ] && [ "$chain" -eq 1 ] && [ "$odd" -eq 0 ] && { [ "$j" -eq "$PFX_END" ] || [ "$BASE_NAME" = env ]; }; then
+      XF_UNTRUSTED=0 XF_APPEND=$PFX_APPEND XF_REPL=$PFX_REPL
+      # parallel's plain words after one ::: (at most 16, as parallel_inputs reads them) are no
+      # input the guard cannot read: each command it runs is judged with them (parallel_inputs).
+      if [ "$PFX_PARALLEL" -eq 1 ] && xf_parallel_read; then
+        XF_PAR_READ=1
+        continue
+      fi
+      if [ "$PFX_PARALLEL" -eq 1 ] && [ -n "$XF_REPL" ]; then
+        XF_APPEND=1
+        for ((k = j + 1; k < XF_END; k++)); do
+          if [[ "${PFX_W[k]}" == *"$XF_REPL"* ]]; then XF_APPEND=$PFX_APPEND; break; fi
+        done
+      fi
+    fi
+    case "$BASE_NAME" in
+      git) xf_git "$j" ;;
+      gh) xf_gh "$j" ;;
+      env) xf_env "$j" ;;
+      *) xf_shell "$j" ;;
+    esac
+  done
+  BASE_NAME="$keep_base"
+  return 0
+}
+# xf_parallel_read: are parallel's inputs one ::: group of 1 to 16 plain words?
+xf_parallel_read() {
+  local k cnt=0
+  [ "$XF_END" -lt "${#PFX_W[@]}" ] && [ "${PFX_W[XF_END]}" = ::: ] || return 1
+  for ((k = XF_END + 1; k < ${#PFX_W[@]}; k++)); do
+    case "${PFX_RAW[k]:-${PFX_W[k]}}" in
+      ::: | :::+ | :::: | ::::+ | *[\'\"\\\$\`]*) return 1 ;;
+    esac
+    cnt=$((cnt + 1))
+  done
+  [ "$cnt" -ge 1 ] && [ "$cnt" -le 16 ]
+}
+xf_git() {
+  local j="$1" i sub d k
+  i=$((j + 1))
+  while [ "$i" -lt "$XF_END" ]; do
+    case "${PFX_W[i]//[\"\'\\]/}" in
+      -c | -C | --git-dir | --work-tree | --config-env | --namespace | --exec-path | --attr-source) i=$((i + 2)) ;;
+      -*) i=$((i + 1)) ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$XF_END" ]; then
+    [ "$XF_APPEND" -eq 0 ] || deny_xargs_filled "git" "its subcommand"
+    return 0
+  fi
+  sub="${PFX_W[i]}"
+  if { [ "$XF_UNTRUSTED" -eq 0 ] && xf_filled "$sub"; } || [[ "$sub" == *'{}'* ]]; then
+    deny_xargs_filled "git" "its subcommand"
+  fi
+  sub="${sub//[\"\'\\]/}"
+  [[ "$XF_GIT_SENSITIVE" == *" $sub "* ]] || return 0
+  xf_any_filled $((j + 1)) "$XF_END" || return 0
+  # A file restore: the filled words all after a literal `--`, and before it nothing, HEAD, or one
+  # commit when xargs never runs it with nothing after the `--` (a replace string and no appending,
+  # or a path written after it): `xargs git checkout develop --` with no input switches to develop.
+  if [ "$XF_UNTRUSTED" -eq 0 ] && { [ "$sub" = checkout ] || [ "$sub" = reset ]; }; then
+    for ((d = i + 1; d < XF_END; d++)); do
+      [ "${PFX_W[d]}" = -- ] && break
+    done
+    if [ "$d" -lt "$XF_END" ] && ! { [ -n "$XF_REPL" ] && xf_any_filled_no_append $((j + 1)) $((d + 1)); }; then
+      [ "$d" -eq $((i + 1)) ] && return 0
+      if [ "$d" -eq $((i + 2)) ] && [[ "${PFX_W[i + 1]}" != -* ]]; then
+        [ "${PFX_W[i + 1]}" = HEAD ] && return 0
+        [ "$XF_APPEND" -eq 0 ] && return 0
+        for ((k = d + 1; k < XF_END; k++)); do
+          xf_filled "${PFX_W[k]}" || return 0
+        done
+      fi
+    fi
+    deny_xargs_filled "git ${sub}" "the branch, commit or option" \
+      "to restore files, put them after a -- with nothing but HEAD before it: git diff --name-only | xargs git ${sub} --"
+  fi
+  deny_xargs_filled "git ${sub}" "the branch, ref or option"
+}
+# xf_any_filled_no_append <from> <to>: does the replace string stand in any word of [from, to)?
+xf_any_filled_no_append() {
+  local k
+  for ((k = $1; k < $2; k++)); do
+    xf_filled "${PFX_W[k]}" && return 0
+  done
+  return 1
+}
+xf_gh() {
+  local j="$1" i p1="" p2="" i1=-1 w write=0 lead=0
+  for ((i = j + 1; i < XF_END; i++)); do
+    w="${PFX_W[i]//[\"\'\\]/}"
+    case "$w" in
+      -R | --repo | --hostname | -H | --header | -q | --jq | -t | --template | --cache | -p | --preview) i=$((i + 1)) ;;
+      -X | --method | -f | -F | --field | --raw-field | --input)
+        write=1
+        i=$((i + 1))
+        ;;
+      -X* | --method=* | -f* | -F* | --field=* | --raw-field=* | --input=*) write=1 ;;
+      -*) ;;
+      *)
+        if [ -z "$p1" ]; then p1="${PFX_W[i]}" i1=$i
+        elif [ -z "$p2" ]; then p2="${PFX_W[i]}"
+        fi
+        ;;
+    esac
+    if [ -n "$XF_REPL" ] && [[ "$w" == "$XF_REPL"* ]]; then lead=1; fi
+  done
+  if [ -z "$p1" ]; then
+    [ "$XF_APPEND" -eq 0 ] || deny_xargs_filled "gh" "its subcommand"
+    return 0
+  fi
+  if { [ "$XF_UNTRUSTED" -eq 0 ] && xf_filled "$p1"; } || [[ "$p1" == *'{}'* ]]; then
+    deny_xargs_filled "gh" "its subcommand"
+  fi
+  p1="${p1//[\"\'\\]/}"
+  case "$p1" in
+    pr)
+      if [ -z "$p2" ]; then
+        [ "$XF_APPEND" -eq 0 ] || deny_xargs_filled "gh pr" "its subcommand"
+        return 0
+      fi
+      if { [ "$XF_UNTRUSTED" -eq 0 ] && xf_filled "$p2"; } || [[ "$p2" == *'{}'* ]]; then
+        deny_xargs_filled "gh pr" "its subcommand"
+      fi
+      if [ "${p2//[\"\'\\]/}" = merge ] && xf_any_filled $((j + 1)) "$XF_END"; then
+        deny_xargs_filled "gh pr merge" "the PR or option"
+      fi
+      ;;
+    api)
+      # Appended words may be options (`-X PUT`), and so may a word that starts with the replace
+      # string; a call that writes is judged by its path, which then holds what xargs reads.
+      if [ "$XF_APPEND" -eq 1 ] || [ "$lead" -eq 1 ] || { [ "$write" -eq 1 ] && xf_any_filled $((i1 + 1)) "$XF_END"; }; then
+        deny_xargs_filled "gh api" "the endpoint or option" "a read (no -X, -f, -F, --input) may take its path from the replace string: xargs -I{} gh api repos/o/r/issues/{}"
+      fi
+      ;;
+  esac
+  return 0
+}
+# A shell launched by xargs runs a script whose text it fills in: the replace string inside it, or
+# what it appends read as "$1", "$@"… (`xargs -I{} sh -c 'git branch -D {}'`). The script is also
+# judged as a command of its own, but there the filled word reads as written. So a script that
+# holds what xargs fills in and runs a git command of XF_GIT_SENSITIVE, `gh pr merge` or a `gh api`
+# that writes (a method or a field among its words) is denied, whatever the rest of the script (read as text: a rough reading, on the safe side).
+XF_SHELL_GIT_RE='(^|[^[:alnum:]_./-])git([[:space:]]+[^[:space:];&|]+)*[[:space:]]+(push|send-pack|branch|merge|checkout|switch|reset|update-ref)([^[:alnum:]_-]|$)'
+XF_SHELL_GH_RE='(^|[^[:alnum:]_./-])gh([[:space:]]+[^[:space:];&|]+)*[[:space:]]+pr[[:space:]]+merge([^[:alnum:]_-]|$)'
+# A gh api call that writes: a method or a field among its words.
+XF_SHELL_API_RE='(^|[^[:alnum:]_./-])gh([[:space:]]+[^[:space:];&|]+)*[[:space:]]+api([[:space:]]+[^[:space:];&|]+)*[[:space:]]+(-X|--method|-f|-F|--field|--raw-field|--input)'
+
+xf_shell() {
+  local j="$1" text="" k
+  for ((k = j + 1; k < XF_END; k++)); do text+=" ${PFX_RAW[k]:-${PFX_W[k]}}"; done
+  [[ "$text" =~ $XF_SHELL_GIT_RE || "$text" =~ $XF_SHELL_GH_RE || "$text" =~ $XF_SHELL_API_RE ]] || return 0
+  if [ "$XF_UNTRUSTED" -eq 1 ] || { [ -n "$XF_REPL" ] && [[ "$text" == *"$XF_REPL"* ]]; } ||
+    { [ "$XF_APPEND" -eq 1 ] && [[ "$text" =~ \$(\{?[1-9@*]) ]]; }; then
+    deny_xargs_filled "the script that xargs or parallel runs (${PFX_W[j]} …)" "a word of its git or gh command" "a script that holds no {} and no \"\$1\" runs as written"
+  fi
+  return 0
+}
+xf_env() {
+  local j="$1" i w
+  i=$((j + 1))
+  while [ "$i" -lt "$XF_END" ]; do
+    w="${PFX_W[i]}"
+    case "$w" in
+      -u | --unset | -C | --chdir) i=$((i + 2)) ;;
+      -S* | --split-string*)
+        xf_filled "$w" && deny_xargs_filled "env" "its assignments" "write the assignments in the command (env NAME=value <command>)"
+        i=$((i + 1))
+        break
+        ;;
+      -*) i=$((i + 1)) ;;
+      *=*)
+        xf_filled "$w" && deny_xargs_filled "env" "its assignments" "write the assignments in the command (env NAME=value <command>)"
+        i=$((i + 1))
+        ;;
+      *) break ;;
+    esac
+  done
+  if [ "$i" -ge "$XF_END" ]; then
+    [ "$XF_APPEND" -eq 0 ] || deny_xargs_filled "env" "its assignments and its command" "write the assignments and the command in the command (env NAME=value <command>)"
+    return 0
+  fi
+  if [ "$XF_UNTRUSTED" -eq 0 ] && xf_filled "${PFX_W[i]}"; then
+    deny_xargs_filled "env" "its assignments and its command" "write the assignments and the command in the command (env NAME=value <command>)"
+  fi
+  return 0
+}
+
 SEG_XARGS=0
 SEG_REPL=""
 SEG_APPEND=0
@@ -5263,6 +8358,7 @@ check_segment() {
   SEG_XARGS=$PFX_XARGS
   SEG_REPL=$PFX_REPL
   SEG_APPEND=$PFX_APPEND
+  check_xargs_filled
   # Before the command word is cut out: an assignment can be the whole segment.
   check_ci_identity_prefix
   if [ "$PFX_END" -ge "${#tok[@]}" ]; then
@@ -5325,13 +8421,16 @@ check_segment() {
       fi
       [ "$PARTIAL" -eq 1 ] && target=""
       SEG_CDS+=("${SEG_POS_O}"$'\t'"${SEG_POS_P}"$'\t'"${cmd0}"$'\t'"${target}")
+      CDS_SEEN=1
       ;;
     popd)
       # `popd +N`, `popd -n`… do not return to the top of the stack: not followed.
       if [ "${#tok[@]}" -gt 1 ]; then
         SEG_CDS+=("${SEG_POS_O}"$'\t'"${SEG_POS_P}"$'\tcd\t')
+        CDS_SEEN=1
       else
         SEG_CDS+=("${SEG_POS_O}"$'\t'"${SEG_POS_P}"$'\tpopd\t')
+        CDS_SEEN=1
       fi
       ;;
   esac
@@ -5341,6 +8440,7 @@ check_segment() {
 
   case "$cmd0" in
     git) check_git ;;
+    git-*) check_git_dashed "$cmd0" ;;
     gh) check_gh ;;
     curl | wget) check_egress ;;
     find) check_find_exec ;;
@@ -5363,6 +8463,7 @@ check_segment() {
   case "$cmd0" in
     cp | mv | rm | tee | sed) check_generated_write "$cmd0" ;;
   esac
+  note_maker "$cmd0"
 
   return 0
 }
@@ -5374,17 +8475,21 @@ check_segment() {
 # segment runs later (a `gh alias set` expansion, parallel's inputs, a command word read again), never
 # reads one, so no text inside a command can stand for one (found 2026-10-03, verifying this change).
 SEG_POS_RE='^([0-9]+(\.[0-9]+)*|!)\ (/[0-9.qhvc/]*)$'
+# The lines being judged and the index of the one at hand stay visible to the rules it calls, as
+# JS_LINES and JS_IDX (bash's dynamic scope: an inner call has its own): check_git_branch reads the
+# segment after its own when the extractor cut it at a `>&` (see seg_continuation).
 judge_segments() {
-  local line
-  local -a lines=()
+  local line JS_IDX
+  local -a JS_LINES=()
   if [ "$1" = "${SEGMENTS:-}" ]; then
     segment_lines
-    lines=(${SEGMENT_LINES[@]+"${SEGMENT_LINES[@]}"})
+    JS_LINES=(${SEGMENT_LINES[@]+"${SEGMENT_LINES[@]}"})
   else
     lines_of "$1"
-    lines=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
+    JS_LINES=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
   fi
-  for line in ${lines[@]+"${lines[@]}"}; do
+  for ((JS_IDX = 0; JS_IDX < ${#JS_LINES[@]}; JS_IDX++)); do
+    line="${JS_LINES[JS_IDX]}"
     check_deadline
     if [[ "$line" == $'\x01'* ]] && [[ "${line#$'\x01'}" =~ $SEG_POS_RE ]]; then
       SEG_POS_O="${BASH_REMATCH[1]}"
@@ -5441,8 +8546,11 @@ if (typeof cmd !== "string" || cmd.trim() === "") process.exit(0);
 //     fails CLOSED: the body is analyzed;
 //   * a heredoc inside `$( … )` / `<( … )` / backticks reaches a shell when the enclosing
 //     command is `eval`, `.`/`source`, or a shell (`bash -c "$(cat <<EOF …)"`);
-//   * interpreters that are not shells (python, node, psql, make) are not parsed — the guard
-//     never read them, and a script file would carry the same text. Documented residual risk.
+//   * a body an interpreter that is not a shell reads as its program (`python3 - <<EOF`, `node
+//     <<EOF`, `awk -f - <<EOF`, `make -f - <<EOF`) is read as that interpreter's -c text is: a
+//     quoted span, every rule over it (#376, see heredocInterp); the script of `sed -f -` is
+//     denied when it runs a command (see sedRunsCommands). The guard still never reads a script
+//     file, and a script file would carry the same text. Documented residual risk.
 // A kept body goes through the same treatment recursively (a heredoc inside it feeds a shell
 // or not by the same rule), depth-capped so a pathological nesting cannot hang the hook.
 // The lookaround in the operator regex avoids confusing here-strings (<<<) with heredocs; a
@@ -5514,6 +8622,7 @@ function tokenize(str) {
 
   function readWord() {
     let text = "", hasExpansion = false, quoted = false, qstart = false;
+    const ansi = [];
     const w0 = i;
     while (i < n) {
       const c = str[i];
@@ -5532,6 +8641,17 @@ function tokenize(str) {
         continue;
       }
       if (c === "\\" && i + 1 < n) { text += str[i + 1]; i += 2; continue; }
+      if (c === "$" && str[i + 1] === "'") {
+        // $'…': text as before 2.29.0 (`$` and the escapes as written, an expansion, so every reading
+        // of the word stays as strict as it was); dtext, with its escapes decoded, is what
+        // wordScripts reads (#390).
+        const a = ansiC(str, i + 2);
+        const raw = str.slice(i + 2, Math.max(i + 2, a.end - 1));
+        ansi.push([text.length, raw.length + 1, a.text]);
+        hasExpansion = true; quoted = true;
+        text += "$" + raw; i = a.end;
+        continue;
+      }
       if (c === "$" || c === "`") {
         hasExpansion = true;
         if (c === "$" && str[i + 1] === "(") { i = skipParens(i + 1); continue; }
@@ -5540,7 +8660,9 @@ function tokenize(str) {
       }
       text += c; i++;
     }
-    return { text, hasExpansion, quoted, qstart };
+    let dtext = text;
+    for (let k = ansi.length - 1; k >= 0; k--) dtext = dtext.slice(0, ansi[k][0]) + ansi[k][2] + dtext.slice(ansi[k][0] + ansi[k][1]);
+    return { text, hasExpansion, quoted, qstart, dtext };
   }
   function skipParens(at) {                                        // at points at "(": index past the matching ")"
     let depth = 0, j = at, q = null;
@@ -5553,6 +8675,66 @@ function tokenize(str) {
     }
     return n;
   }
+}
+
+// The text of a $'…' quote whose body starts at i, as bash decodes it, and the index past its
+// closing quote: `\x20`, `\t`, `\040`, `\u0020` are the blanks they write, so the word `bash -c
+// $'git\x20push --force origin develop'` runs is read as the push it is (#390); until then its text
+// was the escapes as written and the command word `git\x20push`. A NUL ends the word, as in bash.
+const ANSI_SIMPLE = { a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+function ansiC(s, i) {
+  const n = s.length;
+  let t = "", m;
+  while (i < n && s[i] !== "'") {
+    if (s[i] !== "\\" || i + 1 >= n) { t += s[i++]; continue; }
+    const e = s[i + 1];
+    i += 2;
+    if (Object.prototype.hasOwnProperty.call(ANSI_SIMPLE, e)) { t += ANSI_SIMPLE[e]; continue; }
+    if (e >= "0" && e <= "7") {
+      m = /^[0-7]{0,2}/.exec(s.slice(i, i + 2));
+      t += String.fromCharCode(parseInt(e + m[0], 8) & 0xff); i += m[0].length; continue;
+    }
+    if (e === "x" && (m = /^[0-9A-Fa-f]{1,2}/.exec(s.slice(i, i + 2)))) { t += String.fromCharCode(parseInt(m[0], 16)); i += m[0].length; continue; }
+    if ((e === "u" || e === "U") && (m = (e === "u" ? /^[0-9A-Fa-f]{1,4}/ : /^[0-9A-Fa-f]{1,8}/).exec(s.slice(i, i + 8)))) {
+      const cp = parseInt(m[0], 16);
+      if (cp <= 0x10ffff) t += String.fromCodePoint(cp);
+      i += m[0].length; continue;
+    }
+    if (e === "c" && i < n) { const x = s[i++]; t += x === "?" ? "\x7f" : String.fromCharCode(x.toUpperCase().charCodeAt(0) & 0x1f); continue; }
+    t += "\\" + e;
+  }
+  const z = t.indexOf("\0");
+  return { text: z >= 0 ? t.slice(0, z) : t, end: Math.min(n, i + 1) };
+}
+
+// The option of su or runuser that takes the command they run, as getopt reads it: -c alone, in a
+// cluster or with the command attached (`-lc`, `-c'…'`), --command and --session-command, abbreviated
+// or not, with the command after `=` or in the next word. Until #390 only the words `-c` and
+// `--command` were, and `su --command=…` ran a push no rule read. Loose on purpose: any cluster
+// with a c counts (in `-sc` the c is -s's value), which reads more as a command, never less.
+// { value } when the command is in the word, { next: true } when it is the next word, or null.
+function suCommandOpt(t) {
+  let m = /^--([A-Za-z-]+)(?:=([\s\S]*))?$/.exec(t);
+  if (m) {
+    const o = m[1];
+    if (!("command".startsWith(o) || (o.length >= 2 && "session-command".startsWith(o)))) return null;
+    return m[2] === undefined ? { next: true } : { value: m[2] };
+  }
+  m = /^-[A-Za-z]*?c([\s\S]*)$/.exec(t);
+  if (!m) return null;
+  return m[1] ? { value: m[1] } : { next: true };
+}
+// The commands su's or runuser's words (after the program's name) give it: [{ word, text }], word
+// the one that holds the text. getopt reads options among the user's name and after `--` too.
+function suCommands(rest) {
+  const acc = [];
+  for (let k = 0; k < rest.length; k++) {
+    const o = suCommandOpt(rest[k].dtext);
+    if (!o) continue;
+    if (o.value !== undefined) acc.push({ word: rest[k], text: o.value });
+    else if (k + 1 < rest.length) { acc.push({ word: rest[k + 1], text: rest[k + 1].dtext }); k++; }
+  }
+  return acc;
 }
 
 // Lexer over one logical line. Calls cb(j, tok, depth, frameStart) for every character outside
@@ -5714,9 +8896,13 @@ function wordsFeedShell(words, depth) {
     return anyFeedsShell(commandLineOf(cmd), depth + 1);
   }
   if (name === "su") {
+    // Only `-c CMD` / `--command CMD` can make a body data (as before 2.29.0), and then also each
+    // command suCommands reads must not feed a shell. Any other form (`--command=cat`, `-lc cat`)
+    // keeps the body as code: loosening that is the owner's decision (#390).
     const c = rest.findIndex((a) => a.text === "-c" || a.text === "--command");
-    if (c >= 0 && rest[c + 1]) return (rest[c + 1].hasExpansion && rest[c + 1].text === "") ? true : anyFeedsShell(rest[c + 1].text, depth + 1);
-    return true;                                                     // `su`, `su -`, `su - user`: a shell on stdin
+    if (c < 0 || !rest[c + 1]) return true;                          // `su`, `su -`, `su - user`: a shell on stdin
+    if ((rest[c + 1].hasExpansion && rest[c + 1].text === "") || anyFeedsShell(rest[c + 1].text, depth + 1)) return true;
+    return suCommands(rest).some((x) => x.word.hasExpansion || anyFeedsShell(x.text, depth + 1));
   }
   if (name === "sudo" || name === "doas") {
     const cmd = skipFlags(name, rest);
@@ -5724,6 +8910,8 @@ function wordsFeedShell(words, depth) {
     return sudoWantsShell(name, rest);                               // `sudo -s` / `sudo -i` / `doas -s` alone
   }
   if (name === "runuser") {
+    // As su above: the reading before 2.29.0, and each command suCommands reads on top of it.
+    if (suCommands(rest).some((x) => x.word.hasExpansion || anyFeedsShell(x.text, depth + 1))) return true;
     const c = rest.findIndex((a) => a.text === "-c" || a.text === "--command");
     if (c >= 0 && rest[c + 1]) return (rest[c + 1].hasExpansion && rest[c + 1].text === "") ? true : anyFeedsShell(rest[c + 1].text, depth + 1);
     const hasU = rest.some((a) => a.text === "-u" || a.text === "--user");
@@ -5865,6 +9053,357 @@ function consumesScript(words) {
   return name === "eval" || name === "." || name === "source" || SHELLS.has(name);
 }
 
+// --- A heredoc that is another language's program (#376) --------------------------------------
+// The guard reads the quoted text of `python3 -c "…"` as a possible command (as every quoted span,
+// see splitSegments), but read a heredoc fed to the same interpreter (`python3 - <<'EOF'`) as data:
+// the same program, judged one way and not the other. A body an interpreter that is not a shell
+// reads as its program is read now as its `-c` text is: as a quoted span, every rule over it, the
+// deny of a text that names a forbidden command included (owner's decision of 2026-10-14: a
+// stricter guard is the agent's call). A script FILE (`python3 x.py`) is still not read, and a body
+// fed to a script (`python3 x.py <<EOF`) is that script's data.
+// Per interpreter, read from its words: the options whose value is the program (then the body is
+// data), the ones whose value is a script file (the body is the program when that file is stdin),
+// the ones that take a value, and what the first word that is not an option is: the script (the
+// body is data unless it is `-` or /dev/stdin), the program (awk), or something else (a database).
+// With none of those the interpreter reads its program from stdin. A word the shell fills in where
+// the guard needs to know which it is reads as stdin: closed.
+const INTERPS = {
+  python: { prog: "cm", val: "WX", lval: ["--check-hash-based-pycs"], pos: "script" },
+  node: { prog: "ep", lprog: ["--eval", "--print"], val: "rC", lval: ["--require", "--import", "--loader", "--experimental-loader", "--conditions", "--input-type", "--title"], pos: "script" },
+  perl: { prog: "eE", val: "I", pos: "script" },
+  ruby: { prog: "e", val: "IrCE", pos: "script" },
+  php: { prog: "rBRE", file: "fF", val: "cdz", pos: "script" },
+  lua: { prog: "e", val: "l", pos: "script" },
+  Rscript: { prog: "e", pos: "script" },
+  R: { prog: "e", file: "f", lfile: ["--file"], pos: "other" },
+  tclsh: { pos: "script" },
+  expect: { file: "f", val: "c", pos: "script" },
+  osascript: { prog: "e", val: "ls", pos: "script" },
+  jshell: { pos: "script" },
+  julia: { prog: "eE", val: "LJ", pos: "script" },
+  ghci: { pos: "other" },
+  irb: { val: "Ir", pos: "script" },
+  deno: { pos: "other" },
+  bun: { prog: "e", lprog: ["--eval", "--print"], pos: "other" },
+  psql: { prog: "c", lprog: ["--command"], file: "f", lfile: ["--file"], val: "dhpUvoLTPFR", pos: "other" },
+  mysql: { prog: "e", lprog: ["--execute"], val: "uhPDS", pos: "other" },
+  sqlite3: { pos: "other" },
+  awk: { prog: "e", lprog: ["--source"], file: "f", lfile: ["--file"], val: "vFil", lval: ["--assign", "--field-separator", "--include", "--load"], pos: "program" },
+  make: { file: "f", lfile: ["--file", "--makefile"], val: "CIjlLoW", lval: ["--directory", "--include-dir", "--jobs", "--load-average", "--old-file", "--what-if", "--assume-old", "--assume-new", "--new-file"], pos: "other", stdinOnly: true },
+};
+const INTERP_ALIAS = { nodejs: "node", luajit: "lua", wish: "tclsh", mariadb: "mysql", gawk: "awk", mawk: "awk", nawk: "awk", gmake: "make", pypy: "python" };
+function interpName(word) {
+  const b = basename(word).replace(/^(python|pypy|perl|php|lua|ruby)[0-9.]*$/, "$1");
+  return INTERPS[b] ? b : INTERP_ALIAS[b] || null;
+}
+
+// Does the interpreter `name`, invoked with these arguments, read its program from stdin?
+function interpReadsStdin(name, args) {
+  const s = INTERPS[name];
+  const has = (set, x) => !!set && set.includes(x);
+  let sawFile = false;
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k], t = a.text;
+    if (a.hasExpansion && t === "") return true;
+    if (t === "--") {
+      const p = args[k + 1];
+      if (s.pos === "script" && !sawFile) return !p || scriptArgIsStdin(p);
+      break;
+    }
+    if (t === "-") return true;
+    if (t.startsWith("--")) {
+      const eq = t.indexOf("="), opt = eq < 0 ? t : t.slice(0, eq);
+      if (has(s.lprog, opt)) return false;
+      if (has(s.lfile, opt)) {
+        const v = eq < 0 ? args[++k] : { text: t.slice(eq + 1), hasExpansion: a.hasExpansion };
+        if (!v || scriptArgIsStdin(v) || (v.hasExpansion && /\$/.test(v.text))) return true;
+        sawFile = true;
+        continue;
+      }
+      if (eq < 0 && has(s.lval, opt)) k++;
+      continue;
+    }
+    if (t.startsWith("-") && t.length > 1) {
+      for (let j = 1; j < t.length; j++) {
+        const L = t[j];
+        if (has(s.prog, L)) return false;
+        if (has(s.file, L)) {
+          const v = j + 1 < t.length ? { text: t.slice(j + 1), hasExpansion: a.hasExpansion } : args[++k];
+          if (!v || scriptArgIsStdin(v)) return true;
+          sawFile = true;
+          break;
+        }
+        if (has(s.val, L)) { if (j + 1 === t.length) k++; break; }
+      }
+      continue;
+    }
+    if (s.pos === "script" && !sawFile) return scriptArgIsStdin(a);
+    if (s.pos === "program" && !sawFile) return false;
+  }
+  if (s.stdinOnly) return false;
+  return name === "awk" ? false : !sawFile;
+}
+
+// The interpreter a simple command hands its stdin to as a program, unwrapped as wordsFeedShell
+// unwraps a shell (sudo, env, nice, timeout, ssh's remote command, a container's), or "sed" for a
+// sed whose script is stdin (`sed -f -`, see sedReadsStdin), or null.
+function wordsFeedInterp(words, depth) {
+  if (depth > 12) return null;
+  let i = 0;
+  while (i < words.length && ((RESERVED.has(words[i].text) && !words[i].quoted) || (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i].text) && !words[i].qstart))) i++;
+  if (i >= words.length) return null;
+  const w0 = words[i], rest = words.slice(i + 1), name = basename(w0.text);
+  if (name === "sed" || name === "gsed") return sedArgs(rest).stdin ? "sed" : null;
+  const ip = interpName(w0.text);
+  if (ip) return interpReadsStdin(ip, rest) ? ip : null;
+  if (name === "ssh") {
+    const r = skipFlags("ssh", rest).slice(1);
+    return r.length ? anyFeedsInterp(commandLineOf(r), depth + 1) : null;
+  }
+  if (name === "su" || name === "runuser") {
+    for (const x of suCommands(rest)) { const f = anyFeedsInterp(x.text, depth + 1); if (f) return f; }
+    return null;
+  }
+  if (name === "env") {
+    const sIdx = rest.findIndex((a) => a.text === "-S" || a.text === "--split-string");
+    if (sIdx >= 0 && rest[sIdx + 1]) return anyFeedsInterp(rest[sIdx + 1].text, depth + 1);
+  }
+  if (name === "sudo" || name === "doas" || WRAPPERS.has(name)) {
+    let r = skipFlags(name, rest);
+    if (name === "env") { while (r.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(r[0].text) && !r[0].qstart) r = r.slice(1); }
+    if (name === "timeout" || name === "chroot" || name === "flock") r = r.slice(1);
+    return r.length ? wordsFeedInterp(r, depth + 1) : null;
+  }
+  if (CONTAINERS.has(name)) {
+    for (let k = 0; k < rest.length; k++) {
+      if (rest[k].quoted) continue;
+      const f = interpName(rest[k].text);
+      if (f) return interpReadsStdin(f, rest.slice(k + 1)) ? f : null;
+    }
+  }
+  return null;
+}
+function anyFeedsInterp(text, depth) {
+  for (const part of splitList(text)) { const f = wordsFeedInterp(tokenize(part), depth); if (f) return f; }
+  return null;
+}
+
+// Which interpreter reads the heredoc body at `at` of the line as its program (see heredocFeed for
+// a shell): the stage that owns it or a later one of its pipeline (`cat <<EOF | python3`), the
+// command a substitution around it is an argument of (`python3 -c "$(cat <<EOF…)"`, `node <(cat
+// <<EOF…)`), or a later stage of the pipeline around a group that holds it. Called only for a body
+// no shell reads.
+function heredocInterp(line, at) {
+  const { stages, idx, frame } = pipelineAround(line, at);
+  for (let k = idx; k < stages.length; k++) { const f = wordsFeedInterp(tokenize(stages[k]), 0); if (f) return f; }
+  for (let fr = frame, d = 0; fr && d < 12; d++) {
+    const outer = pipelineAround(line, fr.start);
+    if (fr.kind === "$(") {
+      const head = tokenize(outer.stages[outer.idx].slice(0, Math.max(0, fr.start - outer.starts[outer.idx])));
+      if (head.some((w) => !w.quoted && interpName(w.text))) return "subst";
+    }
+    for (let k = outer.idx + 1; k < outer.stages.length; k++) { const f = wordsFeedInterp(tokenize(outer.stages[k]), 0); if (f) return f; }
+    fr = outer.frame;
+  }
+  return null;
+}
+
+// --- GNU sed's `e` (#376) ----------------------------------------------------------------------
+// A sed script runs a command with GNU sed's `e` command (`1e git push …`) or the `e` flag of `s`
+// (`s/.*/git push …/e`), which runs the pattern space. Neither was judged: the guard read the script
+// as text. Wherever the script comes from (a word of the command, -e, -f FILE, a heredoc to `sed -f
+// -`), one that holds either is denied (exit 4, see guard_judge), unless the command has --sandbox,
+// which makes sed refuse them. A script the guard cannot read (a -f file it cannot open, one the
+// same command may write first, or stdin that is not a heredoc) is denied too.
+// sedArgs: the scripts and script files of sed's arguments, as GNU sed reads them (options anywhere,
+// clusters, -e/-f/-l taking the rest of the word or the next one, -i the rest of its word).
+function sedArgs(args) {
+  const scripts = [], files = [], pos = [];
+  let sandbox = false, stdin = false, ends = false;
+  for (let k = 0; k < args.length; k++) {
+    const a = args[k], t = a.text;
+    if (ends || !t.startsWith("-") || t === "-") { pos.push(a); continue; }
+    if (t === "--") { ends = true; continue; }
+    if (t.startsWith("--")) {
+      const eq = t.indexOf("="), opt = eq < 0 ? t : t.slice(0, eq);
+      const val = () => (eq < 0 ? args[++k] : { text: t.slice(eq + 1), hasExpansion: a.hasExpansion });
+      if (opt === "--sandbox") sandbox = true;
+      else if (opt === "--expression") { const v = val(); if (v) scripts.push(v); }
+      else if (opt === "--file") { const v = val(); if (v) files.push(v); }
+      else if (opt === "--line-length" && eq < 0) k++;
+      continue;
+    }
+    for (let j = 1; j < t.length; j++) {
+      const L = t[j];
+      if (L === "i") break;
+      if (L === "e" || L === "f" || L === "l") {
+        const v = j + 1 < t.length ? { text: t.slice(j + 1), hasExpansion: a.hasExpansion } : args[++k];
+        if (v && L === "e") scripts.push(v);
+        if (v && L === "f") files.push(v);
+        break;
+      }
+    }
+  }
+  if (!scripts.length && !files.length && pos.length) scripts.push(pos[0]);
+  for (const f of files) if (scriptArgIsStdin(f)) stdin = true;
+  return { scripts, files, sandbox, stdin };
+}
+
+// Does this sed script run a command: an `e` command, or an `s` with the `e` flag? Read as GNU sed
+// compiles it: addresses (numbers, $, first~step, /re/ and \cREc with I/M, a second one after a
+// comma, `!`), commands up to `;` or a newline, `{ }`, comments, labels and b/t/T up to `;`, the text
+// of a/i/c and the file of r/R/w/W to the end of the line, the regex of an address or of s and y read
+// with its bracket expressions (`s/[/]/x/` is one s). A script sed would reject (an unterminated s)
+// runs nothing.
+function sedRunsCommands(s) {
+  const n = s.length;
+  let i = 0;
+  const ws = () => { while (i < n && (s[i] === " " || s[i] === "\t")) i++; };
+  const toEol = () => { while (i < n && s[i] !== "\n") i++; };
+  const toSemi = () => { while (i < n && s[i] !== "\n" && s[i] !== ";") i++; };
+  // From just past the opening delimiter to just past the closing one; false if it does not close.
+  const regex = (d) => {
+    while (i < n && s[i] !== d) {
+      if (s[i] === "\n") return false;
+      if (s[i] === "\\") { i += 2; continue; }
+      if (s[i] === "[") {
+        let j = i + 1;
+        if (s[j] === "^") j++;
+        if (s[j] === "]") j++;
+        while (j < n && s[j] !== "]" && s[j] !== "\n") {
+          if (s[j] === "[" && (s[j + 1] === ":" || s[j + 1] === "." || s[j + 1] === "=")) {
+            const e = s.indexOf(s[j + 1] + "]", j + 2);
+            j = e < 0 ? j + 1 : e + 2;
+            continue;
+          }
+          j++;
+        }
+        if (j < n && s[j] === "]") { i = j + 1; continue; }
+      }
+      i++;
+    }
+    if (i >= n) return false;
+    i++;
+    return true;
+  };
+  const address = () => {
+    if (s[i] === "/" || (s[i] === "\\" && i + 1 < n)) {
+      const d = s[i] === "/" ? "/" : s[i + 1];
+      i += s[i] === "/" ? 1 : 2;
+      if (!regex(d)) return false;
+      while (i < n && (s[i] === "I" || s[i] === "M")) i++;
+      return true;
+    }
+    while (i < n && /[0-9$~+]/.test(s[i])) i++;
+    return true;
+  };
+  for (let guard = 0; i < n && guard < 100000; guard++) {
+    while (i < n && /[\s;]/.test(s[i])) i++;
+    if (i >= n) break;
+    if (!address()) return false;
+    ws();
+    if (s[i] === ",") { i++; ws(); if (!address()) return false; ws(); }
+    while (s[i] === "!") { i++; ws(); }
+    const c = s[i++];
+    switch (c) {
+      case "e": return true;
+      case "#": toEol(); break;
+      case ":": case "b": case "t": case "T": case "v": toSemi(); break;
+      case "r": case "R": case "w": case "W": toEol(); break;
+      case "a": case "i": case "c":
+        for (;;) {
+          toEol();
+          let b = 0;
+          while (b < i && s[i - 1 - b] === "\\") b++;
+          if (b % 2 === 1 && i < n) { i++; continue; }
+          break;
+        }
+        break;
+      case "s": {
+        const d = s[i++];
+        if (d === undefined || d === "\n" || d === "\\") return false;
+        if (!regex(d)) return false;
+        while (i < n && s[i] !== d) i += s[i] === "\\" ? 2 : 1;
+        if (i >= n) return false;
+        i++;
+        while (i < n) {
+          if (s[i] === "e") return true;
+          if (s[i] === "w") { toEol(); break; }
+          if (/[gpiImM0-9]/.test(s[i])) { i++; continue; }
+          break;
+        }
+        break;
+      }
+      case "y": {
+        const d = s[i++];
+        if (d === undefined || d === "\n" || d === "\\") return false;
+        for (let part = 0; part < 2; part++) {
+          while (i < n && s[i] !== d) { if (s[i] === "\n") return false; i += s[i] === "\\" ? 2 : 1; }
+          if (i >= n) return false;
+          i++;
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+  return false;
+}
+
+// Does this segment run a sed whose script runs a command, or one the guard cannot read? Every sed
+// word in it counts (`sudo sed`, `xargs sed`, `find … -exec sed`), its arguments up to a `;` or `+`
+// of find. A -f file is read from the session's directory (cwd), when it is a regular file of at
+// most 256 KiB, the command moves no directory before it (no cd, pushd or popd in it) and names it
+// nowhere else (it may write it first).
+let SED_EXEC = false;
+const SESSION_CWD = data && typeof data.cwd === "string" && data.cwd ? data.cwd : process.cwd();
+function sedSegmentRuns(seg) {
+  if (!/(^|[\s/])g?sed(\s|$)/.test(seg)) return false;
+  const words = tokenize(seg);
+  // The command word, past wrappers (sudo, env, timeout…); a sed after it counts only when that is
+  // sed, or a command that runs another (xargs, parallel, find -exec, watch). A sed among other
+  // words (`for b in grep sed head`) is a word, not a command.
+  let cw = 0;
+  while (cw < words.length && ((RESERVED.has(words[cw].text) && !words[cw].quoted) || (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[cw].text) && !words[cw].qstart))) cw++;
+  for (let d = 0; d < 12 && cw < words.length; d++) {
+    const name = basename(words[cw].text);
+    if (name !== "sudo" && name !== "doas" && !WRAPPERS.has(name)) break;
+    let r = skipFlags(name, words.slice(cw + 1));
+    if (name === "env") { while (r.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(r[0].text) && !r[0].qstart) r = r.slice(1); }
+    if (name === "timeout" || name === "chroot" || name === "flock") r = r.slice(1);
+    cw = words.length - r.length;
+  }
+  if (cw >= words.length) return false;
+  const runner = ["xargs", "parallel", "find", "watch"].includes(basename(words[cw].text));
+  for (let k = cw; k < words.length; k++) {
+    const nm = basename(words[k].text);
+    if ((nm !== "sed" && nm !== "gsed") || words[k].hasExpansion) continue;
+    if (k !== cw && !runner) continue;
+    let e = k + 1;
+    while (e < words.length && words[e].text !== ";" && words[e].text !== "+") e++;
+    const a = sedArgs(words.slice(k + 1, e));
+    if (a.sandbox) continue;
+    if (a.scripts.some((w) => sedRunsCommands(w.text))) return true;
+    for (const f of a.files) {
+      if (scriptArgIsStdin(f)) {
+        // A heredoc's body is read where splitHeredocs takes it out; any other stdin cannot be read.
+        if (!/(^|[^<])<<-?[ \t]*[A-Za-z_"'\\]/.test(seg)) return true;
+        continue;
+      }
+      if (f.hasExpansion || /[*?[]/.test(f.text) || /(^|[\s;&|(])(cd|pushd|popd)(\s|$)/.test(cmd)) return true;
+      const p = require("path").resolve(SESSION_CWD, f.text.replace(/^~(?=\/|$)/, process.env.HOME || "~"));
+      if (cmd.split(f.text).length > 2) return true;
+      let st = null;
+      try { st = fs.statSync(p); } catch (err) { return true; }
+      if (!st.isFile() || st.size > 262144) return true;
+      let body = "";
+      try { body = fs.readFileSync(p, "utf8"); } catch (err) { return true; }
+      if (sedRunsCommands(body)) return true;
+    }
+  }
+  return false;
+}
+
 // Is the quoted word that starts after `head` (the words of its command written before it) a
 // script the shell runs, rather than an argument that may be data? It is when it is the -c string
 // of a shell (`bash -c '…'`, `sudo -u x sh -lc "…"`, `xargs -I{} sh -c '…'`, `find … -exec sh -c
@@ -5902,7 +9441,7 @@ function scriptSpan(head) {
     const name = basename(rest[0].text);
     if (name === "eval") return rest.length === 1 && "eval";
     if (name === "ssh") return skipFlags("ssh", rest.slice(1)).length === 1 && "shell";
-    if (name === "su" || name === "runuser") return (last.text === "-c" || last.text === "--command") && "shell";
+    if (name === "su" || name === "runuser") return !!suCommandOpt(last.text) && "shell";
     if (name === "sudo" || name === "doas" || WRAPPERS.has(name)) {
       let r = skipFlags(name, rest.slice(1));
       if (name === "env") { while (r.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(r[0].text) && !r[0].qstart) r = r.slice(1); }
@@ -5915,10 +9454,179 @@ function scriptSpan(head) {
   return false;
 }
 
-// Returns the text with every heredoc body removed, plus the bodies that feed a shell, and where
-// each operator whose body was removed stands in the text returned (see shellScopes).
+// The scripts a simple command hands to a shell, each read WHOLE, as the shell joins its word:
+// the word after a shell's -c (`bash -c …`, also after xargs, find -exec, sudo), eval's words
+// joined by blanks, the words an ssh destination runs, su's or runuser's -c. scriptSpan reads one
+// quoted span at a time, so a script word built from several pieces was read in pieces: in
+// `bash -c 'X'"="'1 git push --force origin develop'` the last piece starts at `1`, and the push
+// it runs reached no rule (#382). Neither did an unquoted one (`bash -c git\ push\ …`, `eval
+// X'=1 git push …'`). Each is returned as { text, kind } (kind "shell" or "eval", as scriptSpan).
+// What a substitution in the word would produce is not in its text (see tokenize): its body is
+// read on its own anyway.
+function wordScripts(seg) {
+  const words = tokenize(seg);
+  const acc = [];
+  const assign = (w) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w.text) && !w.qstart;
+  for (let j = 0; j < words.length; j++) {
+    if (!SHELLS.has(basename(words[j].text))) continue;
+    let k = j + 1, c = false;
+    for (; k < words.length; k++) {
+      const t = words[k].text;
+      if (t === "--") { k++; break; }
+      if (/^[-+][A-Za-z]*[oO]$/.test(t)) { if (t[0] === "-" && t.slice(0, -1).includes("c")) c = true; k++; continue; }  // -o pipefail
+      if (/^[-+][A-Za-z]+$/.test(t)) { if (t[0] === "-" && t.includes("c")) c = true; continue; }
+      if (/^--[A-Za-z][-A-Za-z]*$/.test(t)) continue;
+      break;
+    }
+    if (c && k < words.length) acc.push({ text: words[k].dtext, kind: "shell" });
+  }
+  let i = 0;
+  while (i < words.length && ((RESERVED.has(words[i].text) && !words[i].quoted) || assign(words[i]))) i++;
+  let rest = words.slice(i);
+  const join = (ws) => ws.map((w) => w.dtext).join(" ");
+  for (let d = 0; d < 12 && rest.length; d++) {
+    const name = basename(rest[0].text);
+    if (name === "eval") { acc.push({ text: join(rest.slice(1)), kind: "eval" }); break; }
+    if (name === "ssh") { const r = skipFlags("ssh", rest.slice(1)); acc.push({ text: join(r.slice(1)), kind: "shell" }); break; }
+    if (name === "su" || name === "runuser") {
+      for (const x of suCommands(rest.slice(1))) acc.push({ text: x.text, kind: "shell" });
+      break;
+    }
+    if (name === "sudo" || name === "doas" || WRAPPERS.has(name)) {
+      let r = skipFlags(name, rest.slice(1));
+      if (name === "env") { while (r.length && assign(r[0])) r = r.slice(1); }
+      if (name === "timeout" || name === "chroot" || name === "flock") r = r.slice(1);
+      rest = r;
+      continue;
+    }
+    break;
+  }
+  return acc.filter((a) => a.text.trim());
+}
+
+// The delimiter word of a heredoc, read from s at i the way bash reads it: the whole word up to a
+// blank or an operator, its quotes and backslashes taken out, and quoted when any part of it was
+// (`'EOF'`, `"EOF"`, `\EOF`, `E"OF"`): then bash expands nothing in the body. Until #382 only a
+// word whose first character opened its quote counted as quoted, and only the identifier part was
+// the delimiter: `<<E"OF"` and `<<'EO'F` ended at a line `E` or `EO` that never came, and
+// `<<EOF-X` at a line `EOF`, so the rest of the command was a body nobody read. null: no word, or
+// one whose quote does not close on its line.
+function heredocWord(s, i) {
+  let d = "", quoted = false;
+  while (i < s.length && !" \t\r\n;&|()<>".includes(s[i])) {
+    const c = s[i];
+    if (c === "\\" && i + 1 < s.length) { d += s[i + 1]; quoted = true; i += 2; continue; }
+    if (c === "'" || c === '"') {
+      const e = s.indexOf(c, i + 1);
+      // A quote that does not close on its line: no delimiter the guard can trust (the `<<` may
+      // stand inside a quoted argument, `f 'bash <<EOF'`), so the text after it is read as code.
+      if (e < 0 || s.slice(i + 1, e).includes("\n")) return null;
+      d += s.slice(i + 1, e); quoted = true; i = e + 1;
+      continue;
+    }
+    d += c; i++;
+  }
+  return d ? { d, quoted, end: i } : null;
+}
+
+// The command substitutions an UNQUOTED heredoc body runs (`$(…)` and backticks, nested ones in
+// their text): bash expands them while it reads the body, whatever command the body is for, so
+// `cat <<EOF` / `$(git push --force origin develop)` / `EOF` pushes (#382). Inside such a body only
+// a backslash quotes (`\$(…)` is text) and quotes are characters; inside `$(…)` the text is code
+// again, so its quotes are skipped while looking for the `)` that closes it. One that does not
+// close runs to the end of the body. `$((…))` is arithmetic: what is in it is still looked at.
+function heredocSubsts(body) {
+  const acc = [];
+  const n = body.length;
+  for (let i = 0; i < n; i++) {
+    const c = body[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "`") {
+      let j = i + 1;
+      while (j < n && body[j] !== "`") j += body[j] === "\\" ? 2 : 1;
+      acc.push(body.slice(i + 1, j).replace(/\\([\\`$])/g, "$1"));
+      i = j;
+      continue;
+    }
+    if (c === "$" && body[i + 1] === "(") {
+      if (body[i + 2] === "(") { i += 2; continue; }
+      // A comment (a `#` that starts a word) runs to the end of its line, and its `)` closes
+      // nothing: `$(#)` / `git push …` / `)` runs the push (#390). While a `case` is open its
+      // patterns' `)` close nothing either (`$(case a in a) git push …;; esac)`): every `(` and `)`
+      // is passed over up to its `esac`, and with no `esac` the substitution runs to the end of the
+      // body. A word read as `case` that is not one only makes the substitution read longer.
+      let depth = 1, j = i + 2, cases = 0;
+      const edge = (k) => k === i + 1 || /[\s;&|()]/.test(body[k]);
+      const kw = (k, w) => edge(k - 1) && body.startsWith(w, k) && (k + w.length >= n || /[\s;&|()]/.test(body[k + w.length]));
+      for (; j < n; j++) {
+        const d = body[j];
+        if (d === "\\") { j++; continue; }
+        if (d === "'") { const e = body.indexOf("'", j + 1); j = e < 0 ? n : e; continue; }
+        if (d === '"') { j++; while (j < n && body[j] !== '"') j += body[j] === "\\" ? 2 : 1; continue; }
+        if (d === "#" && edge(j - 1)) { const e = body.indexOf("\n", j); j = e < 0 ? n : e; continue; }
+        if (kw(j, "case")) { cases++; j += 3; continue; }
+        if (cases > 0) { if (kw(j, "esac")) { cases--; j += 3; } continue; }
+        if (d === "(") depth++;
+        else if (d === ")" && --depth === 0) break;
+      }
+      acc.push(body.slice(i + 2, j));
+      i = j;
+    }
+  }
+  return acc.filter((t) => t.trim());
+}
+
+// Is the `<<` at `at` of this logical line an operator bash reads as a heredoc? Not when it stands
+// inside a quote (`echo 'use <<EOF here'`), in a comment (`# <<EOF`: from a `#` that starts a word),
+// or in arithmetic (`$((1<<EOF))`, `((x = 1<<EOF))`, `$[1<<EOF]`), where it is a shift. Until #390
+// those two were heredocs to the guard, and the lines after them, which bash runs, were a body
+// nobody read. Read loosely on purpose: a `#` or a `$((` the guard takes for one it is not makes
+// the lines after the `<<` read as commands, which is stricter, never laxer. A comment on a line
+// joined to this one by a backslash-newline counts as on it, though the newline ends it for bash.
+function heredocOperator(line, at) {
+  let bare = false, comment = false;
+  const open = [];
+  let sq = 0;
+  lex(line.slice(0, at + 1), (j, tok, depth, fs) => {
+    if (j === at) { bare = true; return; }
+    if (tok === "$(" || tok === "(") open.push(j);
+    else if (tok === ")") { const k = open.lastIndexOf(fs); if (k >= 0) open.splice(k, 1); }
+    else if (tok === "#" && (j === 0 || /[\s;&|()<>]/.test(line[j - 1]))) comment = true;
+    else if (tok === "$" && line[j + 1] === "[") sq++;
+    else if (tok === "]" && sq > 0) sq--;
+  });
+  if (!bare || comment || sq > 0) return false;
+  return !open.some((s) => line.startsWith("$((", s) || line.startsWith("((", s));
+}
+
+// The terminator of an unquoted heredoc body as bash may also read it: there a backslash-newline
+// joins two lines before the line is compared with the delimiter, so `EO\` and `F` end a body that
+// waits for `EOF` (#390). { index, 0 } like a match of endRe (the lines joined, from the first one's
+// start to the last one's end), only when the lines were joined (endRe finds the others), or null.
+// Tabs off every line with `<<-`. Read no further than `limit` (where endRe ends the body).
+function joinedTerminator(tail, d, strip, limit = tail.length) {
+  let pos = 0, start = 0, acc = "", joined = false;
+  for (;;) {
+    if (start > limit) return null;
+    let e = tail.indexOf("\n", pos);
+    if (e === -1) e = tail.length;
+    let ln = tail.slice(pos, e);
+    if (strip) ln = ln.replace(/^\t+/, "");
+    let b = 0;
+    while (b < ln.length && ln[ln.length - 1 - b] === "\\") b++;
+    if (b % 2 === 1 && e < tail.length) { acc += ln.slice(0, -1); joined = true; pos = e + 1; continue; }
+    acc += ln;
+    if (joined && acc === d) return { index: start, 0: tail.slice(start, e) };
+    if (e >= tail.length) return null;
+    acc = ""; joined = false; pos = e + 1; start = pos;
+  }
+}
+
+// Returns the text with every heredoc body removed, plus the bodies that feed a shell (and the
+// substitutions an unquoted body runs, see heredocSubsts), and where each operator whose body was
+// removed stands in the text returned (see shellScopes).
 function splitHeredocs(src) {
-  const opRe = /(?<!<)<<(?!<)-?\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1/;
+  const opRe = /(?<!<)<<(?!<)-?[ \t]*(?=[A-Za-z_"'\\])/;
   let out = "";
   const bodies = [];
   const handled = [];   // where, in `out`, each operator whose body was taken out stands
@@ -5926,21 +9634,34 @@ function splitHeredocs(src) {
   for (;;) {
     const m = opRe.exec(rest);
     if (!m) { out += rest; break; }
+    const w = heredocWord(rest, m.index + m[0].length);
+    if (!w) { out += rest.slice(0, m.index + 2); rest = rest.slice(m.index + 2); continue; }
     // The LOGICAL opener line: joined across backslash-newline in both directions, because
     // bash joins them before it ever parses — `cat <<EOF \` / `| bash` is one line to bash.
     let lineStart = rest.lastIndexOf("\n", m.index) + 1;
     while (lineStart >= 2 && rest[lineStart - 2] === "\\") lineStart = rest.lastIndexOf("\n", lineStart - 2) + 1;
-    let eol = rest.indexOf("\n", m.index + m[0].length);
+    let eol = rest.indexOf("\n", w.end);
     while (eol !== -1 && rest[eol - 1] === "\\") eol = rest.indexOf("\n", eol + 1);
     if (eol === -1) { out += rest; break; }
     let line = rest.slice(lineStart, eol).replace(/\\\n/g, " ");
     const at = m.index - lineStart - (rest.slice(lineStart, m.index).match(/\\\n/g) || []).length;
+    // A `<<` inside a quote on its line is text, not an operator (`echo 'use <<EOF here'`): what
+    // follows is read as code. Until #382 its "body" was data up to a line `EOF`, or to the end.
+    // Nor is one in a comment or in arithmetic (#390, see heredocOperator).
+    if (!heredocOperator(line, at)) { out += rest.slice(0, m.index + 2); rest = rest.slice(m.index + 2); continue; }
     const opAt = out.length + m.index;   // where the operator stands in `out` (see analyzableTexts)
     handled.push(opAt);
     out += rest.slice(0, eol + 1);
     const tail = rest.slice(eol + 1);
-    const endRe = new RegExp("^\\t*" + m[2] + "[ \\t]*\\r?$", "m");
-    const em = endRe.exec(tail);
+    // The terminator as bash reads it: the delimiter alone on its line, tabs before it only with
+    // `<<-`. A looser match (blanks after it, tabs without the dash) ended the body before bash
+    // does, and its text was read as commands: a `cd` in it moved the git command after it.
+    const endRe = new RegExp("^" + (m[0][2] === "-" ? "\\t*" : "") + w.d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "m");
+    let em = endRe.exec(tail);
+    // Of the two readings of the terminator, the one that ends the body first: what follows it is
+    // read as commands.
+    const ej = w.quoted ? null : joinedTerminator(tail, w.d, m[0][2] === "-", em ? em.index : tail.length);
+    if (ej && (!em || ej.index < em.index)) em = ej;
     let forced = false;
     if (em) {
       // The command may continue after the terminator while a frame or quote is still open on
@@ -5957,12 +9678,24 @@ function splitHeredocs(src) {
     const how = forced ? "shell" : heredocFeed(line, at);
     const shellFed = how !== null;
     if (!em) {
-      // Unterminated heredoc: the rest is its body. Dropped (conservative) unless it feeds a
-      // shell — then it is code that WILL run, and it is analyzed.
-      if (shellFed) bodies.push({ text: tail, at: opAt, how });
+      // Unterminated heredoc: the rest is its body, to bash. Read as code all the same: what the
+      // guard took for an operator may stand inside a quoted argument (`echo 'use <<EOF here'`),
+      // and then the lines after it are commands bash runs. Until #382 it was dropped unless it fed
+      // a shell, and `echo 'use <<EOF here'` / `git push --force origin develop` passed.
+      bodies.push({ text: tail, at: opAt, how: shellFed ? how : "open" });
       break;
     }
     if (shellFed) bodies.push({ text: tail.slice(0, em.index), at: opAt, how });
+    else {
+      // The program of an interpreter that is not a shell is read as its -c text is, a quoted span;
+      // a script of `sed -f -` is denied when it runs a command (#376).
+      const ip = heredocInterp(line, at);
+      if (ip === "sed") { if (sedRunsCommands(tail.slice(0, em.index))) SED_EXEC = true; }
+      else if (ip) bodies.push({ text: tail.slice(0, em.index), at: opAt, how: "interp" });
+      // A body that is data still runs its substitutions when the delimiter is not quoted: each one
+      // is read as the command it is, in a subshell of its own (#382).
+      if (!w.quoted) for (const t of heredocSubsts(tail.slice(0, em.index))) bodies.push({ text: t, at: opAt, how: "subst" });
+    }
     rest = tail.slice(em.index + em[0].length);
   }
   return { out, bodies, handled };
@@ -6420,6 +10153,8 @@ function analyzableTexts(src, depth, base = { p: "/", o: "" }) {
   for (const b of bodies) {
     const c = ctxAt(sc, base, b.at);
     let p = c.p + "h" + c.o + "/";
+    // An interpreter's program (#376): a quoted span of its own, not a shell's text to split again.
+    if (b.how === "interp") { texts.push({ text: b.text, p: p + "v" + c.o + "./", o: c.o + ".", handled: [], quoted: true }); continue; }
     if (b.how === "here") p = c.p;
     else if (b.how === "frame") {
       const f = frameAround(sc, b.at);
@@ -6478,7 +10213,22 @@ function analyzableTexts(src, depth, base = { p: "/", o: "" }) {
 // left that merge judged by nobody (found 2026-09-30, verifying this change: a PR whose base is
 // the protected branch merged by the agent). So a half is marked only when no substitution span
 // overlaps it; one inside a substitution is read by every rule, as before this mark existed.
+//
+// A $'…' quote with an escaped quote in it (`$'it\'s'`, `$'\''`) ends where the shell ends it, at
+// the first quote no backslash escapes. This reader, lex, tokenize and the shell side's word
+// readers end it at the first quote, escaped or not, and read what follows inside a quote the
+// shell has already closed: the cut falls where the shell does not cut, and the rest of the
+// command reached no rule (#378: `env {X=$'\'',Y=1} git push --force origin develop` passed, and
+// so did the same quote in a command word). Such a text cannot be cut with certainty, so the
+// command is not let through (exit 3, see guard_judge). It is looked for in the text as written,
+// with no quoting state, so no misreading of the text around it can hide one: here in every text
+// that is certainly a command (`code`, a reopened `bash -c "…"` script among them, whose escapes
+// hid it in the raw text), and over the whole raw command at the end (see ANSI_UNREADABLE below).
+// A `$'…'` without `\'` (`$'\n'`, `$'\t'`, `$'a\\b'`) ends at the same quote for every reader.
+const ANSI_ESCAPED_QUOTE = /\$'(?:[^'\\]|\\[\s\S])*\\'/;
+let ANSI_UNREADABLE = false;
 function splitSegments(str, top = true, spans = [], code = top, info = null) {
+  if (code && ANSI_ESCAPED_QUOTE.test(str)) ANSI_UNREADABLE = true;
   const out = [];
   const inner = [];
   let qAt = 0;      // where the current quoted span opens in str
@@ -6489,6 +10239,7 @@ function splitSegments(str, top = true, spans = [], code = top, info = null) {
   let cutLeft = false;   // this segment starts right after a substitution closed
   const frames = [];     // unquoted "$(" and "(" still open, to tell which one a ")" closes
   let tick = false;      // inside a backtick substitution
+  let comment = false;   // past an unquoted `#` that starts a word, up to the end of its line
   let i = 0;             // the scan position (hoisted: push reads it)
   let from = 0;          // where the current segment starts in str
   const insideSubst = (a, b) => spans.some(([s, e]) => a < e && s < b);
@@ -6520,7 +10271,7 @@ function splitSegments(str, top = true, spans = [], code = top, info = null) {
     if (q === '"') {
       // A backslash-newline is a LINE CONTINUATION: bash removes it before the word ever
       // exists. Keeping it turned one command into two segments (see the unquoted branch).
-      if (c === "\\" && next === "\n") { cur += " "; buf += " "; i++; continue; }
+      if (c === "\\" && next === "\n") { i++; continue; }
       if (c === "\\" && next) { cur += c + next; buf += c + next; i++; continue; }
       if (c === '"') { cur += c; closeQuote(); continue; }
       if (c === "$" && next === "(") { openSubst(); i++; continue; }
@@ -6532,10 +10283,15 @@ function splitSegments(str, top = true, spans = [], code = top, info = null) {
     // before parsing. Keeping the pair verbatim carries a raw newline into the line-based read
     // loop below and TEARS THE SEGMENT IN HALF, and half a command satisfies no rule honestly:
     // one that requires a flag to be present stops seeing it, one that forbids a shape stops
-    // recognising it. Joining first is what lets every rule read the whole command.
-    if (c === "\\" && next === "\n") { cur += " "; i++; continue; }
+    // recognising it. Joining first is what lets every rule read the whole command. Nothing takes
+    // the pair's place: bash joins the two halves of a word (`env X=\` / `1 git push …` is `env
+    // X=1 git push …`), and a blank there read `1` as the command word (#382). Not in a comment,
+    // which ends at its newline, backslash or not: there the newline cuts.
+    if (c === "#" && !/\S$/.test(cur)) comment = true;
+    if (c === "\\" && next === "\n" && comment) { cur += c; continue; }
+    if (c === "\\" && next === "\n") { i++; continue; }
     if (c === "\\" && next) { cur += c + next; i++; continue; }
-    if (c === "'" || c === '"') { q = c; qHead = cur; qAt = i; cur += c; buf = ""; continue; }
+    if (c === "'" || c === '"') { comment = false; q = c; qHead = cur; qAt = i; cur += c; buf = ""; continue; }
     if (c === "$" && next === "(") { frames.push("$"); openSubst(); i++; continue; }
     if (c === "`") { backtick(); continue; }
     if (c === "|" || c === "&") {
@@ -6545,12 +10301,34 @@ function splitSegments(str, top = true, spans = [], code = top, info = null) {
     }
     if (c === "(") { frames.push("("); push(); continue; }
     if (c === ")") { if (frames.pop() === "$") closeSubst(); else push(); continue; }
-    if (c === ";" || c === "\n") { push(); continue; }
+    if (c === ";" || c === "\n") { if (c === "\n") comment = false; push(); continue; }
     cur += c;
   }
   push();
   // An unterminated quote leaves text in buf; analyze it rather than drop it.
   if (buf.trim()) inner.push({ t: buf.trim(), qc: q, script: code && scriptSpan(qHead), at: qAt });
+  // The scripts of this text's commands, each read whole (see wordScripts): only where the word is
+  // not one quoted span, which the loop below reads already. Never the text itself again: the
+  // script is shorter than the command that holds it, so this ends.
+  if (code) {
+    const spanTexts = new Set();
+    for (const { t, qc } of inner) { spanTexts.add(t); if (qc === '"') spanTexts.add(t.replace(/\\([\\"$`])/g, "$1")); }
+    const have = new Set(out);
+    const own = out.length;
+    for (let k = 0; k < own; k++) {
+      const s0 = out[k].replace(/^\t/, "");
+      for (const { text, kind } of wordScripts(s0)) {
+        const u = text.trim();
+        if (spanTexts.has(u) || u.length >= s0.trim().length) continue;
+        for (const s of splitSegments(u, false, [], true)) {
+          if (have.has(s)) continue;
+          have.add(s);
+          out.push(s);
+          if (info) info.push({ at: info[k] ? info[k].at : 0, kind: s[0] === "\v" ? kind + "-quoted" : kind });
+        }
+      }
+    }
+  }
   // The quoted spans are re-split with the same rules, so an operator inside a quoted
   // command still separates the commands it joins.
   // A span that is certainly a script (scriptSpan: `bash -c '…'`, `eval "…"`, `ssh host '…'`) of a
@@ -6662,6 +10440,12 @@ function maskSubstitutions(text, spans = substSpans(text)) {
 const all = [];
 for (const tx of analyzableTexts(cmd, 0)) {
   const text = tx.text;
+  // An interpreter's program from a heredoc (#376): its segments as those of a quoted span, marked
+  // (\v) as text that may be a command, where the heredoc stands.
+  if (tx.quoted) {
+    for (const s of splitSegments(text, false)) all.push({ seg: s[0] === "\v" ? s : "\v" + s, ctx: { o: tx.o + "0", p: tx.p } });
+    continue;
+  }
   const spans = substSpans(text);
   let sc = scopesOf(text, tx.handled);
   if (!sc) { SCOPES_UNREADABLE = true; sc = NO_SCOPES; }
@@ -6710,6 +10494,16 @@ for (const tx of analyzableTexts(cmd, 0)) {
   addBodies(segs, text, ctxs, (o) => ctxOf(o));
   segs.forEach((seg, k) => all.push({ seg, ctx: ctxs[k] || { o: tx.o + "0", p: tx.p } }));
 }
+// A $'…' with an escaped quote in a command (see ANSI_ESCAPED_QUOTE): no segment is sent. Also
+// when it is anywhere in the raw command, quoted span, data or heredoc body included: other readers
+// take text from there that never passes through splitSegments as a command (`parallel ::: "…"`,
+// `gh alias set p --shell "…"`, found verifying #378), and their cut is just as wrong. Looked for
+// in the text as written and with one level of "…" escapes taken off (`\$'\\''` is `$'\''` once
+// the shell reads the "…" it stands in), wherever they stand.
+const unDq = cmd.replace(/\\([\\"$`])/g, "$1");
+if (ANSI_UNREADABLE || ANSI_ESCAPED_QUOTE.test(cmd) || ANSI_ESCAPED_QUOTE.test(unDq)) process.exit(3);
+// A sed script that runs a command, or one the guard cannot read (#376, see sedSegmentRuns).
+if (SED_EXEC || all.some(({ seg }) => sedSegmentRuns(seg.replace(/^[\t\v]/, "")))) process.exit(4);
 // In the order of their positions (stable: the segments of one position keep theirs), unless a
 // text's scopes could not be read: then in the order they were made, behind "\x01! /".
 const posCmp = (a, b) => {
@@ -7102,6 +10896,69 @@ function recursive(name, flags) {
     default: return false;
   }
 }
+// A recursive read in the mode that follows the links it meets on the way (#318, owner decision of
+// 2026-10-13): `find -L`/`-follow`, `grep -R`, `rg`/`fd -L`, `ag -f`, `du -L`, `ls -RL`, `tree -l`,
+// `cp -rL`, `rsync -L`/`-k`, `tar -h`, `chmod -RL`, and zip, 7z and `scp -r`, which follow by default.
+function followsLinks(name, flags) {
+  const has = (re) => flags.some((f) => re.test(f));
+  switch (name) {
+    case "find": return has(/^-(L|follow)$/);
+    case "grep": case "egrep": case "fgrep": case "zgrep": case "ugrep": case "ug":
+      return has(/^-[A-Za-z]*R/) || has(/^--dereference-recursive$/);
+    case "rg": case "fd": case "fdfind": return has(/^-[A-Za-z]*L/) || has(/^--follow$/);
+    case "ag": return has(/^-[A-Za-z]*f/) || has(/^--follow$/);
+    case "ack": return has(/^--follow$/);
+    case "du": case "ls": case "dir": case "cp": case "chmod": case "chown": case "chgrp": case "getfacl": case "setfacl":
+      return has(/^-[A-Za-z]*L/) || has(/^--(dereference|logical)$/);
+    case "ncdu": return has(/^-[A-Za-z]*L/) || has(/^--follow-symlinks$/);
+    case "tree": return has(/^-[A-Za-z]*l/);
+    case "rsync": case "rclone": return has(/^-[A-Za-z]*[Lk]/) || has(/^--copy-(links|dirlinks|unsafe-links)$/);
+    case "tar": return has(/^-[A-Za-z]*h/) || has(/^--dereference$/) || /^[A-Za-z]*h[A-Za-z]*$/.test(rest0[0] || "");
+    case "bsdtar": return has(/^-[A-Za-z]*[hL]/);
+    case "zip": return !has(/^-[A-Za-z]*y/) && !has(/^--symlinks$/);
+    case "7z": return !has(/^-snl$/);
+    case "scp": return true;
+    default: return false;
+  }
+}
+// The links under a directory such a read starts from, followed as it follows them: one whose target
+// is under a root, or a directory that holds one, is where the read goes. The walk is bounded
+// (LINK_DIRS deep, LINK_ENTRIES names); past the bound the guard has not seen everything, and denies.
+// Accepted risk, not closed (owner decision of 2026-10-13 on #318): a path an interpreter builds
+// (python, node…), another spelling of the root on a case-insensitive file system, `~user`, the Grep
+// tool with several globs, and the residuals of #324 (a path held in a variable, read by xargs from
+// a file, or built by a substitution with text around it).
+const LINK_DIRS = 40, LINK_ENTRIES = 50000;
+const linkMemo = new Map();
+function linkScan(start) {
+  if (linkMemo.has(start)) return linkMemo.get(start);
+  let r0;
+  try { r0 = fs.realpathSync.native(start); if (!fs.statSync(r0).isDirectory()) r0 = null; } catch (e) { r0 = null; }
+  let res = null, n = 0;
+  const seenDirs = new Set(), stack = r0 ? [[r0, 0]] : [];
+  outer: while (stack.length) {
+    const [d, dep] = stack.pop();
+    if (seenDirs.has(d)) continue;
+    seenDirs.add(d);
+    let ents;
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch (e) { continue; }
+    for (const e of ents) {
+      if (++n > LINK_ENTRIES) { res = { too: true }; break outer; }
+      const p = path.join(d, e.name);
+      let t = p;
+      if (e.isSymbolicLink()) {
+        try { t = fs.realpathSync.native(p); } catch (x) { t = real(p); }
+        const o = roots.find((o) => under(t, o.real) || under(t, o.abs) || under(o.real, t));
+        if (o) { res = { o, link: p }; break outer; }
+        try { if (!fs.statSync(t).isDirectory()) continue; } catch (x) { continue; }
+      } else if (!e.isDirectory() || roots.some((o) => under(p, o.real))) continue;
+      if (dep + 1 > LINK_DIRS) { res = { too: true }; break outer; }
+      stack.push([t, dep + 1]);
+    }
+  }
+  linkMemo.set(start, res);
+  return res;
+}
 // `ls -d` names the directories, not what is in them; in a bundle, a letter that takes a value
 // (`-I`, `-w`, `-T`) ends it (`-Id` ignores `d`).
 function lsDir(flags) {
@@ -7357,6 +11214,18 @@ function judge(seg, depth, piped) {
     h = holds(here);
     if (h) report("the command (" + name + " from " + here + ", a folder above it)", h);
   }
+  // Where it starts (a pattern: from its fixed directory), scanned for a link it would follow (#318).
+  if (rec && !extract && followsLinks(name, flags)) {
+    const starts = args.filter((a) => a !== dest).map(at).filter((p) => p !== null);
+    if (DEFAULT_DOT.has(name) && args.length <= (/grep$|^rg$|^ag$|^ack$|^fd(find)?$/.test(name) ? 1 : 0)) starts.push(here);
+    for (const p0 of starts) {
+      const fixed = p0.split(/[*?[{]/)[0];
+      const p = path.resolve(fixed === p0 || fixed.endsWith("/") ? fixed : path.dirname(fixed));
+      const s = linkScan(p);
+      if (s && s.too) report("the command (" + name + ", which follows links, from " + p + ", more than the guard looks through for them; without following links (grep -r, rg without -L, find without -L) or from a narrower folder it is checked normally)", roots[0]);
+      if (s) report("the command (" + name + ", which follows links, from " + p + ": " + s.link + " leads there)", s.o);
+    }
+  }
 }
 walk(words(cmd), 0);
 JS
@@ -7462,6 +11331,18 @@ guard_judge() {
       deny "the guard could not read this command within ${GUARD_SECONDS} s, and a command it cannot read is not let through" \
         "split it into shorter commands, with less nesting"
       ;;
+    # A $'…' quote with an escaped quote in it (`$'it\'s'`): the reader cannot cut the command
+    # where the shell does (#378, see ANSI_ESCAPED_QUOTE in EXTRACT_JS).
+    3)
+      deny "the command holds a \$'…' quote with an escaped quote (\\') in it, which the guard's reader cannot cut where the shell does, and a command it cannot read is not let through" \
+        "write that quote another way: \"it's\", or 'it'\\''s', or \$'it\\x27s'"
+      ;;
+    # A sed script that runs a command with GNU sed's e (the e command, or s///e), or one the guard
+    # cannot read: a -f file it cannot open, or stdin that is not a heredoc (#376, see sedSegmentRuns).
+    4)
+      deny "a sed script here runs commands with GNU sed's e (the e command or the e flag of s///), which the guard does not judge as commands, or comes from a file or stdin the guard cannot read, and a command it cannot judge is not let through" \
+        "run the command itself as its own Bash command, or edit the file with the Edit tool; for a sed script, write it without e, inline or in a heredoc, or add --sandbox"
+      ;;
     # No node (timeout's 127 and 126, like the shell's): nothing can read the command (see header),
     # and only forbidden_paths holds, by the text alone.
     126 | 127)
@@ -7485,6 +11366,9 @@ guard_judge() {
   load_policy
   check_forbidden_paths
 
+  [[ "$SEGMENTS" =~ $INTERP_RE || "$INPUT" == *\`* || "$INPUT" == *'$('* || "$INPUT" == *[\<\>]'('* ]] && QUOTED_HINT_OFF=1
+  ci_escaped_identity "$SEGMENTS"
+  git_env_unreadable "$SEGMENTS"
   judge_segments "$SEGMENTS"
   # A deny past the deadline inside a substitution (`dst="$(push_head_branch)"`) may not have stopped it.
   check_deadline
