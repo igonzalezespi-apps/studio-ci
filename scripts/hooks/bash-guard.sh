@@ -6899,7 +6899,7 @@ if (tool === "Grep" || tool === "Glob") {
   if (tool === "Grep") {
     h = holder(base);
     const gl = typeof input.glob === "string" ? input.glob : "";
-    if (h && !(gl.startsWith("!") && dirGlob(gl.slice(1), path.basename(h.abs)))) report("Grep over " + base + ", which holds", h);
+    if (h && !(gl.startsWith("!") && dirGlob(gl.slice(1), path.basename(h.abs)))) report("Grep over " + base + " (a folder above it)", h);
   } else {
     const ex = expand(/^(\/|~|\$HOME|\$\{HOME\})/.test(g) ? g : base + "/" + g);
     h = ex === null ? null : globHit(path.resolve(cwd, ex), false);
@@ -6909,7 +6909,7 @@ if (tool === "Grep" || tool === "Glob") {
       const r = realPath(dir, 0);
       if (r !== path.resolve(dir)) h = globHit(path.join(r, abs.slice(dir.length)), false);
     }
-    if (h) report("Glob " + g + (input.path ? " in " + input.path : "") + ", which reaches", h);
+    if (h) report("Glob " + g + (input.path ? " in " + input.path : "") + ", by what it matches,", h);
   }
   process.exit(0);
 }
@@ -7331,14 +7331,14 @@ function judge(seg, depth, piped) {
       const t = subOnly(a);
       if (t === null) continue;
       h = namesHolder(words(t));
-      if (h) report("the command (" + name + " " + a + "), whose path a command computes from a directory that holds", h);
+      if (h) report("the command (" + name + " " + a + "), whose path a command computes from a directory above it,", h);
     }
     const k = group.indexOf(seg);
     if (hd.xargs && k > 0) {
       let f = k;
       while (f > 0 && group[f - 1].pipe) f--;
       h = namesHolder(group.slice(f, k));
-      if (h) report("the command (xargs " + name + "), whose arguments may come from a directory that holds", h);
+      if (h) report("the command (xargs " + name + "), whose arguments may come from a directory above it,", h);
     }
   }
   for (const a of cands) {
@@ -7355,7 +7355,7 @@ function judge(seg, depth, piped) {
   }
   if (rec && DEFAULT_DOT.has(name) && args.length <= (/grep$|^rg$|^ag$|^ack$/.test(name) ? 1 : 0)) {
     h = holds(here);
-    if (h) report("the command (" + name + " from " + here + ", which holds", h);
+    if (h) report("the command (" + name + " from " + here + ", a folder above it)", h);
   }
 }
 walk(words(cmd), 0);

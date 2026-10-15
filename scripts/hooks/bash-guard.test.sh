@@ -4,8 +4,9 @@
 # ============================================================================
 # Runs the real guard (bash-guard.sh), feeding it via STDIN the exact JSON the
 # Claude Code harness sends, and compares the exit code with the expected
-# verdict (allow = 0, deny = 2). Assertions are on exit codes only, never on
-# message text — so translating the guard's messages never moves a result.
+# verdict (allow = 0, deny = 2). Assertions are on exit codes, not on message
+# text — so translating the guard's messages never moves a result. The one
+# exception is fp_msg (GROUP 7), which pins the five forbidden_paths wordings.
 #
 # Table format: "<allow|deny>|<command>" — only the FIRST '|' separates (a
 # command may itself contain pipes).
@@ -2097,9 +2098,30 @@ fp_case() {
   return 0
 }
 fpath() { node -e 'process.stdout.write(JSON.stringify({ file_path: process.argv[1] }))' "$1"; }
+# fp_msg <tool> <tool_input> <fragment> [cwd]: denied (exit 2), and the reason reads as a sentence:
+# it carries the fragment and none of the old "which holds touches" / "which reaches touches".
+# The only text assertions of the suite: each fragment is one of the five forbidden_paths wordings.
+fp_msg() {
+  local out rc
+  total=$((total + 1))
+  out="$(input_with "$1" "$2" "${4:-$FREPO}" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+    BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_FP" \
+    BASH_GUARD_HOME="$FH" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
+    PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+  rc=$?
+  if [[ "$rc" -eq 2 && "$out" == *"$3"* && "$out" != *"holds touches"* && "$out" != *"reaches touches"* ]]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  exit %d or message without %s  [%s]  ::  %s\n      output: %s\n' "$rc" "$3" "$1" "$2" "$out"
+  return 0
+}
 # shellcheck disable=SC2016 # the `$HOME` spellings must reach the guard literally
 {
   fp_case deny  Bash "$(bash_input 'cat ~/privado/notas.md')"
+  fp_msg Grep "$(node -e 'process.stdout.write(JSON.stringify({ pattern: "x", path: process.argv[1] }))' "$FH")" " (a folder above it) touches ~/privado"
+  fp_msg Glob "$(node -e 'process.stdout.write(JSON.stringify({ pattern: "*/notas.md", path: process.argv[1] }))' "$FH")" ", by what it matches, touches ~/privado"
+  fp_msg Bash "$(bash_input 'find -name x')" ", a folder above it) touches ~/privado" "$FH"
+  fp_msg Bash "$(bash_input 'du $(echo ~)')" "computes from a directory above it, touches ~/privado"
+  fp_msg Bash "$(bash_input 'echo ~ | xargs du')" "may come from a directory above it, touches ~/privado"
   fp_case deny  Bash "$(bash_input 'ls $HOME/privado')"
   fp_case deny  Bash "$(bash_input 'ls ${HOME}/privado/')"
   fp_case deny  Bash "$(bash_input "cat $FH/privado/notas.md")"
