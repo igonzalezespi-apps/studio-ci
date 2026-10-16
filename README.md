@@ -648,7 +648,27 @@ A riesgo-3/4 PR by a person, with CI green and no `revision-humana`, gets that l
 so the `labeled` event wakes the TL;DR check; a bot's PR is never labelled.
 
 **Lens verdict (riesgo-1/2).** The session reviews the PR (Sonnet-high for 1, Opus-high for 2) and
-posts a comment from an account in `verdict_authors`:
+posts a comment from an account in `verdict_authors`. The current form, `agent-verdict v2`, carries
+the exit codes of the two review axes (`review-gate.py --axis standards` and `--axis spec` on that
+head) and no score:
+
+````
+<!-- agent-verdict v2 -->
+```json
+{"head_sha": "<40 hex>", "class": 2, "reviewer": "opus-high", "owner_gate_exit": 0,
+ "review": {"standards": 0, "spec": 0}, "at": "<YYYY-MM-DDThh:mm:ssZ>"}
+```
+````
+
+A v2 verdict clears only with exactly those six keys, `review` exactly `{standards, spec}`, both
+axes and `owner_gate_exit` the integer `0` (`true`/`false` or `"0"` are not exit codes), and
+`reviewer` either `sonnet-high` or `opus-high`, and `at` a real UTC time to the second in ASCII
+digits (`2026-10-16T04:06:12Z`, nothing after it; `9999-99-99T99:99:99Z` is refused). One that
+carries a `pr_score` or any other key (a summed score, a total), at the top or inside `review`, or a
+score nested in `reviewer` or written as text in either field, is refused. Nothing reads `at`'s value.
+
+**Deprecated, accepted during the transition:** `agent-verdict v1`, which carries the summed
+pr-score instead of `review` and needs a score at or above the config's `pr_score` (default 22/4):
 
 ````
 <!-- agent-verdict v1 -->
@@ -658,12 +678,13 @@ posts a comment from an account in `verdict_authors`:
 ```
 ````
 
-It counts only if it is the latest such comment, never edited, for the current head, with
-`owner_gate_exit: 0`, a score at or above `pr_score`, and a `class` not below the computed one (a
-higher class wins; 3 or more escalates). A new push voids it. **`verdict_authors` must be an
-identity the agent sessions cannot use** (a workflow with its own App, or a separate bot account):
-if the sessions post as the owner and the owner is a verdict author, a session can clear its own
-PR. Until such an identity exists, keep `max_auto_class` at 0.
+Of either version, it counts only if it is the latest such comment by `created_at` (a v2 after a
+v1 replaces it, and the other way round; a comment carrying both marks is ignored), never edited,
+for the current head, with `owner_gate_exit: 0`, its axes or its score clearing, and a `class` not
+below the computed one (a higher class wins; 3 or more escalates). A new push voids it.
+**`verdict_authors` must be an identity the agent sessions cannot use** (a workflow with its own
+App, or a separate bot account): if the sessions post as the owner and the owner is a verdict
+author, a session can clear its own PR. Until such an identity exists, keep `max_auto_class` at 0.
 
 **Locally**: `merge-when-green/pr-merge.sh decide --repo owner/name --pr N` (read-only; exit 0
 merge, 10 wait, 20 needs a verdict, 30 escalate, 40 skip, 2 error). `merge` refuses outside GitHub
