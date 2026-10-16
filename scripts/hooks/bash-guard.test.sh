@@ -4504,7 +4504,10 @@ done
 # (exit 2) con ese texto. El prefijo envuelve al guard (`ulimit`, un PATH sin timeout).
 G15_RUN=(env BASH_GUARD_BRANCH=feature/x BASH_GUARD_POLICY="$POL_PRODUCT"
   BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO")
-G15_FULL_TMP=(bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
+# Los casos con /tmp lleno prueban que la orden se lee entera, no cuanto tarda: con un limite de 30 s,
+# una maquina cargada no los convierte en un DENY por tiempo (7000 segmentos tardan unos 7 s en local,
+# y en el runner de un consumidor pasaron de 10 el 2026-10-15, #404).
+G15_FULL_TMP=(env BASH_GUARD_SECONDS=30 bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
 g15_case() {
   local what="$1" want="$2" js="$3" out rc
   shift 3
@@ -5985,6 +5988,126 @@ G25_CASES=(
 )
 for ((k = 0; k < ${#G25_CASES[@]}; k += 2)); do
   run_case "${G25_CASES[k]}" "${G25_CASES[k + 1]}"
+done
+
+# ============================================================================
+# GROUP 26 — LO QUE EL GUARD DEJO DE HACER EN CADA ORDEN PARA IR MAS RAPIDO (#404).
+# (1) Las dos lecturas con comodines del nombre (ci_wild_re2) se cortan del nombre escrito en vez de
+#     montarse letra a letra: el texto debe ser el mismo que da la definicion, letra a letra, en node.
+# (2) La lectura de escapes no arranca node si la entrada no tiene ni `\\` ni `\u`, porque en JSON una
+#     barra solo se escribe asi. Cada caso que se niega del GROUP 18 con una barra en la orden se
+#     repite con sus barras escritas `\`: debe negarse igual.
+# ============================================================================
+total=$((total + 1))
+G26_FN="$(awk '/^ci_wild_re2\(\) \{$/ { f = 1 } f { print } f && /^\}$/ { exit }' "$GUARD")"
+G26_GOT="$(bash -c "$G26_FN"$'\nfor n in GITHUB_ACTIONS MWG_WRITE_TOKEN_KIND A AB X_Y_Z; do ci_wild_re2 "$n"; printf "%s\\n" "$CI_WILD2_V2"; done')"
+G26_WANT="$(node -e '
+for (const n of ["GITHUB_ACTIONS", "MWG_WRITE_TOKEN_KIND", "A", "AB", "X_Y_Z"]) {
+  const alts = [];
+  for (let j = 0; j < n.length; j++) for (let k = j; k < n.length; k++) {
+    let a = "";
+    for (let i = 0; i < n.length; i++) {
+      if (i > 0) a += "[?]*";
+      a += i === j || i === k ? (i === n.length - 1 ? "[?]" : "[?@]") : n[i];
+    }
+    alts.push(a);
+  }
+  console.log(alts.join("|"));
+}')"
+if [ -n "$G26_FN" ] && [ "$G26_GOT" = "$G26_WANT" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  printf 'FAIL  ci_wild_re2 no da el texto de su definicion (%d contra %d caracteres)\n' "${#G26_GOT}" "${#G26_WANT}"
+fi
+# g26_case <allow|deny> <command>: como run_case, con cada barra de la orden escrita `\` en el JSON.
+g26_case() {
+  local expected="$1" cmd="$2" out rc want
+  total=$((total + 1))
+  out="$(cd "$NOT_A_REPO" && node -e '
+const j = JSON.stringify({ session_id: "test-session", hook_event_name: "PreToolUse",
+  tool_name: "Bash", tool_input: { command: process.argv[1] } });
+process.stdout.write(j.replace(/\\(u[0-9a-fA-F]{4}|.)/g, (m) => (m === "\\\\" ? "\\u005c" : m)));
+' "$cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
+    BASH_GUARD_PR_BASE=develop BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" \
+    BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  [\\u005c] expected=%s (exit %d), got exit %d  ::  %s\n' "$expected" "$want" "$rc" "$cmd"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+G26_N=0
+for g26_line in "${G18_CASES[@]}" "${G18B_CASES[@]}" "${G18C_CASES[@]}" "${G18D_CASES[@]}" \
+  "${G18E_CASES[@]}" "${G18F_CASES[@]}" "${G18G_CASES[@]}" "${G18H_CASES[@]}" "${G18I_CASES[@]}" \
+  "${G18J_CASES[@]}"; do
+  [[ "$g26_line" == deny\|* && "$g26_line" == *\\* ]] || continue
+  g26_case deny "${g26_line#deny|}"
+  G26_N=$((G26_N + 1))
+done
+# Sin casos no se ha probado nada: los del GROUP 18 que se niegan con una barra son la mayoria de esas tablas.
+total=$((total + 1))
+if [ "$G26_N" -ge 50 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); printf 'FAIL  GROUP 26 repitio %d casos con \\u005c, menos de 50\n' "$G26_N"; fi
+# g26_run <allow|deny> <texto que debe salir, o ""> <politica> <orden> [prefijo...]: el guard con la
+# politica dada, el home falso del GROUP 7 y el prefijo delante (otro PATH, un /tmp lleno).
+g26_run() {
+  local expected="$1" want_text="$2" pol="$3" cmd="$4" out rc want
+  shift 4
+  total=$((total + 1))
+  out="$(cd "$NOT_A_REPO" && make_input "$cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch \
+    BASH_GUARD_POLICY="$pol" BASH_GUARD_HOME="$FH" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" \
+    BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" "$@" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ] && [[ "$out" == *"$want_text"* ]]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 26] expected=%s (exit %d), got exit %d  ::  %s\n      output: %s\n' "$expected" "$want" "$rc" "$cmd" "${out:0:300}"
+}
+# (3) Un /tmp lleno con un bash que escribe todo heredoc en un fichero (BASH_COMPAT=50, como el 3.2 de
+#     macOS): el lector de forbidden_paths no se puede cargar y, con forbidden_paths en la politica,
+#     toda orden se niega. Un `set -e` sobre el heredoc fallido acababa el guard con exit 1, y una
+#     orden con exit 1 del hook se ejecuta.
+G26_FULL=(env BASH_COMPAT=50 BASH_GUARD_SECONDS=30 PATH="${NO_NET_BIN}:${PATH}" bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
+g26_run deny "$G15_PUSH" "$POL_PRODUCT" 'git push --force origin main' "${G26_FULL[@]}"
+g26_run deny 'could not load its reader' "$POL_FP" 'cat ~/privado/notas.md' "${G26_FULL[@]}"
+g26_run deny 'could not load its reader' "$POL_FP" 'git status' "${G26_FULL[@]}"
+# (4) Una etapa de la proyeccion de ci_escaped_identity que falla (aqui, sin awk) para al juez: se niega.
+G26_NOAWK="$TMP/g26-sin-awk"
+mkdir -p "$G26_NOAWK"
+IFS=: read -r -a G26_DIRS <<< "$PATH"
+for g26_d in "${G26_DIRS[@]}"; do
+  for g26_f in "$g26_d"/*; do
+    g26_b="${g26_f##*/}"
+    case "$g26_b" in awk | gawk | mawk | nawk | busybox) continue ;; esac
+    [ -x "$g26_f" ] && [ ! -e "$G26_NOAWK/$g26_b" ] && ln -s "$g26_f" "$G26_NOAWK/$g26_b"
+  done
+done
+g26_run deny '' "$POL_PRODUCT" 'printf "export \x4${a:-7}ITHUB_ACTIONS=1; node x\n" | bash' env PATH="${NO_NET_BIN}:${G26_NOAWK}"
+# (5) Leer la orden una vez antes de cada subshell que juzga (un hijo de git rebase -x, la relectura de
+#     un alias): sin eso, cada subshell arrancaba su propio node para leerla, y 120 hijos pasaban del
+#     limite. Un node de pega cuenta las lecturas: como mucho una.
+G26_LOG="$TMP/g26-lecturas.log"
+G26_BIN="$TMP/g26-node"
+mkdir -p "$G26_BIN"
+printf '%s\n' '#!/bin/sh' "case \"\$2\" in *'d.tool_input.command : undefined'*) echo leida >> '$G26_LOG' ;; esac" \
+  "exec '$(command -v node)' \"\$@\"" > "$G26_BIN/node"
+chmod +x "$G26_BIN/node"
+G26_REBASE="git rebase"
+for ((k = 0; k < 30; k++)); do G26_REBASE+=" -x 'git co'"; done
+for g26_cmd in "$G26_REBASE main" \
+  "git -c 'alias.status=log \"--oneline\"' -c 'alias.log=diff \"--stat\"' -c 'alias.diff=show \"--stat\"' status"; do
+  : > "$G26_LOG"
+  (cd "$NOT_A_REPO" && make_input "$g26_cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
+    BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
+    PATH="${G26_BIN}:${NO_NET_BIN}:${PATH}" "$GUARD" >/dev/null 2>&1)
+  total=$((total + 1))
+  g26_reads="$(wc -l < "$G26_LOG" | tr -d ' ')"
+  if [ "$g26_reads" -le 1 ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    printf 'FAIL  [GROUP 26] la orden se leyo %s veces con node (como mucho 1)  ::  %s\n' "$g26_reads" "${g26_cmd:0:80}"
+  fi
 done
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi
