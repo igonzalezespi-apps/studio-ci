@@ -833,7 +833,9 @@ git_inline_alias() {
         ntok+=("${tok[@]:i}")
         nraw+=("${raw[@]:i}")
         # In a subshell: what the second reading records (GIT_GLOBALS, GIT_SUB, a fresh repository)
-        # stays out of the first; only its deny counts.
+        # stays out of the first; only its deny counts. The command is read here first, so the
+        # subshell inherits it instead of starting node to read it again each time (#404).
+        raw_command
         (GIT_ALIAS_USED+="$k " && git_alias_reread) || exit 2
       done
     done
@@ -1245,6 +1247,8 @@ git_child_judge() {
   [ -n "$ctext" ] || return 0
   [[ "$ctext" != *$'\n'* ]] || deny "git ${s}: the command it runs spans several lines, which the guard does not read as a command" \
     "write the command on one line, or run it directly"
+  # Read once here, so each child's subshell inherits the command instead of starting node (#404).
+  raw_command
   (
     CW_DEPTH=$((CW_DEPTH + 1))
     check_segment "$ctext"
@@ -6052,33 +6056,43 @@ done
 # backslashes (a JSON string escaped twice, a byte string in hex) from reading as the name on its
 # own; three or more letters each written by a gap are judged by the tail reading below instead.
 ci_wild_re2() {
-  local n="$1" j k i re2="" alt cls last
+  local LC_ALL=C n="$1" j k full="" cj ck re2="" sep="" last
   last=$((${#n} - 1))
+  # The name written out with a `[?]*` between letters, so letter i stands at offset 5i: each
+  # alternative is that text with the wildcard class in place of letter j and of letter k. Between two
+  # letters only a hard `?` may stand (a backslash writing nothing); a weak `@` is a literal
+  # `$`/brace/paren really in the output, so it cannot vanish between two letters. Cut from the
+  # written-out name instead of rebuilt letter by letter: the same text, in 4 ms instead of 90 (#404).
   for ((j = 0; j < ${#n}; j++)); do
+    [ "$j" -eq 0 ] || full+="[?]*"
+    full+="${n:j:1}"
+  done
+  for ((j = 0; j < ${#n}; j++)); do
+    if [ "$j" -eq "$last" ]; then cj="[?]"; else cj="[?@]"; fi
     for ((k = j; k < ${#n}; k++)); do
-      alt=""
-      for ((i = 0; i < ${#n}; i++)); do
-        # Between two letters only a hard `?` may stand (a backslash writing nothing); a weak `@` is a
-        # literal `$`/brace/paren really in the output, so it cannot vanish between two letters.
-        [ "$i" -eq 0 ] || alt+="[?]*"
-        if [ "$i" -eq "$j" ] || [ "$i" -eq "$k" ]; then
-          if [ "$i" -eq "$last" ]; then cls="[?]"; else cls="[?@]"; fi
-          alt+="$cls"
-        else
-          alt+="${n:i:1}"
-        fi
-      done
-      [ -z "$re2" ] || re2+="|"
-      re2+="$alt"
+      if [ "$k" -eq "$j" ]; then
+        re2+="${sep}${full:0:5*j}${cj}${full:5*j+1}"
+      else
+        if [ "$k" -eq "$last" ]; then ck="[?]"; else ck="[?@]"; fi
+        re2+="${sep}${full:0:5*j}${cj}${full:5*j+1:5*(k-j)-1}${ck}${full:5*k+1}"
+      fi
+      sep="|"
     done
   done
   CI_WILD2_V2="$re2"
 }
-ci_wild_re2 GITHUB_ACTIONS
-CI_ESC_V2_GH_RE="$CI_WILD2_V2"
-ci_wild_re2 MWG_WRITE_TOKEN_KIND
-CI_ESC_V2_MWG_RE="$CI_WILD2_V2"
-unset CI_WILD2_V2
+# The two readings are built the first time a command needs them (ci_wild_ready), not on every run:
+# only a command with an escape left after decoding reads them (#404).
+CI_ESC_V2_GH_RE=""
+CI_ESC_V2_MWG_RE=""
+ci_wild_ready() {
+  [ -z "$CI_ESC_V2_GH_RE" ] || return 0
+  ci_wild_re2 GITHUB_ACTIONS
+  CI_ESC_V2_GH_RE="$CI_WILD2_V2"
+  ci_wild_re2 MWG_WRITE_TOKEN_KIND
+  CI_ESC_V2_MWG_RE="$CI_WILD2_V2"
+  unset CI_WILD2_V2
+}
 # The two names' letters, for the `?` reading's projection: any other capital drops out, so a capital
 # the shell throws away between the escape and the name (`\x4${a:+\}X}7ITHUB_ACTIONS` leaves an `X`,
 # the `Z=1` of a `case` leaves a `Z`) does not break the name. `F J L P Q V X Y Z` are in neither.
@@ -6096,7 +6110,7 @@ CI_ESC_DECODE+=(-e 'ta')
 CI_ESC_HIDE+=(-e 'ta')
 unset CI_ESC_C CI_ESC_H CI_ESC_O CI_ESC_HX CI_ESC_K CI_ESC_R
 ci_escaped_identity() {
-  local LC_ALL=C t="$1" i r h rn hn name d w
+  local LC_ALL=C t="$1" i r h rn hn name d
   local m proj
   local -a versions_r=() versions_h=()
   if [[ "$t" == *\\[0-7xXuU]* ]]; then
@@ -6107,6 +6121,10 @@ ci_escaped_identity() {
       deny_ci_escaped_identity "${BASH_REMATCH[0]}"
     fi
   fi
+  # A hook input with no `\\` and no `\u` in it has no string that decodes to a backslash (JSON writes
+  # one no other way), so the command has none and the reading below has nothing to find: node is not
+  # started to read it (#404).
+  [[ "${INPUT-}" == *'\\'* || "${INPUT-}" == *'\u'* ]] || return 0
   raw_command
   # An escape, or a backslash before what may start a gap (a quote, an expansion, a brace, another
   # backslash: `\'"$a"'x47`, `\\$(:)x47`).
@@ -6137,7 +6155,8 @@ ci_escaped_identity() {
       -e ':e' -e 's/\{([^{}]*,)?([^{},]*)\}/\2/g' -e 'te' | tr -d '\001')"
   # Each line starts with a `#`, so that none is empty and line i is the version i in both.
   d="$(printf '%s\n' "$t" | sed -E "${CI_ESC_DECODE[@]}")"
-  lines_of "$(printf '%s\n' "$d" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  m="$(printf '%s\n' "$d" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  lines_of "$m"
   versions_r=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
   # A backslash left once the escapes are decoded is read as a wildcard that may write a letter,
   # whatever the gap writes or however its quoting ends it. A backslash before a digit, x, u or U is
@@ -6159,21 +6178,27 @@ ci_escaped_identity() {
   # class (the shell, not a text escape, puts the character there). The last three are left for #319's
   # own follow-up, out of this round.
   if [[ "$d" == *\\* ]]; then
+    # Every line projected at once and each projection judged once, in order: three processes per
+    # line made a heredoc of a few hundred lines take a second (#404). A line with no marker projects
+    # to no `?`/`@` and is dropped, as before. Assigned before it is split, so a stage that fails
+    # stops the judge (set -e) instead of leaving nothing to judge: without awk, a command that gets
+    # here is denied.
     m="$(printf '%s\n' "$d" |
-      sed -E -e "s/\\\\([0-7xXuU])/"$'\002'"\\1/g" -e "s/\\\\([\$\`{}()]|\\[|\\])/"$'\003'"\\1/g")"
-    while IFS= read -r w; do
-      [[ "$w" == *$'\002'* || "$w" == *$'\003'* ]] || continue
-      proj="$(printf '%s' "$w" | tr -cd "${CI_ESC_NAME_LETTERS}"$'\002\003' | tr $'\002\003' '?@')"
-      [[ "$proj" == *[?@]* ]] || continue
+      sed -E -e "s/\\\\([0-7xXuU])/"$'\002'"\\1/g" -e "s/\\\\([\$\`{}()]|\\[|\\])/"$'\003'"\\1/g" |
+      tr -cd "${CI_ESC_NAME_LETTERS}"$'\002\003\n' | tr $'\002\003' '?@' | LC_ALL=C awk '/[?@]/ && !seen[$0]++')"
+    lines_of "$m"
+    ci_wild_ready
+    for proj in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
       if [[ "$proj" =~ $CI_ESC_V2_GH_RE || "$proj" =~ $CI_ESC_LEAD_GH_RE ]]; then
         deny_ci_escaped_identity "GITHUB_ACTIONS, read with an escape the guard cannot finish as any letter"
       fi
       if [[ "$proj" =~ $CI_ESC_V2_MWG_RE || "$proj" =~ $CI_ESC_LEAD_MWG_RE ]]; then
         deny_ci_escaped_identity "MWG_WRITE_TOKEN_KIND, read with an escape the guard cannot finish as any letter"
       fi
-    done <<< "$m"
+    done
   fi
-  lines_of "$(printf '%s\n' "$t" | sed -E "${CI_ESC_HIDE[@]}" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  m="$(printf '%s\n' "$t" | sed -E "${CI_ESC_HIDE[@]}" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  lines_of "$m"
   versions_h=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
   # Should the two not line up, nothing counts as hidden: the stricter reading.
   [ "${#versions_h[@]}" -eq "${#versions_r[@]}" ] || versions_h=()
@@ -10549,7 +10574,14 @@ fi
 # directory with symlinks followed, and a Glob pattern rooted in it. Empty (the default): no rule.
 # Prints "<what touched it>\t<the entry>" for the first hit, nothing otherwise. TEST-ONLY override:
 # BASH_GUARD_HOME (the home `~` stands for).
-read -r -d '' FORBID_JS <<'JS' || true
+# Read with cat, not `read -d ''`: a heredoc that fits in a pipe reaches `read` one byte at a time,
+# about 18 ms for this one on every command (#404). Where the heredoc cannot be written (a full /tmp
+# on a bash that puts every heredoc in a file), FORBID_JS stays empty and check_forbidden_paths
+# denies. There is deliberately no second copy to read it from: a reader that cannot load keeps every
+# command out, and the guard does not go on judging in a state it cannot read itself in.
+FORBID_JS=""
+forbid_js_load() { FORBID_JS="$(cat)"; }
+forbid_js_load <<'JS' || true
 const fs = require("fs");
 const path = require("path");
 let d;
@@ -11274,6 +11306,8 @@ check_forbidden_paths_bare() {
 check_forbidden_paths() {
   local out what entry
   [ "${#FORBIDDEN_PATHS[@]}" -gt 0 ] || return 0
+  [ -n "$FORBID_JS" ] || deny "the guard could not load its reader for the paths this repository's guard.policy.json keeps out of every session (forbidden_paths), and a command it cannot read is not let through" \
+    "free some space in the temporary folder (/tmp) and try again"
   local rc=0
   out="$(printf '%s' "$INPUT" | node -e "$FORBID_JS" "${BASH_GUARD_HOME:-${HOME:-}}" "${FORBIDDEN_PATHS[@]}" 2>/dev/null)" || rc=$?
   # A reader that fails (a stack overflow on thousands of nested `"$(`, found in the independent
