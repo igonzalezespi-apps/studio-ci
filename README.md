@@ -662,10 +662,10 @@ head) and no score:
 
 A v2 verdict clears only with exactly those six keys, `review` exactly `{standards, spec}`, both
 axes and `owner_gate_exit` the integer `0` (`true`/`false` or `"0"` are not exit codes), and
-`reviewer` either `sonnet-high` or `opus-high`, and `at` a UTC time to the second
-(`2026-10-16T04:06:12Z`, nothing after it). One that carries a `pr_score` or any other key (a summed
-score, a total), at the top or inside `review`, or a score nested or spelled out in `reviewer`/`at`,
-is refused.
+`reviewer` either `sonnet-high` or `opus-high`, and `at` a real UTC time to the second in ASCII
+digits (`2026-10-16T04:06:12Z`, nothing after it; `9999-99-99T99:99:99Z` is refused). One that
+carries a `pr_score` or any other key (a summed score, a total), at the top or inside `review`, or a
+score nested in `reviewer` or written as text in either field, is refused. Nothing reads `at`'s value.
 
 **Deprecated, accepted during the transition:** `agent-verdict v1`, which carries the summed
 pr-score instead of `review` and needs a score at or above the config's `pr_score` (default 22/4):

@@ -191,6 +191,12 @@ expect("v2: a score after a valid at is refused",
        v2_world(v2_comment(H.sha(5), extra={"at": "2026-10-01T12:00:00Z pr_score=25"})), 5, "verdict", "at must be")
 expect("v2: an at with a trailing newline is refused",
        v2_world(v2_comment(H.sha(5), extra={"at": "2026-10-01T12:00:00Z\n"})), 5, "verdict", "at must be")
+expect("v2: an at with an impossible date is refused",
+       v2_world(v2_comment(H.sha(5), extra={"at": "9999-99-99T99:99:99Z"})), 5, "verdict", "at must be")
+expect("v2: an at with a day 00 is refused",
+       v2_world(v2_comment(H.sha(5), extra={"at": "0022-04-00T00:00:00Z"})), 5, "verdict", "at must be")
+expect("v2: an at with non-ASCII digits is refused",
+       v2_world(v2_comment(H.sha(5), extra={"at": "\u0662\u0660\u0662\u0666-10-01T12:00:00Z"})), 5, "verdict", "at must be")
 expect("v2: for another SHA", v2_world(v2_comment(H.sha(4))), 5, "verdict", "ask again")
 expect("v2: cannot lower the class", v2_world(v2_comment(H.sha(5), cls=0)), 5, "verdict", "below the computed")
 expect("v2: by an untrusted author is ignored", v2_world(v2_comment(H.sha(5), author="stranger")), 5, "verdict",

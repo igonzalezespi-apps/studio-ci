@@ -284,13 +284,19 @@
  {
   "file": "merge-when-green/pr_merge.py",
   "why": "a v2 verdict's at is not checked (a score may ride in it)",
-  "old": "    if not (isinstance(data[\"at\"], str) and V2_AT_RX.match(data[\"at\"])):",
+  "old": "    if not _utc_second(data[\"at\"]):",
   "new": "    if False:"
  },
  {
   "file": "merge-when-green/pr_merge.py",
-  "why": "a v2 verdict's at may carry text after the time",
-  "old": "r\"\\A\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z\\Z\"",
-  "new": "r\"\\A\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z\""
+  "why": "a v2 verdict's at only needs the shape, not a real date",
+  "old": "        time.strptime(at, \"%Y-%m-%dT%H:%M:%SZ\")",
+  "new": "        pass"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a v2 verdict's at may use non-ASCII digits",
+  "old": "V2_AT_RX = re.compile(r\"\\A[0-9]{4}",
+  "new": "V2_AT_RX = re.compile(r\"\\A\\d{4}"
  }
 ]

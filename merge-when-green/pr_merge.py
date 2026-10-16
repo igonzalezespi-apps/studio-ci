@@ -48,7 +48,18 @@ VERDICT_MARKS = {"<!-- agent-verdict v1 -->": 1, "<!-- agent-verdict v2 -->": 2}
 V2_KEYS = frozenset(("head_sha", "class", "reviewer", "owner_gate_exit", "review", "at"))
 V2_AXES = frozenset(("standards", "spec"))
 V2_REVIEWERS = frozenset((risk_class.REVIEW[1], risk_class.REVIEW[2]))
-V2_AT_RX = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+V2_AT_RX = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+
+
+def _utc_second(at):
+    """A real UTC time to the second, ASCII digits only: the shape alone would also take 9999-99-99."""
+    if not (isinstance(at, str) and V2_AT_RX.match(at)):
+        return False
+    try:
+        time.strptime(at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 ACTIONS_BOT = "github-actions[bot]"
 SKIP_CI = re.compile(r"\[(skip ci|ci skip|no ci|skip actions|actions skip)\]", re.I)
 SKIP_CHECKS = re.compile(r"^(\s*skip-checks\s*):", re.I | re.M)
@@ -311,8 +322,8 @@ def check_verdict(found, head_sha, cls, cfg):
 
 def _check_v2(data, cls, vcls):
     """agent-verdict v2: exactly its six keys (a pr_score or any other score never comes back),
-    reviewer one of the lens reviewers and at a UTC second (no score, nested or spelled out, rides
-    in either), a non-bool integer class, owner_gate_exit 0 and both review axes exactly the
+    reviewer one of the lens reviewers and at a real UTC second (so neither can carry a score as
+    text; nothing reads at's value), a non-bool integer class, owner_gate_exit 0 and both review axes exactly the
     integer 0."""
     extra, missing = sorted(set(data) - V2_KEYS), sorted(V2_KEYS - set(data))
     if extra or missing:
@@ -320,8 +331,8 @@ def _check_v2(data, cls, vcls):
             ", ".join(extra) or "-", ", ".join(missing) or "-")
     if not (isinstance(data["reviewer"], str) and data["reviewer"] in V2_REVIEWERS):
         return False, cls, "the v2 verdict's reviewer must be one of %s: ask again" % ", ".join(sorted(V2_REVIEWERS))
-    if not (isinstance(data["at"], str) and V2_AT_RX.match(data["at"])):
-        return False, cls, "the v2 verdict's at must be a UTC time like 2026-10-16T04:06:12Z: ask again"
+    if not _utc_second(data["at"]):
+        return False, cls, "the v2 verdict's at must be a real UTC time to the second, like 2026-10-16T04:06:12Z: ask again"
     if not _int(vcls):
         return False, cls, "the v2 verdict's class (%s) is not an integer" % vcls
     gate = data["owner_gate_exit"]
