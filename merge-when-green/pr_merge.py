@@ -41,7 +41,12 @@ ESCALATION_LABEL = "revision-humana"
 REVERT_LABEL = "revert-on-red"
 FREEZE_LABEL = "merge-freeze"
 COMMENT_MARK = "<!-- merge-when-green v1"
-VERDICT_MARK = "<!-- agent-verdict v1 -->"
+# The lens verdict comment. v1 carries the summed pr_score (deprecated: accepted during the
+# transition, with the `pr_score` bar of the config); v2 carries the exit codes of the two review
+# axes and no score at all. The latest trusted, never-edited comment of either version is read.
+VERDICT_MARKS = {"<!-- agent-verdict v1 -->": 1, "<!-- agent-verdict v2 -->": 2}
+V2_KEYS = frozenset(("head_sha", "class", "reviewer", "owner_gate_exit", "review", "at"))
+V2_AXES = frozenset(("standards", "spec"))
 ACTIONS_BOT = "github-actions[bot]"
 SKIP_CI = re.compile(r"\[(skip ci|ci skip|no ci|skip actions|actions skip)\]", re.I)
 SKIP_CHECKS = re.compile(r"^(\s*skip-checks\s*):", re.I | re.M)
@@ -251,17 +256,19 @@ def merge_method_ok(pull, is_bot):
 
 
 def find_verdict(comments, authors, head_sha):
-    """The last agent-verdict v1 by a trusted author, never edited. None if there is none."""
+    """(version, data) of the last agent-verdict (v1 or v2) by a trusted author, never edited.
+    None if there is none. A comment that carries both marks says nothing and is ignored."""
     best = None
     for c in comments:
         if (c.get("user") or {}).get("login") not in authors:
             continue
         body = c.get("body") or ""
-        if VERDICT_MARK not in body:
+        marks = [m for m in VERDICT_MARKS if m in body]
+        if len(marks) != 1:
             continue
         if c.get("updated_at") != c.get("created_at"):
             continue
-        m = re.search(r"```json\s*(\{.*?\})\s*```", body.split(VERDICT_MARK, 1)[1], re.S)
+        m = re.search(r"```json\s*(\{.*?\})\s*```", body.split(marks[0], 1)[1], re.S)
         if not m:
             continue
         try:
@@ -269,19 +276,27 @@ def find_verdict(comments, authors, head_sha):
         except ValueError:
             continue
         if best is None or (c.get("created_at") or "") >= (best[0].get("created_at") or ""):
-            best = (c, data)
-    return best[1] if best else None
+            best = (c, VERDICT_MARKS[marks[0]], data)
+    return (best[1], best[2]) if best else None
 
 
-def check_verdict(data, head_sha, cls, cfg):
-    """(ok, effective-class, reason)."""
-    if data is None:
+def _int(v):
+    """An integer that is not a bool (json `true` is not an exit code)."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def check_verdict(found, head_sha, cls, cfg):
+    """(ok, effective-class, reason). `found` is what find_verdict returned."""
+    if found is None:
         return False, cls, "riesgo:%d needs a %s verdict pinned to %s" % (cls, risk_class.REVIEW[cls], head_sha[:7])
+    version, data = found
     if data.get("head_sha") != head_sha:
         return False, cls, "the lens verdict is for %s, the head is %s: ask again" % (str(data.get("head_sha"))[:7], head_sha[:7])
     vcls = data.get("class")
     if not isinstance(vcls, int) or vcls < cls:
         return False, cls, "the verdict's class (%s) is below the computed riesgo:%d" % (vcls, cls)
+    if version == 2:
+        return _check_v2(data, cls, vcls)
     if data.get("owner_gate_exit") != 0:
         return False, max(cls, 3), "the owner-decision lens did not clear it (exit %s)" % data.get("owner_gate_exit")
     ps = data.get("pr_score") or {}
@@ -289,6 +304,27 @@ def check_verdict(data, head_sha, cls, cfg):
     if not (isinstance(ps.get("total"), int) and isinstance(ps.get("axis_min"), int)
             and ps["total"] >= want.get("total", 22) and ps["axis_min"] >= want.get("axis_min", 4)):
         return False, cls, "pr-score below %s/%s" % (want.get("total", 22), want.get("axis_min", 4))
+    return True, vcls, ""
+
+
+def _check_v2(data, cls, vcls):
+    """agent-verdict v2: exactly its six keys (a pr_score or any other score never comes back), a
+    non-bool integer class, owner_gate_exit 0 and both review axes exactly the integer 0."""
+    extra, missing = sorted(set(data) - V2_KEYS), sorted(V2_KEYS - set(data))
+    if extra or missing:
+        return False, cls, "the v2 verdict does not follow its contract (extra %s, missing %s): ask again" % (
+            ", ".join(extra) or "-", ", ".join(missing) or "-")
+    if not _int(vcls):
+        return False, cls, "the v2 verdict's class (%s) is not an integer" % vcls
+    gate = data["owner_gate_exit"]
+    if not (_int(gate) and gate == 0):
+        return False, max(cls, 3), "the owner-decision lens did not clear it (exit %s)" % gate
+    review = data["review"]
+    if not (isinstance(review, dict) and set(review) == V2_AXES):
+        return False, cls, "the v2 verdict's review must be exactly {standards, spec}: ask again"
+    for axis in sorted(V2_AXES):
+        if not (_int(review[axis]) and review[axis] == 0):
+            return False, cls, "review axis %s did not clear it (exit %s)" % (axis, json.dumps(review[axis]))
     return True, vcls, ""
 
 
@@ -490,8 +526,8 @@ def decide_pr(ctx, pull, open_pulls=(), pre=None):
 
     if cls >= 1:
         comments = gh.list("repos/%s/issues/%d/comments" % (ctx.repo, pull["number"]))
-        data = find_verdict(comments, cfg.get("verdict_authors") or [], head_sha)
-        ok, vcls, why = check_verdict(data, head_sha, cls, cfg)
+        found = find_verdict(comments, cfg.get("verdict_authors") or [], head_sha)
+        ok, vcls, why = check_verdict(found, head_sha, cls, cfg)
         if vcls >= 3:
             return escalate_or_wait(vcls, why or "the lens raised it")
         if not ok:

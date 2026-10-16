@@ -130,6 +130,68 @@ expect("a verdict cannot lower the class", w, 5, "verdict", "below the computed"
 w = world(max_auto_class=1); add_pr(w, 5, files=["src/x.ts"]); w.comments(5, [verdict_comment(H.sha(5), total=20)])
 expect("pr-score below the bar", w, 5, "verdict", "pr-score")
 
+
+# ── lens verdict v2: the two review axes, no score ───────────────────────────────────────────────
+def v2_comment(head, cls=1, author="owner", standards=0, spec=0, gate=0, extra=None, review_extra=None,
+               drop=(), created="2026-10-01T12:00:00Z", cid=78):
+    review = {"standards": standards, "spec": spec}
+    review.update(review_extra or {})
+    data = {"head_sha": head, "class": cls, "reviewer": "sonnet-high", "owner_gate_exit": gate,
+            "review": review, "at": created}
+    data.update(extra or {})
+    for k in drop:
+        (review if k in ("standards", "spec") else data).pop(k)
+    body = "%s\n```json\n%s\n```" % ("<!-- agent-verdict v2 -->", json.dumps(data))
+    return {"id": cid, "user": {"login": author}, "body": body, "created_at": created, "updated_at": created}
+
+
+def at(comment, created):
+    return dict(comment, created_at=created, updated_at=created)
+
+
+def v2_world(*comments):
+    w = world(max_auto_class=1); add_pr(w, 5, files=["src/x.ts"]); w.comments(5, list(comments))
+    return w
+
+
+expect("v2: both review axes 0 clears", v2_world(v2_comment(H.sha(5))), 5, "merge")
+expect("v2: spec exit 3 is refused", v2_world(v2_comment(H.sha(5), spec=3)), 5, "verdict", "review axis spec")
+expect("v2: standards exit 1 is refused", v2_world(v2_comment(H.sha(5), standards=1)), 5, "verdict", "review axis standards")
+expect("v2: standards missing is refused", v2_world(v2_comment(H.sha(5), drop=("standards",))), 5, "verdict",
+       "exactly {standards, spec}")
+expect("v2: no review at all is refused", v2_world(v2_comment(H.sha(5), drop=("review",))), 5, "verdict", "missing review")
+expect("v2: spec false (a bool, == 0 in Python) is refused", v2_world(v2_comment(H.sha(5), spec=False)), 5, "verdict",
+       "review axis spec")
+expect("v2: standards true is refused", v2_world(v2_comment(H.sha(5), standards=True)), 5, "verdict", "review axis standards")
+expect("v2: an axis \"0\" (a string) is refused", v2_world(v2_comment(H.sha(5), spec="0")), 5, "verdict", "review axis spec")
+expect("v2: owner_gate_exit false is not 0: escalates", v2_world(v2_comment(H.sha(5), gate=False)), 5, "escalate")
+expect("v2: owner_gate_exit 1 escalates", v2_world(v2_comment(H.sha(5), gate=1)), 5, "escalate")
+expect("v2: class true is not an integer", v2_world(v2_comment(H.sha(5), cls=True)), 5, "verdict", "not an integer")
+expect("v2: carrying pr_score is refused", v2_world(v2_comment(H.sha(5), extra={"pr_score": {"total": 25, "axis_min": 5}})),
+       5, "verdict", "extra pr_score")
+expect("v2: a summed score field is refused", v2_world(v2_comment(H.sha(5), extra={"score": 10})), 5, "verdict", "extra score")
+expect("v2: a total inside review is refused", v2_world(v2_comment(H.sha(5), review_extra={"total": 0})), 5, "verdict",
+       "exactly {standards, spec}")
+expect("v2: for another SHA", v2_world(v2_comment(H.sha(4))), 5, "verdict", "ask again")
+expect("v2: cannot lower the class", v2_world(v2_comment(H.sha(5), cls=0)), 5, "verdict", "below the computed")
+expect("v2: by an untrusted author is ignored", v2_world(v2_comment(H.sha(5), author="stranger")), 5, "verdict",
+       "needs a sonnet-high verdict")
+edited = dict(v2_comment(H.sha(5)), updated_at="2026-10-01T12:30:00Z")
+expect("v2: an edited one is ignored", v2_world(edited), 5, "verdict", "needs a sonnet-high verdict")
+both = dict(v2_comment(H.sha(5)))
+both["body"] = "<!-- agent-verdict v1 -->\n" + both["body"]
+expect("a comment carrying both marks is ignored", v2_world(both), 5, "verdict", "needs a sonnet-high verdict")
+# which one is read: the latest by created_at, whatever its version and its place in the list
+v1_ok = at(verdict_comment(H.sha(5)), "2026-10-01T11:00:00Z")
+v1_low = at(verdict_comment(H.sha(5), total=20), "2026-10-01T13:00:00Z")
+expect("v1 still clears with its bar during the transition", v2_world(v1_ok), 5, "merge")
+expect("v1 older and clearing, v2 newer with spec 3: v2 is read", v2_world(v1_ok, v2_comment(H.sha(5), spec=3)), 5,
+       "verdict", "review axis spec")
+expect("v2 older and clearing, v1 newer below the bar (listed first): v1 is read",
+       v2_world(v1_low, v2_comment(H.sha(5))), 5, "verdict", "pr-score")
+expect("v1 older below the bar, v2 newer clearing: v2 is read",
+       v2_world(at(verdict_comment(H.sha(5), total=20), "2026-10-01T11:00:00Z"), v2_comment(H.sha(5))), 5, "merge")
+
 # ── PR shape ─────────────────────────────────────────────────────────────────────────────────────
 w = world(); child = w.pull(6, base="feat/pr-5"); add_pr(w, 5, others=[child])
 expect("a stacked PR on top of it", w, 5, "skip", "stacked")

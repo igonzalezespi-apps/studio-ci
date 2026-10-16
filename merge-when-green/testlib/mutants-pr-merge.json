@@ -250,5 +250,29 @@
   "why": "the sweep looks for stacked PRs only among the PRs into the integration branch",
   "old": "        return out, every\n    return pulls, every\n",
   "new": "        return out, pulls\n    return pulls, pulls\n"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a v2 verdict's review axes are not read",
+  "old": "        if not (_int(review[axis]) and review[axis] == 0):",
+  "new": "        if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a bool passes as a v2 exit code",
+  "old": "    return isinstance(v, int) and not isinstance(v, bool)",
+  "new": "    return isinstance(v, int)"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a v2 verdict may carry a pr_score or any other score",
+  "old": "    if extra or missing:",
+  "new": "    if missing:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a v2 verdict is judged by the v1 rules",
+  "old": "    if version == 2:\n        return _check_v2(",
+  "new": "    if False:\n        return _check_v2("
  }
 ]
