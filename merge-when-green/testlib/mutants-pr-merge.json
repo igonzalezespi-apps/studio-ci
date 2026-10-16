@@ -277,8 +277,20 @@
  },
  {
   "file": "merge-when-green/pr_merge.py",
-  "why": "a v2 verdict may nest a score inside reviewer or at",
-  "old": "        if not (isinstance(data[key], str) and data[key]):",
-  "new": "        if False:"
+  "why": "a v2 verdict's reviewer is not checked (a score may ride in it)",
+  "old": "    if not (isinstance(data[\"reviewer\"], str) and data[\"reviewer\"] in V2_REVIEWERS):",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a v2 verdict's at is not checked (a score may ride in it)",
+  "old": "    if not (isinstance(data[\"at\"], str) and V2_AT_RX.match(data[\"at\"])):",
+  "new": "    if False:"
+ },
+ {
+  "file": "merge-when-green/pr_merge.py",
+  "why": "a v2 verdict's at may carry text after the time",
+  "old": "r\"\\A\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z\\Z\"",
+  "new": "r\"\\A\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z\""
  }
 ]

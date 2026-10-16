@@ -656,14 +656,16 @@ head) and no score:
 <!-- agent-verdict v2 -->
 ```json
 {"head_sha": "<40 hex>", "class": 2, "reviewer": "opus-high", "owner_gate_exit": 0,
- "review": {"standards": 0, "spec": 0}, "at": "<ISO time>"}
+ "review": {"standards": 0, "spec": 0}, "at": "<YYYY-MM-DDThh:mm:ssZ>"}
 ```
 ````
 
 A v2 verdict clears only with exactly those six keys, `review` exactly `{standards, spec}`, both
 axes and `owner_gate_exit` the integer `0` (`true`/`false` or `"0"` are not exit codes), and
-`reviewer` and `at` non-empty strings. One that carries a `pr_score` or any other key (a summed
-score, a total), at the top, inside `review` or nested in `reviewer`/`at`, is refused.
+`reviewer` either `sonnet-high` or `opus-high`, and `at` a UTC time to the second
+(`2026-10-16T04:06:12Z`, nothing after it). One that carries a `pr_score` or any other key (a summed
+score, a total), at the top or inside `review`, or a score nested or spelled out in `reviewer`/`at`,
+is refused.
 
 **Deprecated, accepted during the transition:** `agent-verdict v1`, which carries the summed
 pr-score instead of `review` and needs a score at or above the config's `pr_score` (default 22/4):

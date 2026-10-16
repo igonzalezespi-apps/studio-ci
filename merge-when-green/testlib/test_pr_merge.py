@@ -177,6 +177,20 @@ expect("v2: a pr_score nested in reviewer is refused",
 expect("v2: a number as at is refused", v2_world(v2_comment(H.sha(5), extra={"at": 25})), 5, "verdict", "at must be")
 expect("v2: an empty reviewer is refused", v2_world(v2_comment(H.sha(5), extra={"reviewer": ""})), 5, "verdict",
        "reviewer must be")
+expect("v2: a score spelled out in reviewer is refused",
+       v2_world(v2_comment(H.sha(5), extra={"reviewer": "pr_score 25/25"})), 5, "verdict", "reviewer must be")
+expect("v2: a score as JSON text in reviewer is refused",
+       v2_world(v2_comment(H.sha(5), extra={"reviewer": json.dumps({"pr_score": {"total": 25}})})), 5, "verdict",
+       "reviewer must be")
+expect("v2: an opus-high reviewer clears", v2_world(v2_comment(H.sha(5), extra={"reviewer": "opus-high"})), 5, "merge")
+expect("v2: at \"25\" (a string) is refused", v2_world(v2_comment(H.sha(5), extra={"at": "25"})), 5, "verdict",
+       "at must be")
+expect("v2: a score spelled out in at is refused", v2_world(v2_comment(H.sha(5), extra={"at": "pr_score=25"})), 5,
+       "verdict", "at must be")
+expect("v2: a score after a valid at is refused",
+       v2_world(v2_comment(H.sha(5), extra={"at": "2026-10-01T12:00:00Z pr_score=25"})), 5, "verdict", "at must be")
+expect("v2: an at with a trailing newline is refused",
+       v2_world(v2_comment(H.sha(5), extra={"at": "2026-10-01T12:00:00Z\n"})), 5, "verdict", "at must be")
 expect("v2: for another SHA", v2_world(v2_comment(H.sha(4))), 5, "verdict", "ask again")
 expect("v2: cannot lower the class", v2_world(v2_comment(H.sha(5), cls=0)), 5, "verdict", "below the computed")
 expect("v2: by an untrusted author is ignored", v2_world(v2_comment(H.sha(5), author="stranger")), 5, "verdict",
