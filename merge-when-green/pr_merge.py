@@ -308,12 +308,15 @@ def check_verdict(found, head_sha, cls, cfg):
 
 
 def _check_v2(data, cls, vcls):
-    """agent-verdict v2: exactly its six keys (a pr_score or any other score never comes back), a
-    non-bool integer class, owner_gate_exit 0 and both review axes exactly the integer 0."""
+    """agent-verdict v2: exactly its six keys (a pr_score or any other score never comes back),
+    reviewer and at plain non-empty strings (nothing nested in them), a non-bool integer class, owner_gate_exit 0 and both review axes exactly the integer 0."""
     extra, missing = sorted(set(data) - V2_KEYS), sorted(V2_KEYS - set(data))
     if extra or missing:
         return False, cls, "the v2 verdict does not follow its contract (extra %s, missing %s): ask again" % (
             ", ".join(extra) or "-", ", ".join(missing) or "-")
+    for key in ("reviewer", "at"):
+        if not (isinstance(data[key], str) and data[key]):
+            return False, cls, "the v2 verdict's %s must be a non-empty string (a score cannot ride in it): ask again" % key
     if not _int(vcls):
         return False, cls, "the v2 verdict's class (%s) is not an integer" % vcls
     gate = data["owner_gate_exit"]

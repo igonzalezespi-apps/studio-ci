@@ -172,6 +172,11 @@ expect("v2: carrying pr_score is refused", v2_world(v2_comment(H.sha(5), extra={
 expect("v2: a summed score field is refused", v2_world(v2_comment(H.sha(5), extra={"score": 10})), 5, "verdict", "extra score")
 expect("v2: a total inside review is refused", v2_world(v2_comment(H.sha(5), review_extra={"total": 0})), 5, "verdict",
        "exactly {standards, spec}")
+expect("v2: a pr_score nested in reviewer is refused",
+       v2_world(v2_comment(H.sha(5), extra={"reviewer": {"pr_score": {"total": 25}}})), 5, "verdict", "reviewer must be")
+expect("v2: a number as at is refused", v2_world(v2_comment(H.sha(5), extra={"at": 25})), 5, "verdict", "at must be")
+expect("v2: an empty reviewer is refused", v2_world(v2_comment(H.sha(5), extra={"reviewer": ""})), 5, "verdict",
+       "reviewer must be")
 expect("v2: for another SHA", v2_world(v2_comment(H.sha(4))), 5, "verdict", "ask again")
 expect("v2: cannot lower the class", v2_world(v2_comment(H.sha(5), cls=0)), 5, "verdict", "below the computed")
 expect("v2: by an untrusted author is ignored", v2_world(v2_comment(H.sha(5), author="stranger")), 5, "verdict",
