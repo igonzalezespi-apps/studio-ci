@@ -4,6 +4,15 @@ on:
     types: [opened, edited, synchronize, reopened]
 permissions:
   pull-requests: read
+# Solo se cancela lo que un commit NUEVO ha dejado viejo: `opened`/`synchronize` de una PR comparten
+# grupo y el ultimo cancela al anterior (el `cancelled` cae en un commit que ya no es la cabeza).
+# Cualquier otro evento (`edited`, `labeled`, `reopened`, push a develop/main) va a un grupo propio de
+# su ejecucion: ni cancela ni lo cancelan, ni GitHub lo descarta estando pendiente. Asi no queda un
+# check `cancelled` en la cabeza vigente y cada push a la rama principal tiene su CI.
+# `concurrency.test.sh` evalua estas expresiones evento a evento.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
 jobs:
   lint:
     runs-on: ubuntu-latest

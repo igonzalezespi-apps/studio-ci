@@ -44,7 +44,8 @@
     "app_slug": {"type": "string", "description": "Slug of the merge App: its merges are the only ones develop-health reverts."},
     "verdict_authors": {"type": "array", "items": {"type": "string"}, "default": []},
     "pr_score": {
-      "type": "object", "additionalProperties": false,
+      "type": "object", "additionalProperties": false, "deprecated": true,
+      "description": "Deprecated. The bar an agent-verdict v1 comment (summed pr-score) must reach; still validated and still applied to v1 during the transition. An agent-verdict v2 comment carries no score (the exit codes of the standards and spec review axes instead) and ignores it.",
       "properties": {"total": {"type": "integer"}, "axis_min": {"type": "integer"}},
       "default": {"total": 22, "axis_min": 4}
     },

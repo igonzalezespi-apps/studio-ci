@@ -17,12 +17,18 @@ One aggregate gate per workflow: the single required check. Call it from a final
 on every other job, so path/label-skipped jobs never wedge the merge — `skipped` and `success`
 both pass; only `failure`/`cancelled` fail it.
 
+Run it with `if: ${{ !cancelled() }}`, not `always()`. Both run the gate when a job it needs
+failed, was cancelled (a timeout included) or was skipped, so it decides the same way. They differ
+only when the whole run is cancelled — a newer commit superseding it: `always()` still starts the
+gate, which then holds a runner just to report red on a commit nobody is looking at;
+`!cancelled()` does not start it.
+
 ```yaml
 jobs:
   # ... your jobs ...
   ci-gate:
     name: ci-gate
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [lint, typecheck, test, build] # list EVERY job
     runs-on: ubuntu-latest
     steps:
@@ -642,7 +648,27 @@ A riesgo-3/4 PR by a person, with CI green and no `revision-humana`, gets that l
 so the `labeled` event wakes the TL;DR check; a bot's PR is never labelled.
 
 **Lens verdict (riesgo-1/2).** The session reviews the PR (Sonnet-high for 1, Opus-high for 2) and
-posts a comment from an account in `verdict_authors`:
+posts a comment from an account in `verdict_authors`. The current form, `agent-verdict v2`, carries
+the exit codes of the two review axes (`review-gate.py --axis standards` and `--axis spec` on that
+head) and no score:
+
+````
+<!-- agent-verdict v2 -->
+```json
+{"head_sha": "<40 hex>", "class": 2, "reviewer": "opus-high", "owner_gate_exit": 0,
+ "review": {"standards": 0, "spec": 0}, "at": "<YYYY-MM-DDThh:mm:ssZ>"}
+```
+````
+
+A v2 verdict clears only with exactly those six keys, `review` exactly `{standards, spec}`, both
+axes and `owner_gate_exit` the integer `0` (`true`/`false` or `"0"` are not exit codes), and
+`reviewer` either `sonnet-high` or `opus-high`, and `at` a real UTC time to the second in ASCII
+digits (`2026-10-16T04:06:12Z`, nothing after it; `9999-99-99T99:99:99Z` is refused). One that
+carries a `pr_score` or any other key (a summed score, a total), at the top or inside `review`, or a
+score nested in `reviewer` or written as text in either field, is refused. Nothing reads `at`'s value.
+
+**Deprecated, accepted during the transition:** `agent-verdict v1`, which carries the summed
+pr-score instead of `review` and needs a score at or above the config's `pr_score` (default 22/4):
 
 ````
 <!-- agent-verdict v1 -->
@@ -652,12 +678,13 @@ posts a comment from an account in `verdict_authors`:
 ```
 ````
 
-It counts only if it is the latest such comment, never edited, for the current head, with
-`owner_gate_exit: 0`, a score at or above `pr_score`, and a `class` not below the computed one (a
-higher class wins; 3 or more escalates). A new push voids it. **`verdict_authors` must be an
-identity the agent sessions cannot use** (a workflow with its own App, or a separate bot account):
-if the sessions post as the owner and the owner is a verdict author, a session can clear its own
-PR. Until such an identity exists, keep `max_auto_class` at 0.
+Of either version, it counts only if it is the latest such comment by `created_at` (a v2 after a
+v1 replaces it, and the other way round; a comment carrying both marks is ignored), never edited,
+for the current head, with `owner_gate_exit: 0`, its axes or its score clearing, and a `class` not
+below the computed one (a higher class wins; 3 or more escalates). A new push voids it.
+**`verdict_authors` must be an identity the agent sessions cannot use** (a workflow with its own
+App, or a separate bot account): if the sessions post as the owner and the owner is a verdict
+author, a session can clear its own PR. Until such an identity exists, keep `max_auto_class` at 0.
 
 **Locally**: `merge-when-green/pr-merge.sh decide --repo owner/name --pr N` (read-only; exit 0
 merge, 10 wait, 20 needs a verdict, 30 escalate, 40 skip, 2 error). `merge` refuses outside GitHub
@@ -774,14 +801,24 @@ on the code); never in the self-test.
 
    The push CI of the integration branch must never cancel or replace a run: every pushed commit
    needs its own verdict, or a red cannot be tied to one merge. `cancel-in-progress: false` is not
-   enough — GitHub still cancels a *pending* run of the same group when a third one arrives — so
-   give each push its own group:
+   enough — GitHub still cancels a *pending* run of the same group when a third one arrives. On a
+   pull request, cancel only what a new commit made stale: grouping every PR event by ref lets a
+   `reopened` (or `labeled`, `edited`) run cancel the one still running on the same head, and the
+   head is left with a `cancelled` check. studio-ci's own `ci.yml` uses this block (the rule of the
+   job-level group of `security.yml`, minus its `pull_request_target` case):
 
    ```yaml
    concurrency:
-     group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
-     cancel-in-progress: ${{ github.event_name != 'push' }}
+     group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+     cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
    ```
+
+   `opened` and `synchronize` share one group per PR and cancel the older run, which by then
+   belongs to a commit that is no longer the head. Every other event — `reopened`, `labeled`,
+   `edited`, each push to the integration branch — gets a group of its own run: it neither cancels
+   nor is cancelled, and GitHub never drops it while pending. Not in a workflow that listens to
+   label-like events and calls `security.yml`: its `caller-guard` fails on any workflow-level
+   `concurrency` there (see **Concurrency** under security above).
 
    In a **private** repo the plan/assess jobs run where `runs-on` says, and they do not start at
    all on a GitHub-hosted image unless the caller passes `allow-hosted: true` (billed minutes: with

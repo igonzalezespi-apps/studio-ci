@@ -336,7 +336,7 @@ CONFIG_KEYS = {
     "renovate_minor_class": int,
     "app_slug": str,
     "verdict_authors": list,
-    "pr_score": dict,
+    "pr_score": dict,  # deprecated: only agent-verdict v1 reads it; v2 carries no score
     "max_reverts_per_day": int,
     "max_candidates": int,
 }
@@ -397,6 +397,8 @@ def validate_config(cfg):
             problems.append("%r must be a list of non-empty strings" % key)
     if out["max_auto_class"] >= 1 and not out["verdict_authors"]:
         problems.append("'max_auto_class' >= 1 needs 'verdict_authors' (riesgo-1/2 need a lens verdict)")
+    # pr_score is deprecated (the bar of agent-verdict v1 only, kept through the transition to v2),
+    # but still validated: a v1 verdict is still read against it.
     ps = out["pr_score"]
     if not (isinstance(ps.get("total"), int) and isinstance(ps.get("axis_min"), int)):
         problems.append("'pr_score' must be {\"total\": int, \"axis_min\": int}")
