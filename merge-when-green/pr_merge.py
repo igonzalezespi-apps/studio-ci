@@ -15,8 +15,10 @@ Subcommands:
                                               pinned to the evaluated head SHA. Refuses outside
                                               GitHub Actions and with anything but an App
                                               installation token scoped to this one repository
-  escalate --repo R --pr N                    label revision-humana with the App token, so the
-                                              `labeled` event wakes the TL;DR check (the one escalation channel)
+  escalate --repo R --pr N                    label revision-humana with the App token (the one
+                                              escalation channel). Live mode only, like the merge;
+                                              and unlike a GITHUB_TOKEN write, an App label still
+                                              fires `labeled` for any workflow the repo hangs on it
 
 Everything a PR author controls is data: titles, bodies, labels and branch names are read from the
 API inside this process and travel as JSON, never through a shell or a `${{ }}` expression.
@@ -902,7 +904,7 @@ def cmd_merge(a):
     problems = post_merge_check(gh, ctx, pr)
     if problems:
         open_issue(gh, repo, "merge-when-green: comprobar el merge de #%d" % pr,
-                   tldr_post_merge(repo, pr, problems, a["run_url"]), [ESCALATION_LABEL])
+                   post_merge_issue(repo, pr, problems, a["run_url"]), [ESCALATION_LABEL])
         print("post-merge check failed: %s" % "; ".join(problems), file=sys.stderr)
         return 1
     if (a["comment"] or "true") == "true":
@@ -924,8 +926,8 @@ def post_merge_check(gh, ctx, pr):
     return problems
 
 
-def tldr_post_merge(repo, pr, problems, run_url):
-    return ("## TL;DR\n\n**Qué ha pasado:** el merge automático de la PR %d de este repositorio salió, pero la "
+def post_merge_issue(repo, pr, problems, run_url):
+    return ("**Qué ha pasado:** el merge automático de la PR %d de este repositorio salió, pero la "
             "comprobación de después no cuadra: %s. Puede ser una carrera (alguien cambió la PR en el segundo "
             "del merge) o algo peor; por eso no se ha seguido mergeando nada más hasta que lo mires.\n\n"
             "**Qué puede salir mal y cómo se deshace:** si el cambio no debía entrar, se revierte el commit "

@@ -146,8 +146,8 @@ S.check("first red attributed", res["outputs"].get("revert_sha") == F, res["outp
 
 w = world([(F, "failure", 2), (L, "success", 1)]); culprit(w, commits=(H.sha(55), F))
 res = expect("two commits between green and red: escalate", w, "escalate", note="not attributable")
-S.check("escalate: the freeze issue carries revision-humana and a TL;DR",
-        any(c["path"].endswith("/issues") and "revision-humana" in json.dumps(c["input"]) and "## TL;DR" in c["input"]["body"]
+S.check("escalate: the freeze issue carries revision-humana and a plain-language body",
+        any(c["path"].endswith("/issues") and "revision-humana" in json.dumps(c["input"]) and "**Qué pasa:**" in c["input"]["body"]
             for c in H.writes(res, "POST")))
 w = world([(F, "failure", 2), (G, "cancelled", 1), (L, "success", 1)]); culprit(w, commits=(G, F))
 expect("an unmeasured (cancelled) push in between: escalate", w, "escalate")
@@ -227,8 +227,8 @@ res = expect("a freeze already escalated is not rewritten on every run", w, "esc
 S.check("already escalated: no write on the freeze", not any("/issues/40" in c["path"] for c in H.writes(res)), H.writes(res))
 w = world([(F, "failure", 2), (L, "success", 1)], freeze=[BOT_FREEZE]); culprit(w, merged_by="igonzalezespi")
 res = expect("escalating an existing freeze edits it and adds revision-humana", w, "escalate")
-S.check("existing freeze: body rewritten with the TL;DR, label added",
-        any(c["method"] == "PATCH" and c["path"].endswith("/issues/40") and "## TL;DR" in c["input"]["body"] for c in H.writes(res)) and
+S.check("existing freeze: body rewritten with the escalation, label added",
+        any(c["method"] == "PATCH" and c["path"].endswith("/issues/40") and "**Qué pasa:**" in c["input"]["body"] for c in H.writes(res)) and
         any(c["path"].endswith("/issues/40/labels") and c["input"] == {"labels": ["revision-humana"]} for c in H.writes(res, "POST")))
 w = world([(F, "failure", 2), (L, "success", 1)]); culprit(w)
 mark = {"id": 88, "user": {"login": "github-actions[bot]"}, "created_at": H.T0, "updated_at": H.T0,

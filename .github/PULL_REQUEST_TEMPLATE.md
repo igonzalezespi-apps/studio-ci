@@ -1,17 +1,3 @@
-## TL;DR
-
-<!-- La sección que Iván lee SIEMPRE, y casi siempre la única. Va primera y es
-     AUTOCONTENIDA: sin «ver abajo», y si hace falta un ADR o una decisión vieja,
-     se escribe aquí en una línea o se enlaza. Sin jerga: nada de ficheros, flags
-     ni herramientas.
-     - Qué cambia para los usuarios o para el estudio.
-     - Qué puede salir mal y cómo se deshace.
-     - Qué decisiones suyas van dentro (o «ninguna»).
-     - Qué NO se ha comprobado.
-     - Si la mergea él: el comando completo.
-     Si esta PR NO debe mergearse todavía, se abre en DRAFT — él mergea lo que
-     está listo y en verde, así que un aviso escrito aquí no la detiene. -->
-
 ## Lo técnico (decidido por el agente; queda registrado)
 
 <!-- Telegráfico: hechos, números, comandos. Qué se MIDIÓ (con el número), qué se

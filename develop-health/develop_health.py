@@ -20,7 +20,7 @@ It always judges the CURRENT head of the integration branch with the push checks
                         * F is not itself a revert;
                         * fewer than `max_reverts_per_day` reverts in the last 24 h;
                         * no revert of that PR exists yet.
-                      Otherwise it escalates: the freeze issue gets revision-humana and a TL;DR.
+                      Otherwise it escalates: the freeze issue gets revision-humana and a plain-language body.
                       A person's merge is never reverted automatically.
                       While the revert is open it is re-judged on every run with merge-when-green's
                       own rules: closed without merging, invalid (anything pushed on top of it),
@@ -218,10 +218,10 @@ def judge_revert(gh, ctx, info, head_sha, v, issue):
     return "%s is open (%s: %s)" % (tag, d["decision"], "; ".join(d["reasons"])), []
 
 
-def tldr_escalation(repo, integration, head_sha, red, reasons, info, run_url):
+def escalation_body(repo, integration, head_sha, red, reasons, info, run_url):
     sus = ", ".join(s[:7] for s in (info or {}).get("range", [])) or "sin determinar"
     return (
-        "%s\n## TL;DR\n\n"
+        "%s\n"
         "**Qué pasa:** la rama %s de este repositorio está en rojo en el commit %s (%s), y el automático no "
         "puede deshacerlo solo: %s. Mientras esta incidencia tenga la etiqueta merge-freeze no se mergea nada "
         "automáticamente aquí.\n\n"
@@ -334,7 +334,7 @@ def assess(gh, ctx, mode, run_url, write=True):
     note = ("Se revierte automáticamente #%d (riesgo:%d, mergeada por el automático)." % (info["pr"], info["class"])
             if plan["action"] == "revert" else "Escalado: %s." % "; ".join(reasons))
     if plan["action"] == "escalate":
-        body = tldr_escalation(repo, ctx.integration, head_sha, v["red"], reasons, culprit, run_url)
+        body = escalation_body(repo, ctx.integration, head_sha, v["red"], reasons, culprit, run_url)
         if issue and pr_merge.ESCALATION_LABEL in [lb["name"] for lb in issue.get("labels") or []]:
             plan["notes"].append("freeze #%d is already with the owner" % issue["number"])
             return plan
@@ -457,7 +457,7 @@ def owner_alerts(gh, ctx, mentions, hours, write, run_url):
             continue
         what = ("una promoción a %s" % ctx.protected) if promotion else "una PR marcada revision-humana"
         body = ("%s class=%d since=%s -->\n%s esto es %s, riesgo:%d, y lleva %d h esperando tu decisión "
-                "(desde el %s UTC). Su `## TL;DR` dice qué mirar y trae el comando de merge. Es el único aviso "
+                "(desde el %s UTC). El principio de su descripción dice qué mirar y trae el comando de merge. Es el único aviso "
                 "de esta espera; si no la quieres aquí, quita la marca o ciérrala.\n\nEjecución: %s"
                 % (ALERT_MARK, cls, mwg.iso(since), " ".join("@" + x for x in mentions), what, cls, int(waited),
                    mwg.iso(since).replace("T", " ").rstrip("Z"), run_url or "(local)"))

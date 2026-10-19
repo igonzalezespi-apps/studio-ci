@@ -21,8 +21,9 @@
 #          any event) cannot read it, so a PR cannot mint a token and merge itself. A repository
 #          secret would not give that guarantee. The merge job also refuses unless the run is on
 #          the default branch, the repo is public (Free plan: no Environments in private repos)
-#          and this is not a self-test. The App token only merges and labels revision-humana (the
-#          `labeled` event must wake the TL;DR check); it is revoked at the end of the step.
+#          and this is not a self-test. The App token only merges and labels revision-humana (a
+#          live-mode act like the merge; an App label, unlike a GITHUB_TOKEN one, still fires
+#          `labeled` for any workflow the caller hangs on it); it is revoked at the end of the step.
 #
 # The code runs from THIS repository at `job.workflow_sha` — the commit the caller pinned — never
 # from the caller's checkout, and the pull request's code is never checked out. The caller's

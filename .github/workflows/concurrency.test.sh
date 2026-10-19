@@ -15,7 +15,7 @@
 #   3. push, schedule y workflow_dispatch no cancelan nunca;
 #   4. el heartbeat no cancela nunca, y en una PR su grupo es solo suyo.
 #   5. los workflows propios con `concurrency` de primer nivel (ci, guard-selftest,
-#      detect-changes-selftest, pr-title-lint, pr-tldr) cumplen 1-3, y dos push a develop/main no
+#      detect-changes-selftest, pr-title-lint) cumplen 1-3, y dos push a develop/main no
 #      comparten grupo: cada commit de la rama principal tiene su CI.
 #
 # Y despues MUTA los ficheros (las dos "simplificaciones" que reintroducen el fallo) y exige que la
@@ -290,7 +290,7 @@ comprueba security  "$HERE/security.yml"           "security.yml cumple las regl
 comprueba heartbeat "$HERE/renovate-heartbeat.yml" "renovate-heartbeat.yml cumple las reglas de concurrencia" 0
 # Los workflows propios con `concurrency` de primer nivel: solo cancelan lo que un commit nuevo dejo
 # viejo, y nunca un push a develop/main.
-for wf in ci guard-selftest detect-changes-selftest pr-title-lint pr-tldr; do
+for wf in ci guard-selftest detect-changes-selftest pr-title-lint; do
   comprueba workflow "$HERE/$wf.yml" "$wf.yml cumple las reglas de concurrencia" 0
 done
 
@@ -331,11 +331,11 @@ PY
 }
 mutaw "$HERE/ci.yml" "$TMP/w1.yml" 'c["group"] = "${{ github.workflow }}-${{ github.ref }}"; c["cancel-in-progress"] = "${{ github.ref != \x27refs/heads/main\x27 }}"'
 comprueba workflow "$TMP/w1.yml" "mutante: el grupo por ref de antes (cancela develop y el mismo commit)" 1
-mutaw "$HERE/pr-tldr.yml" "$TMP/w2.yml" 'c["cancel-in-progress"] = True'
+mutaw "$HERE/pr-title-lint.yml" "$TMP/w2.yml" 'c["cancel-in-progress"] = True'
 comprueba workflow "$TMP/w2.yml" "mutante: workflow que cancela en cualquier evento" 1
 mutaw "$HERE/ci.yml" "$TMP/w3.yml" 'c["group"] = c["group"].replace("format(\x27run-{0}-{1}\x27, github.run_id, github.run_attempt)", "github.ref")'
 comprueba workflow "$TMP/w3.yml" "mutante: push y eventos sin codigo agrupados por ref" 1
-mutaw "$HERE/pr-tldr.yml" "$TMP/w4.yml" 'doc.pop("concurrency")'
+mutaw "$HERE/pr-title-lint.yml" "$TMP/w4.yml" 'doc.pop("concurrency")'
 comprueba workflow "$TMP/w4.yml" "mutante: workflow sin concurrency" 1
 
 echo

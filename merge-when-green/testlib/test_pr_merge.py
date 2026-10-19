@@ -534,7 +534,7 @@ S.check("merge: waits for mergeability (UNKNOWN after another merge)", res["rc"]
 w = merge_world()
 res = H.run_script(PM, ["escalate", "--repo", R, "--pr", "5"], w, APP_ENV)
 lab = [c for c in H.writes(res, "POST") if c["path"].endswith("/issues/5/labels")]
-S.check("escalate: revision-humana with the App token (so `labeled` wakes the TL;DR check)",
+S.check("escalate: revision-humana with the App token (a live-mode act whose `labeled` event still fires)",
         res["rc"] == 0 and lab and lab[0]["token"] == "ghs_ap" and lab[0]["input"] == {"labels": ["revision-humana"]})
 res = H.run_script(PM, ["escalate", "--repo", R, "--pr", "5"], merge_world())
 S.check("escalate refuses without an App token", res["rc"] == 2)

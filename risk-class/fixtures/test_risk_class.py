@@ -221,7 +221,6 @@ case("H1 a script the agent's hooks run (outside scripts/hooks)", dict(facts(["s
 case("H2 the status-line script", dict(facts(["tools/status.py"]), hook_paths=HOOKED), 3)
 case("H3 a script no hook runs", dict(facts(["scripts/other.sh"]), hook_paths=HOOKED), 1)
 case("O4a the classifier itself", facts(["risk-class/risk_class.py"]), 3)
-case("O4b the TL;DR check", facts(["check-pr-tldr/check.sh"]), 3)
 case("O4c the merge gate scripts", facts(["merge-when-green/pr_merge.py"]), 3)
 case("PR template", facts([".github/PULL_REQUEST_TEMPLATE.md"]), 0)
 out = case("missing semver does not change the class", facts(["docs/a.md"], labels=[]), 0)
