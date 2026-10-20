@@ -76,6 +76,23 @@
 # and the end of this file).
 # ============================================================================
 set -euo pipefail
+# SIGXFSZ is ignored: a write past a file-size limit (`ulimit -f`) fails with an error, as on a full
+# disk, and the guard still reaches its verdict. A hook ended by a signal does not block the command.
+# The guard keeps no temporary file of its own: its policy readers and every list it loops over need
+# none. Its two heredocs and mapfile_of's here-string may, and where one cannot be written the guard
+# reads the same text another way or denies.
+trap '' XFSZ
+# The guard runs in bash's own mode, never in POSIX mode, and resolves its paths without CDPATH,
+# whatever the environment that launches it holds (POSIXLY_CORRECT, posix in SHELLOPTS, CDPATH): its
+# rules are written for bash's expansions and its paths are read as written. When it cannot clear
+# them, it judges nothing and denies.
+set +o posix
+shopt -u inherit_errexit 2>/dev/null || true
+unset POSIXLY_CORRECT CDPATH 2>/dev/null || true
+if [ -n "${POSIXLY_CORRECT+x}${CDPATH+x}" ] || shopt -qo posix; then
+  printf '%s\n' "bash-guard DENY: POSIXLY_CORRECT or CDPATH is read-only in the environment that started this hook, so the guard cannot judge any command. Alternative: start Claude Code from an environment where neither is read-only" >&2 || true
+  exit 2
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -125,10 +142,16 @@ POLICY_FILE="${BASH_GUARD_POLICY:-$HERE/guard.policy.json}"
 # The reader itself, kept in a variable: the SAME strict-defaults parser has to serve
 # both this repo's policy and (in check_pr_merge) a target repo's. Two copies would
 # drift, and the one that drifted would be the one nobody runs locally.
+#   A first line `READ<TAB>fail` says the file is not one JSON object, and the defaults below
+#   stand in for it: only a foreign push reads that line (destination_protected_branch); every
+#   other reader ignores the key and keeps the defaults it always had.
 POLICY_READER='
 const fs = require("fs");
-let p = {};
-try { p = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) {}
+let p = {}, read = false;
+try {
+  p = JSON.parse(fs.readFileSync(process.argv[1] === "-" ? 0 : process.argv[1], "utf8"));
+  read = typeof p === "object" && p !== null && !Array.isArray(p);
+} catch (e) {}
 const trees = Array.isArray(p.generated_trees) ? p.generated_trees : [];
 const regen = typeof p.generated_regen_hint === "string" ? p.generated_regen_hint : "";
 const merge = p.agent_may_merge === true ? "true" : "false";
@@ -141,6 +164,7 @@ const egress = Array.isArray(p.egress_allow) && p.egress_allow.length
 const worktree = p.one_worktree_per_task === true ? "true" : "false";
 const forbidden = Array.isArray(p.forbidden_paths) ? p.forbidden_paths : [];
 const out = [];
+if (!read) out.push("READ\tfail");
 out.push("MERGE\t" + merge);
 out.push("PRLABEL\t" + prLabel);
 out.push("PROTECTED\t" + prot);
@@ -169,14 +193,17 @@ FORBIDDEN_PATHS=()
 # helpers defined further down (published_policy_tsv); the vendored mode reads the
 # same file with the same reader as ever.
 load_policy() {
-  local POLICY_TSV key val
+  local POLICY_TSV key val line
   if [ "$PUBLISHED" -eq 1 ] && [ -z "${BASH_GUARD_POLICY:-}" ]; then
     POLICY_TSV="$(published_policy_tsv "$PUBLISHED_PROJECT")"
   else
     POLICY_TSV="$(node -e "$POLICY_READER" "$POLICY_FILE" 2>/dev/null || true)"
   fi
   if [ -n "$POLICY_TSV" ]; then
-    while IFS=$'\t' read -r key val; do
+    lines_of "$POLICY_TSV"
+    for line in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+      tsv_pair "$line"
+      key="$TSV_KEY" val="$TSV_VAL"
       case "$key" in
         MERGE) AGENT_MAY_MERGE="$val" ;;
         PRLABEL) REQUIRE_PR_LABEL="$val" ;;
@@ -189,7 +216,7 @@ load_policy() {
         WORKTREE) ONE_WORKTREE_PER_TASK="$val" ;;
         FORBID) [ -n "$val" ] && FORBIDDEN_PATHS+=("$val") ;;
       esac
-    done <<<"$POLICY_TSV"
+    done
   fi
   # Fallback if the policy provided no egress allow-list (defensive; the node
   # reader already defaults, but never leave the list empty → would allow all).
@@ -253,10 +280,10 @@ deny() {
   local alt="$2"
   [ "${QUOTED:-0}" != 1 ] || [ "$QUOTED_HINT_OFF" = 1 ] || alt="${alt%.}. ${QUOTED_TEXT_HINT}"
   if [ -n "$CW_CONTEXT" ]; then
-    printf 'bash-guard DENY: %s: %s. Alternative: %s%s\n' "$CW_CONTEXT" "$1" "${CW_HINT:+$CW_HINT; then }" "$alt" >&2
+    printf 'bash-guard DENY: %s: %s. Alternative: %s%s\n' "$CW_CONTEXT" "$1" "${CW_HINT:+$CW_HINT; then }" "$alt" >&2 || true
     exit 2
   fi
-  printf 'bash-guard DENY: %s. Alternative: %s\n' "$1" "$alt" >&2
+  printf 'bash-guard DENY: %s. Alternative: %s\n' "$1" "$alt" >&2 || true
   exit 2
 }
 
@@ -342,6 +369,22 @@ lines_of() {
   # shellcheck disable=SC2206 # splitting is the point; globbing is off
   SPLIT_LINES=($1)
   [ "$noglob" -eq 1 ] || set +f
+  return 0
+}
+# tsv_pair <line>: a `KEY<tab>value` line of a policy reader, split as `IFS=$'\t' read -r key val`
+# splits it (tabs at either end dropped, the tabs between key and value are one separator, the value
+# keeps the rest), in TSV_KEY and TSV_VAL. The guard reads every list it loops over with lines_of and
+# this split, which need no file: what a loop reads does not depend on room in /tmp. One regular
+# expression, byte-wise: stripping tabs one at a time took time quadratic in a run of them.
+TSV_KEY="" TSV_VAL=""
+TSV_RE=$'^\t*([^\t]*)\t*(.*[^\t])?\t*$'
+tsv_pair() {
+  local LC_ALL=C
+  TSV_KEY="" TSV_VAL=""
+  if [[ "$1" =~ $TSV_RE ]]; then
+    TSV_KEY="${BASH_REMATCH[1]}"
+    TSV_VAL="${BASH_REMATCH[2]}"
+  fi
   return 0
 }
 # shell_text <word as written>: what the shell hands the command for <word> when it fills nothing
@@ -833,7 +876,9 @@ git_inline_alias() {
         ntok+=("${tok[@]:i}")
         nraw+=("${raw[@]:i}")
         # In a subshell: what the second reading records (GIT_GLOBALS, GIT_SUB, a fresh repository)
-        # stays out of the first; only its deny counts.
+        # stays out of the first; only its deny counts. The command is read here first, so the
+        # subshell inherits it instead of starting node to read it again each time (#404).
+        raw_command
         (GIT_ALIAS_USED+="$k " && git_alias_reread) || exit 2
       done
     done
@@ -1245,6 +1290,8 @@ git_child_judge() {
   [ -n "$ctext" ] || return 0
   [[ "$ctext" != *$'\n'* ]] || deny "git ${s}: the command it runs spans several lines, which the guard does not read as a command" \
     "write the command on one line, or run it directly"
+  # Read once here, so each child's subshell inherits the command instead of starting node (#404).
+  raw_command
   (
     CW_DEPTH=$((CW_DEPTH + 1))
     check_segment "$ctext"
@@ -1375,19 +1422,126 @@ project_identities() {
     urls+="$(git_clean -C "$root" remote get-url --all "$r" 2>/dev/null)"$'\n'
     urls+="$(git_clean -C "$root" remote get-url --push --all "$r" 2>/dev/null)"$'\n'
   done
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
+  lines_of "$urls"
+  for u in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
     remote_identity "$u"
     printf '\n'
-  done <<<"$urls"
+  done
   return 0
+}
+
+# The repositories that this repository's own remotes reach through a spelling the guard resolves
+# itself (guard_resolved_url), one identity per line. A push to one of them is judged by this
+# repository's rules AND by that repository's own (push_targets_this_repo). Only a push reads this
+# list: which repository is "this one" for a merge or a PR stays project_identities.
+own_resolved_identities() {
+  local root="${BASH_GUARD_PROJECT_ROOT:-$ANCHOR_ROOT}" remotes="" urls="" r u base="" based=0 cwd
+  [ -n "$root" ] && [ -d "$root" ] || return 0
+  git_clean -C "$root" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  remotes="$(git_clean -C "$root" remote 2>/dev/null)" || remotes=""
+  for r in $remotes; do
+    urls+="$(git_clean -C "$root" remote get-url --all "$r" 2>/dev/null)"$'\n'
+    urls+="$(git_clean -C "$root" remote get-url --push --all "$r" 2>/dev/null)"$'\n'
+  done
+  lines_of "$urls"
+  for u in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+    guard_resolved_url "$u" || continue
+    if [ "$based" -eq 0 ] && url_is_relative_path "$u"; then
+      cwd="$(cd "$root" 2>/dev/null && pwd -P)" || cwd=""
+      [ -z "$cwd" ] || base="$(git_work_dir "$cwd" git_clean -C "$root")"
+      based=1
+    fi
+    remote_identity "$(local_url_path "$u" "$base")"
+    printf '\n'
+  done
+  return 0
+}
+
+# local_url_path <url> <base>: a URL that git reads as a local path, written as the absolute path
+# git reaches; any other URL unchanged. Git resolves a relative path against the directory it runs
+# in (<base>: git_work_dir), `~` and `~/<path>` against HOME, and reads `file://localhost/<path>` as
+# `file:///<path>`. Any other spelling, or a relative path with no <base>, is left as written.
+local_url_path() {
+  local u="$1" base="$2" h="${BASH_GUARD_HOME:-${HOME:-}}"
+  # shellcheck disable=SC2088 # the patterns are the LITERAL spellings git reads
+  case "$u" in
+    file://localhost/*) printf '/%s' "${u#file://localhost/}" ;;
+    "~") printf '%s' "${h:-$u}" ;;
+    "~/"*) if [ -n "$h" ]; then printf '%s/%s' "$h" "${u#\~/}"; else printf '%s' "$u"; fi ;;
+    *) if url_is_relative_path "$u" && [ -n "$base" ]; then printf '%s/%s' "$base" "$u"; else printf '%s' "$u"; fi ;;
+  esac
+}
+
+# url_is_relative_path <url>: does git read it as a path relative to where it runs? Not a scheme
+# URL, not scp syntax (a colon before any slash), not absolute, not `~`.
+url_is_relative_path() {
+  case "$1" in
+    '' | /* | '~'* | *://*) return 1 ;;
+  esac
+  case "${1%%/*}" in *:*) return 1 ;; esac
+  return 0
+}
+
+# guard_resolved_url <url>: is it a spelling whose repository the guard works out itself, from a
+# directory or a HOME it can only assume (a relative path, `~`, `~/<path>`, file://localhost/)? The
+# repository it names then counts as this one, as it always did, and ALSO as the one it resolves to:
+# the guard's directory or HOME may not be the ones the push runs with.
+guard_resolved_url() {
+  # shellcheck disable=SC2088 # the patterns are the LITERAL spellings git reads
+  case "$1" in
+    file://localhost/* | "~" | "~/"*) return 0 ;;
+  esac
+  url_is_relative_path "$1"
+}
+
+# git_work_dir <cwd> <git command words...>: the directory that git runs a push from, given the
+# directory it starts in (<cwd>, after any -C): the top of the work tree when <cwd> is inside it,
+# otherwise <cwd> itself (a bare repository, a git directory, core.worktree or --work-tree naming a
+# tree <cwd> is not in: measured 2026-10-16, git resolves a relative push path from <cwd> there).
+git_work_dir() {
+  local cwd="$1" out top
+  shift
+  out="$("$@" rev-parse --is-inside-work-tree --show-toplevel 2>/dev/null)" || out=""
+  top="${out#*$'\n'}"
+  if [ "${out%%$'\n'*}" = true ] && [ "$top" != "$out" ] && [ -n "$top" ]; then
+    printf '%s' "$top"
+  else
+    printf '%s' "$cwd"
+  fi
+}
+
+# The directory the command's git starts in: the hook's own, moved by each -C of the command in
+# turn (an empty one moves nothing). Fails when a -C does not lead to a directory.
+push_start_dir() {
+  local dir k v
+  dir="$(pwd -P)" || return 1
+  for ((k = 0; k < ${#GIT_GLOBALS[@]}; k++)); do
+    case "${GIT_GLOBALS[k]}" in
+      -C)
+        k=$((k + 1))
+        v="${GIT_GLOBALS[k]:-}"
+        [ -n "$v" ] || continue
+        dir="$(cd "$dir" 2>/dev/null && cd -- "$v" 2>/dev/null && pwd -P)" || return 1
+        ;;
+      -c | --git-dir | --work-tree | --config-env) k=$((k + 1)) ;;
+    esac
+  done
+  printf '%s' "$dir"
+}
+
+# The directory a relative push URL is resolved from (git_work_dir), for the command's own git.
+# Nothing when it cannot be told.
+push_url_base() {
+  local cwd
+  cwd="$(push_start_dir)" || return 0
+  git_work_dir "$cwd" git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"}
 }
 
 # The URL(s) a push reaches, asked of git with the command's own -C / --git-dir / -c
 # replayed: repository discovery, insteadOf rewriting and a pushurl that differs from
-# the url are git's answer, not a re-derivation. With no remote named, git picks one
-# from its config (pushRemote, pushDefault, the branch's remote, origin); every remote
-# of the repository stands in for it. Returns 1 when the destination does not resolve.
+# the url are git's answer, not a re-derivation. With no remote named, every remote of
+# the repository stands in for the one git picks (push_default_remote says which one that
+# is, when it can). Returns 1 when the destination does not resolve.
 push_destination_urls() {
   local remote="$1" remotes="" urls="" out="" r
   if [ -z "$remote" ]; then
@@ -1407,70 +1561,234 @@ push_destination_urls() {
   printf '%s\n' "$urls"
 }
 
+# The remote a push that names none goes to, picked as git picks it: branch.<current>.pushRemote,
+# then remote.pushDefault, then branch.<current>.remote, then origin (with no current branch, the
+# two branch keys are skipped). Prints its name when it is a configured remote with a push URL;
+# returns 1 otherwise (git would then read the name as a URL, or fail), and the caller keeps every
+# remote.
+push_default_remote() {
+  local b n=""
+  b="$(current_branch)"
+  [ -z "$b" ] || n="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} config --get "branch.${b}.pushRemote" 2>/dev/null)" || n=""
+  [ -n "$n" ] || n="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} config --get remote.pushDefault 2>/dev/null)" || n=""
+  if [ -z "$n" ] && [ -n "$b" ]; then
+    n="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} config --get "branch.${b}.remote" 2>/dev/null)" || n=""
+  fi
+  [ -n "$n" ] || n=origin
+  git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} remote get-url --push --all "$n" >/dev/null 2>&1 || return 1
+  printf '%s' "$n"
+}
+
 # identity_in <identity> <newline-separated identities>
 identity_in() {
   local x
-  while IFS= read -r x; do
-    [ -n "$x" ] && [ "$x" = "$1" ] && return 0
-  done <<<"$2"
+  lines_of "$2"
+  for x in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+    [ "$x" = "$1" ] && return 0
+  done
   return 1
 }
 
+# url_is_github <url>: may it reach GitHub? Its host (brackets dropped, as git drops them; trailing
+# dots dropped, the same name absolute in DNS) is github.com (www., ssh.) or has `github` in its name (`github.com-work`, the
+# usual multi-account alias, or a GitHub Enterprise host), or, for an ssh URL or scp syntax, it has
+# no dot: an ssh host alias, which may well point at GitHub. The alias is NOT resolved: `ssh -G`
+# reads the user's ssh configuration, whose `Match exec` lines run commands, and they would run
+# inside the guard while it judges. A dotted alias without `github` in its name reads as the host
+# it names, as it did before #441 (`main` protected).
+# Only there is the owner/name of the URL the repository the GitHub API reads.
+url_is_github() {
+  local u="$1" host="" ssh=0
+  case "$u" in
+    *://*)
+      case "${u%%://*}" in ssh | git+ssh | ssh+git) ssh=1 ;; esac
+      host="${u#*://}"
+      host="${host%%/*}"
+      ;;
+    *:*)
+      host="${u%%:*}"
+      case "$host" in */*) return 1 ;; esac
+      ssh=1
+      ;;
+    *) return 1 ;;
+  esac
+  host="${host##*@}"
+  case "$host" in
+    \[*\]*) host="${host#\[}"; host="${host%%\]*}" ;;
+    *) host="${host%%:*}" ;;
+  esac
+  host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  while [ "${host%.}" != "$host" ]; do host="${host%.}"; done
+  case "$host" in *github*) return 0 ;; esac
+  [ "$ssh" -eq 1 ] && [ -n "$host" ] || return 1
+  case "$host" in *.* | *:*) return 1 ;; esac
+  return 0
+}
+
 # Is this push aimed at the repository that vendored this guard? True (0) unless it
-# is PROVEN foreign — see the fail-closed paragraph above. When it returns 1 it leaves
-# the foreign destinations, one identity per line, in PUSH_FOREIGN_IDS.
+# is PROVEN foreign — see the fail-closed paragraph above. Either way it leaves the
+# foreign destinations it found, one identity per line, in PUSH_FOREIGN_IDS, each judged by
+# that repository's own policy:
+#   - every destination is first read as it always was: one the guard cannot name, or one of
+#     this repository's, makes the push this repository's; any other is a foreign destination;
+#   - a destination the guard names only by resolving it itself (guard_resolved_url) is this
+#     repository's as before, AND, when it resolves to another repository, that one's too;
+#   - one of the repositories this repository's own remotes reach that way
+#     (own_resolved_identities) is this repository's AND its own.
+# PUSH_FOREIGN_URLS holds `<identity><TAB><url>` for the destinations the push goes to (with no
+# remote named, those of push_default_remote, or of every remote when it cannot tell): only there
+# does a policy that cannot be read deny every push (see check_git_push).
 PUSH_FOREIGN_IDS=""
+PUSH_FOREIGN_URLS=""
 push_targets_this_repo() {
-  local remote="$1" ids="" dests="" u d foreign=0
+  local remote="$1" ids="" extra="" extra_read=0 dests="" chosen="" name="" u d own=0 base="" based=0
   PUSH_FOREIGN_IDS=""
+  PUSH_FOREIGN_URLS=""
   command_relocates && return 0
   ids="$(project_identities)" || ids=""
   [ -n "${ids//$'\n'/}" ] || return 0
   dests="$(push_destination_urls "$remote")" || return 0
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
+  chosen="$dests"
+  if [ -z "$remote" ] && name="$(push_default_remote)"; then
+    chosen="$(git ${GIT_GLOBALS[@]+"${GIT_GLOBALS[@]}"} remote get-url --push --all "$name" 2>/dev/null)" ||
+      chosen="$dests"
+  fi
+  lines_of "$dests"
+  for u in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
     d="$(remote_identity "$u")" || d=""
-    [ -n "$d" ] || return 0
-    identity_in "$d" "$ids" && return 0
-    identity_in "$d" "$PUSH_FOREIGN_IDS" || PUSH_FOREIGN_IDS+="$d"$'\n'
-    foreign=1
-  done <<<"$dests"
-  [ "$foreign" -eq 1 ] || return 0
+    if [ -z "$d" ] || identity_in "$d" "$ids"; then
+      own=1
+      continue
+    fi
+    if [ "$extra_read" -eq 0 ]; then
+      extra="$(own_resolved_identities)" || extra=""
+      extra_read=1
+    fi
+    identity_in "$d" "$extra" && own=1
+    push_foreign_add "$d"
+  done
+  lines_of "$chosen"
+  for u in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+    d="$(remote_identity "$u")" || d=""
+    if [ -z "$d" ] && guard_resolved_url "$u"; then
+      if [ "$based" -eq 0 ] && url_is_relative_path "$u"; then
+        base="$(push_url_base)"
+        based=1
+      fi
+      d="$(remote_identity "$(local_url_path "$u" "$base")")" || d=""
+      [ -n "$d" ] || continue
+      identity_in "$d" "$ids" && continue
+      push_foreign_add "$d"
+    fi
+    [ -n "$d" ] || continue
+    identity_in "$d" "$ids" && continue
+    PUSH_FOREIGN_URLS+="$d"$'\t'"$u"$'\n'
+  done
+  [ "$own" -eq 0 ] && [ -n "$PUSH_FOREIGN_IDS" ] && return 1
+  return 0
+}
+push_foreign_add() {
+  identity_in "$1" "$PUSH_FOREIGN_IDS" || PUSH_FOREIGN_IDS+="$1"$'\n'
+}
+
+# push_unreadable_denies <identity>: does a policy of <identity> that cannot be read deny every
+# push (owner's decision of 2026-10-16, #431)? Yes when the push goes there (PUSH_FOREIGN_URLS) and
+# it is a local repository or a GitHub one (url_is_github). Elsewhere it reads as it always did:
+# `main` protected.
+push_unreadable_denies() {
+  local line
+  lines_of "$PUSH_FOREIGN_URLS"
+  for line in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+    [ "${line%%$'\t'*}" = "$1" ] || continue
+    case "$1" in local:*) return 0 ;; esac
+    url_is_github "${line#*$'\t'}" && return 0
+  done
   return 1
 }
 
 # The protected branch of a FOREIGN push destination, by ITS OWN policy — not ours, which
 # is not in charge there, and not "none", which let a session rooted in one consumer push
-# straight to another consumer's main. Prints the branch; prints nothing when the destination
-# provably vendors no policy (then pushing to its main may well be its flow: the case that
-# made foreign pushes exempt in the first place, 2026-08-03); prints the strict default
-# `main` when the policy exists but cannot be read, or cannot be looked for.
+# straight to another consumer's main. Prints the branch and returns 0; prints nothing and
+# returns 0 when the destination provably vendors no policy (then pushing to its main may well
+# be its flow: the case that made foreign pushes exempt in the first place, 2026-08-03).
+# Returns 4 when a read was attempted and it did not give a policy: the content is not one JSON
+# object (a UTF-8 BOM in front of it included), or the read failed for any reason but a proven
+# absence. Which branch it protects is then unknown, and the caller denies every push there
+# when the push goes to it and it is local or on GitHub (owner's decision of 2026-10-16, #431;
+# push_unreadable_denies); anywhere else it stands for `main`, as it always did.
 #   owner/name   the API, as a cross-repository merge reads it (api_policy_tsv: 404 = none).
-#   local:<dir>  that repository's own HEAD commit (committed, never a working tree).
+#                Looked up on GitHub whatever host the remote names, as it always was: for a
+#                repository on another host a readable answer still applies and a 404 is still
+#                no policy, while a failed read keeps `main` protected (the caller's choice).
+#   local:<dir>  that repository's own HEAD commit (committed, never a working tree). Only an
+#                unborn HEAD (the branch it names does not exist yet) has no policy. A HEAD
+#                that resolves is read through its tree; one that names a missing object, or
+#                an object with no tree, is a failed read. The policy must be a regular file:
+#                a symlink, a directory or a submodule at its path, or a symlinked or
+#                submodule `scripts` or `scripts/hooks` folder, is a policy that cannot be
+#                read, since what a checkout holds there is not in that commit. The API read
+#                answers 404 (no policy) for the folder cases: a known disagreement between
+#                the two reads, and the local one is the stricter.
+#   any other    a remote the guard has no way to look up (a host that is not GitHub and no
+#                owner/name path): no read is attempted, and `main`, the strict default,
+#                stands for its protected branch.
 destination_protected_branch() {
-  local id="$1" tsv="" rc=0 tmp key val prot="main"
+  local id="$1" tsv="" rc=0 line prot="main" dir head ref out tree entry path oid
   case "$id" in
     local:*)
-      if git_clean --git-dir="${id#local:}" cat-file -e HEAD:scripts/hooks/guard.policy.json 2>/dev/null; then
-        tmp="$(mktemp 2>/dev/null)" || { printf 'main'; return 0; }
-        git_clean --git-dir="${id#local:}" show HEAD:scripts/hooks/guard.policy.json >"$tmp" 2>/dev/null || true
-        tsv="$(policy_tsv_from_file "$tmp")"
-        rm -f "$tmp"
-      else
-        # No commit yet, or a HEAD without the file: no policy. A git that cannot even open
-        # the directory is not proof of that.
-        git_clean --git-dir="${id#local:}" rev-parse --git-dir >/dev/null 2>&1 || printf 'main'
+      dir="${id#local:}"
+      # A git that cannot even open the directory is not proof that there is no policy.
+      git_clean --git-dir="$dir" rev-parse --git-dir >/dev/null 2>&1 || return 4
+      if ! head="$(git_clean --git-dir="$dir" rev-parse -q --verify HEAD 2>/dev/null)"; then
+        # HEAD names no object: no policy only when it names a branch that does not exist.
+        ref="$(git_clean --git-dir="$dir" symbolic-ref -q HEAD 2>/dev/null)" || return 4
+        [ -n "$ref" ] || return 4
+        out="$(git_clean --git-dir="$dir" for-each-ref --format='%(refname)' "$ref" 2>&1)" || return 4
+        [ -z "$out" ] || return 4
         return 0
       fi
+      tree="$(git_clean --git-dir="$dir" rev-parse -q --verify "${head}^{tree}" 2>/dev/null)" || return 4
+      # Paths from the root of that tree, wherever the guard runs (--full-tree).
+      entry="$(git_clean --git-dir="$dir" ls-tree --full-tree "$tree" -- scripts/hooks/guard.policy.json 2>/dev/null)" ||
+        return 4
+      if [ -z "$entry" ]; then
+        # A tree without the file: no policy, unless a folder on its path is a symlink or a
+        # submodule.
+        for path in scripts scripts/hooks; do
+          entry="$(git_clean --git-dir="$dir" ls-tree --full-tree "$tree" -- "$path" 2>/dev/null)" || return 4
+          case "$entry" in
+            040000\ *) ;;
+            120000\ * | 160000\ *) return 4 ;;
+            *) return 0 ;;
+          esac
+        done
+        return 0
+      fi
+      case "$entry" in
+        100644\ blob\ * | 100755\ blob\ *) ;;
+        *) return 4 ;;
+      esac
+      oid="${entry#* blob }"
+      oid="${oid%%$'\t'*}"
+      tsv="$(git_clean --git-dir="$dir" cat-file blob "$oid" 2>/dev/null | policy_tsv_from_stdin)" || tsv=""
       ;;
     */*)
       tsv="$(api_policy_tsv "$id")" || rc=$?
       [ "$rc" -eq 3 ] && return 0
+      [ "$rc" -eq 0 ] || return 4
+      ;;
+    *)
+      printf '%s' "$prot"
+      return 0
       ;;
   esac
-  while IFS=$'\t' read -r key val; do
-    [ "$key" = PROTECTED ] && [ -n "$val" ] && prot="$val"
-  done <<<"$tsv"
+  [ -n "$tsv" ] || return 4
+  lines_of "$tsv"
+  for line in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+    tsv_pair "$line"
+    [ "$TSV_KEY" = READ ] && return 4
+    [ "$TSV_KEY" = PROTECTED ] && [ -n "$TSV_VAL" ] && prot="$TSV_VAL"
+  done
   printf '%s' "$prot"
 }
 
@@ -1781,8 +2099,8 @@ remote_is_other_repo() {
     urls="$out"
   fi
   [ -n "${urls//$'\n'/}" ] || return 1
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
+  lines_of "$urls"
+  for u in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
     case "$u" in
       file://*)
         p="${u#file://}"
@@ -1800,7 +2118,7 @@ remote_is_other_repo() {
       RIO_SELF=1
       return 1
     fi
-  done <<<"$urls"
+  done
   return 0
 }
 
@@ -2126,29 +2444,42 @@ check_git_push() {
   #   - this repository (or not provably another one): the policy loaded at the top;
   #   - another repository: ITS policy (destination_protected_branch), so a session rooted
   #     here cannot push to another consumer's main, while a repository that vendors no
-  #     policy — whose flow may be pushing to main — keeps no protected branch at all.
-  local protected_set="$PROTECTED_BRANCH" whose="" id p
-  if ! push_targets_this_repo "${positional[0]:-$repo_opt}"; then
-    protected_set=""
-    while IFS= read -r id; do
-      [ -n "$id" ] || continue
-      p="$(destination_protected_branch "$id")"
-      [ -n "$p" ] || continue
-      protected_set+="$p"$'\n'
-      whose+="${whose:+, }${id}"
-    done <<<"$PUSH_FOREIGN_IDS"
-    [ -n "$protected_set" ] || return 0
-  fi
+  #     policy — whose flow may be pushing to main — keeps no protected branch at all, and
+  #     one whose policy cannot be read takes no push at all when the push goes there and it
+  #     is local or on GitHub: which branch it protects is unknown, and a guess is not that
+  #     repository's rule (elsewhere `main` stands for it, as it always did);
+  #   - both at once (a remote whose push URLs reach this repository and another one, or a
+  #     destination the guard resolves itself: push_targets_this_repo): both rules, each
+  #     branch denied by whichever protects it.
+  local own_set="" protected_set="" whose="" id p prc
+  push_targets_this_repo "${positional[0]:-$repo_opt}" && own_set="$PROTECTED_BRANCH"
+  lines_of "$PUSH_FOREIGN_IDS"
+  for id in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+    prc=0
+    p="$(destination_protected_branch "$id")" || prc=$?
+    if [ "$prc" -ne 0 ]; then
+      push_unreadable_denies "$id" || p=main
+    fi
+    if [ "$prc" -ne 0 ] && [ -z "$p" ]; then
+      deny "git push to ${id#local:}, whose scripts/hooks/guard.policy.json could not be read as a policy (not one JSON object, not a regular file, or the read failed), so which of its branches are protected is unknown and no push there is allowed" \
+        "fix that repository's scripts/hooks/guard.policy.json, which must be one JSON object in a regular file; if the read itself failed (network, rate limit), retry; or ask the user to push it"
+    fi
+    [ -n "$p" ] || continue
+    protected_set+="$p"$'\n'
+    whose+="${whose:+, }${id}"
+  done
+  [ -n "$own_set" ] || [ -n "$protected_set" ] || return 0
 
   # Where the protected branch comes from, for the message: a foreign destination's own
-  # policy is named, so the reader looks at the right file.
-  local by=""
-  [ -n "$whose" ] && by=" in ${whose}, by that repository's own guard.policy.json"
+  # policy is named, so the reader looks at the right file; ours is not.
+  local by="" by_foreign=""
+  [ -n "$whose" ] && by_foreign=" in ${whose}, by that repository's own guard.policy.json"
 
   if [ "${#refspecs[@]}" -eq 0 ]; then
     # push with no refspec: with push.default=simple the target is the current branch
     dst="$(current_branch)"
-    if [ -n "$dst" ] && identity_in "$dst" "$protected_set"; then
+    if [ -n "$dst" ] && push_branch_protected "$dst" "$own_set" "$protected_set" "$by_foreign"; then
+      by="$PUSH_PROTECTED_BY"
       deny "git push from ${dst} pushes directly to ${dst}${by}" \
         "work on a PR branch (git checkout -b <type>/<issue>-description) and open a PR"
     fi
@@ -2169,7 +2500,8 @@ check_git_push() {
     if [ "$dst" = "HEAD" ] || [ "$dst" = "@" ]; then
       dst="$(current_branch)"
     fi
-    if [ -n "$dst" ] && identity_in "$dst" "$protected_set"; then
+    if [ -n "$dst" ] && push_branch_protected "$dst" "$own_set" "$protected_set" "$by_foreign"; then
+      by="$PUSH_PROTECTED_BY"
       # The alternative names the branch, or the worktree with -C: a bare `HEAD`
       # resolves wherever the session happens to stand, so what this message
       # suggests must never contain one.
@@ -2177,6 +2509,17 @@ check_git_push() {
         "push your PR branch by name (git push -u origin <branch>) or from its worktree (git -C <worktree> push -u origin HEAD), and open a PR"
     fi
   done
+  return 0
+}
+
+# push_branch_protected <branch> <ours> <foreign> <foreign's message>: is <branch> in either
+# newline-separated set? PUSH_PROTECTED_BY is then empty for ours, <foreign's message> otherwise.
+PUSH_PROTECTED_BY=""
+push_branch_protected() {
+  PUSH_PROTECTED_BY=""
+  identity_in "$1" "$2" && return 0
+  identity_in "$1" "$3" || return 1
+  PUSH_PROTECTED_BY="$4"
   return 0
 }
 
@@ -3873,14 +4216,14 @@ merge_target() {
   for r in $remotes; do
     urls+="$(git_clean remote get-url --all "$r" 2>/dev/null)"$'\n'
   done
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
+  lines_of "$urls"
+  for u in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
     d="$(remote_identity "$u")" || d=""
     [ -n "$d" ] || return 2
     identity_in "$d" "$ids" || return 2
     [ "$any" -eq 1 ] || t="$d"
     any=1
-  done <<<"$urls"
+  done
   [ "$any" -eq 1 ] || return 2
   printf '%s' "$t"
   return 0
@@ -3892,6 +4235,11 @@ merge_target() {
 # would be the one nobody runs locally.
 policy_tsv_from_file() {
   node -e "$POLICY_READER" "$1" 2>/dev/null || true
+}
+# The same, from the policy on stdin, piped in by the caller: no temporary file, and no shell
+# variable in between, which would drop a NUL byte the file reader sees.
+policy_tsv_from_stdin() {
+  node -e "$POLICY_READER" - 2>/dev/null || true
 }
 
 # The guard policy of ANOTHER repo, read from its origin. Empty output = could not
@@ -3913,21 +4261,26 @@ target_policy_tsv() {
 # difference — for a merge both mean "unknown", which denies — because "no policy" is exactly
 # the repository whose own flow may be to push to its main (see check_git_push).
 api_policy_tsv() {
-  local repo="$1" content="" err="" rc=0 tmp tsv
-  err="$(mktemp 2>/dev/null)" || return 1
-  content="$(gh api "repos/${repo}/contents/scripts/hooks/guard.policy.json" --jq .content 2>"$err")" || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    if grep -q 'HTTP 404' "$err" 2>/dev/null; then rc=3; else rc=1; fi
-    rm -f "$err"
-    return "$rc"
+  local repo="$1" out="" status="" content="" tsv
+  # One call, never a temporary file: gh's stdout (the content) goes straight to the capture and
+  # its stderr (the one place a 404 is said) straight into grep, so nothing gh writes to stderr
+  # reaches the decode. The last line, written once gh has exited and so after all of its stdout,
+  # carries both exit codes.
+  out="$(
+    set +e
+    { gh api "repos/${repo}/contents/scripts/hooks/guard.policy.json" --jq .content 2>&1 1>&3 3>&- |
+      grep -F 'HTTP 404' >/dev/null
+      printf '\n!%s %s\n' "${PIPESTATUS[0]}" "${PIPESTATUS[1]}"; } 3>&1
+  )" || return 1
+  status="${out##*$'\n!'}"
+  content="${out%$'\n!'*}"
+  [[ "$status" =~ ^([0-9]+)\ ([0-9]+)$ ]] || return 1
+  if [ "${BASH_REMATCH[1]}" -ne 0 ]; then
+    if [ "${BASH_REMATCH[2]}" -eq 0 ]; then return 3; fi
+    return 1
   fi
-  rm -f "$err"
-  content="$(printf '%s' "$content" | base64 -d 2>/dev/null)" || return 1
-  [ -n "$content" ] || return 1
-  tmp="$(mktemp 2>/dev/null)" || return 1
-  printf '%s' "$content" >"$tmp"
-  tsv="$(policy_tsv_from_file "$tmp")"
-  rm -f "$tmp"
+  [[ "$content" == *[![:space:]]* ]] || return 1
+  tsv="$(printf '%s' "$content" | base64 -d 2>/dev/null | policy_tsv_from_stdin)" || return 1
   [ -n "$tsv" ] || return 1
   printf '%s' "$tsv"
 }
@@ -3941,14 +4294,15 @@ api_policy_tsv() {
 #   2. The API, through target_policy_tsv, for a clone without origin/HEAD or a ref
 #      that lacks the file. Only for a GitHub-shaped origin: a local path has no API.
 published_policy_tsv() {
-  local root="$1" ref="" tmp="" tsv="" url="" id=""
+  local root="$1" ref="" size=0 tsv="" url="" id=""
   [ -n "$root" ] && [ -d "$root" ] || return 0
   ref="$(git_clean -C "$root" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)" || ref=""
-  if [ -n "$ref" ] && tmp="$(mktemp 2>/dev/null)"; then
-    if git_clean -C "$root" show "${ref}:scripts/hooks/guard.policy.json" >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-      tsv="$(policy_tsv_from_file "$tmp")"
+  if [ -n "$ref" ]; then
+    size="$(git_clean -C "$root" cat-file -s "${ref}:scripts/hooks/guard.policy.json" 2>/dev/null)" || size=0
+    if [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -gt 0 ]; then
+      tsv="$(git_clean -C "$root" show "${ref}:scripts/hooks/guard.policy.json" 2>/dev/null |
+        policy_tsv_from_stdin)" || tsv=""
     fi
-    rm -f "$tmp"
   fi
   if [ -z "$tsv" ]; then
     url="$(git_clean -C "$root" remote get-url origin 2>/dev/null)" || url=""
@@ -3989,7 +4343,7 @@ published_policy_tsv() {
 #     in o/n from any directory, so that is the target (and a --repo naming another repository
 #     next to it cannot be told apart from it: denied).
 check_pr_merge() {
-  local pr="$1" repo="${2:-}" pr_exp="${3:-0}" repo_exp="${4:-0}" refs base head target rc=0 tsv foreign=0
+  local pr="$1" repo="${2:-}" pr_exp="${3:-0}" repo_exp="${4:-0}" refs base head target rc=0 tsv foreign=0 line
   local url_repo="" shown
   if [ "$pr_exp" = 1 ] || [ "$repo_exp" = 1 ]; then
     shown="gh pr merge ${pr}${repo:+ --repo $repo}"
@@ -4021,14 +4375,16 @@ check_pr_merge() {
       PROTECTED_BRANCH=main
       INTEGRATION_BRANCH=""
       LONG_LIVED_BRANCHES=()
-      while IFS=$'\t' read -r key val; do
-        case "$key" in
-          MERGE) AGENT_MAY_MERGE="$val" ;;
-          PROTECTED) PROTECTED_BRANCH="$val" ;;
-          INTEGRATION) INTEGRATION_BRANCH="$val" ;;
-          LONGLIVED) [ -n "$val" ] && LONG_LIVED_BRANCHES+=("$val") ;;
+      lines_of "$tsv"
+      for line in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
+        tsv_pair "$line"
+        case "$TSV_KEY" in
+          MERGE) AGENT_MAY_MERGE="$TSV_VAL" ;;
+          PROTECTED) PROTECTED_BRANCH="$TSV_VAL" ;;
+          INTEGRATION) INTEGRATION_BRANCH="$TSV_VAL" ;;
+          LONGLIVED) [ -n "$TSV_VAL" ] && LONG_LIVED_BRANCHES+=("$TSV_VAL") ;;
         esac
-      done <<<"$tsv"
+      done
       ;;
     *)
       deny "gh pr merge$([ -n "$repo" ] && printf " --repo %s" "$repo"): cannot tell which repository this PR belongs to, so the policy that governs it is unknown" \
@@ -4752,7 +5108,7 @@ deny_owner_label() {
       ;;
   esac
   deny "$1. ${why}, and only a human takes it off" \
-    "leave it on; if the reason for it no longer holds, say so in the PR's ## TL;DR and give the reviewer the command (gh pr edit <n> --repo <owner>/<name> --remove-label ${name}), in a body written with --body-file or a heredoc: a command written inside a quoted --body is read as one. Any other label comes off with gh pr edit <n> --remove-label <name>, the name written in the command"
+    "leave it on; if the reason for it no longer holds, say so at the top of the PR body and give the reviewer the command (gh pr edit <n> --repo <owner>/<name> --remove-label ${name}), in a body written with --body-file or a heredoc: a command written inside a quoted --body is read as one. Any other label comes off with gh pr edit <n> --remove-label <name>, the name written in the command"
 }
 
 # pct_decode <text>: <text> with each percent-escape decoded once, in PCT_DECODED; one that is not
@@ -5361,7 +5717,7 @@ check_gh_api_refs() {
 # and gh's default without fields or --input; `-X GET` with fields too. With fields and no -X, gh
 # sends POST. A method the shell fills in (`-X "$M"`) may be any. No real command of the 31 days to
 # 2026-10-03 writes there; reading the protection and the rulesets is common, and passes.
-PROTECTION_HINT="leave branch protection and rulesets as they are; read them with gh api <path> (GET, or -X GET with fields), and if they need to change, say so in the PR's ## TL;DR or an issue with the exact command, for the repository owner to run (write that body with --body-file or a heredoc: a command written inside a quoted --body is read as one)"
+PROTECTION_HINT="leave branch protection and rulesets as they are; read them with gh api <path> (GET, or -X GET with fields), and if they need to change, say so at the top of the PR body or in an issue with the exact command, for the repository owner to run (write that body with --body-file or a heredoc: a command written inside a quoted --body is read as one)"
 # The repository part is <owner>/<name>, one word the shell fills in with both (`repos/$R/…`), or
 # the repository's id: GitHub serves the same resources under repositories/<id>/… (measured
 # 2026-10-03: repositories/<id>/rulesets answers 200, and …/branches/<b>/protection answers as
@@ -6052,33 +6408,43 @@ done
 # backslashes (a JSON string escaped twice, a byte string in hex) from reading as the name on its
 # own; three or more letters each written by a gap are judged by the tail reading below instead.
 ci_wild_re2() {
-  local n="$1" j k i re2="" alt cls last
+  local LC_ALL=C n="$1" j k full="" cj ck re2="" sep="" last
   last=$((${#n} - 1))
+  # The name written out with a `[?]*` between letters, so letter i stands at offset 5i: each
+  # alternative is that text with the wildcard class in place of letter j and of letter k. Between two
+  # letters only a hard `?` may stand (a backslash writing nothing); a weak `@` is a literal
+  # `$`/brace/paren really in the output, so it cannot vanish between two letters. Cut from the
+  # written-out name instead of rebuilt letter by letter: the same text, in 4 ms instead of 90 (#404).
   for ((j = 0; j < ${#n}; j++)); do
+    [ "$j" -eq 0 ] || full+="[?]*"
+    full+="${n:j:1}"
+  done
+  for ((j = 0; j < ${#n}; j++)); do
+    if [ "$j" -eq "$last" ]; then cj="[?]"; else cj="[?@]"; fi
     for ((k = j; k < ${#n}; k++)); do
-      alt=""
-      for ((i = 0; i < ${#n}; i++)); do
-        # Between two letters only a hard `?` may stand (a backslash writing nothing); a weak `@` is a
-        # literal `$`/brace/paren really in the output, so it cannot vanish between two letters.
-        [ "$i" -eq 0 ] || alt+="[?]*"
-        if [ "$i" -eq "$j" ] || [ "$i" -eq "$k" ]; then
-          if [ "$i" -eq "$last" ]; then cls="[?]"; else cls="[?@]"; fi
-          alt+="$cls"
-        else
-          alt+="${n:i:1}"
-        fi
-      done
-      [ -z "$re2" ] || re2+="|"
-      re2+="$alt"
+      if [ "$k" -eq "$j" ]; then
+        re2+="${sep}${full:0:5*j}${cj}${full:5*j+1}"
+      else
+        if [ "$k" -eq "$last" ]; then ck="[?]"; else ck="[?@]"; fi
+        re2+="${sep}${full:0:5*j}${cj}${full:5*j+1:5*(k-j)-1}${ck}${full:5*k+1}"
+      fi
+      sep="|"
     done
   done
   CI_WILD2_V2="$re2"
 }
-ci_wild_re2 GITHUB_ACTIONS
-CI_ESC_V2_GH_RE="$CI_WILD2_V2"
-ci_wild_re2 MWG_WRITE_TOKEN_KIND
-CI_ESC_V2_MWG_RE="$CI_WILD2_V2"
-unset CI_WILD2_V2
+# The two readings are built the first time a command needs them (ci_wild_ready), not on every run:
+# only a command with an escape left after decoding reads them (#404).
+CI_ESC_V2_GH_RE=""
+CI_ESC_V2_MWG_RE=""
+ci_wild_ready() {
+  [ -z "$CI_ESC_V2_GH_RE" ] || return 0
+  ci_wild_re2 GITHUB_ACTIONS
+  CI_ESC_V2_GH_RE="$CI_WILD2_V2"
+  ci_wild_re2 MWG_WRITE_TOKEN_KIND
+  CI_ESC_V2_MWG_RE="$CI_WILD2_V2"
+  unset CI_WILD2_V2
+}
 # The two names' letters, for the `?` reading's projection: any other capital drops out, so a capital
 # the shell throws away between the escape and the name (`\x4${a:+\}X}7ITHUB_ACTIONS` leaves an `X`,
 # the `Z=1` of a `case` leaves a `Z`) does not break the name. `F J L P Q V X Y Z` are in neither.
@@ -6096,7 +6462,7 @@ CI_ESC_DECODE+=(-e 'ta')
 CI_ESC_HIDE+=(-e 'ta')
 unset CI_ESC_C CI_ESC_H CI_ESC_O CI_ESC_HX CI_ESC_K CI_ESC_R
 ci_escaped_identity() {
-  local LC_ALL=C t="$1" i r h rn hn name d w
+  local LC_ALL=C t="$1" i r h rn hn name d
   local m proj
   local -a versions_r=() versions_h=()
   if [[ "$t" == *\\[0-7xXuU]* ]]; then
@@ -6107,6 +6473,10 @@ ci_escaped_identity() {
       deny_ci_escaped_identity "${BASH_REMATCH[0]}"
     fi
   fi
+  # A hook input with no `\\` and no `\u` in it has no string that decodes to a backslash (JSON writes
+  # one no other way), so the command has none and the reading below has nothing to find: node is not
+  # started to read it (#404).
+  [[ "${INPUT-}" == *'\\'* || "${INPUT-}" == *'\u'* ]] || return 0
   raw_command
   # An escape, or a backslash before what may start a gap (a quote, an expansion, a brace, another
   # backslash: `\'"$a"'x47`, `\\$(:)x47`).
@@ -6137,7 +6507,8 @@ ci_escaped_identity() {
       -e ':e' -e 's/\{([^{}]*,)?([^{},]*)\}/\2/g' -e 'te' | tr -d '\001')"
   # Each line starts with a `#`, so that none is empty and line i is the version i in both.
   d="$(printf '%s\n' "$t" | sed -E "${CI_ESC_DECODE[@]}")"
-  lines_of "$(printf '%s\n' "$d" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  m="$(printf '%s\n' "$d" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  lines_of "$m"
   versions_r=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
   # A backslash left once the escapes are decoded is read as a wildcard that may write a letter,
   # whatever the gap writes or however its quoting ends it. A backslash before a digit, x, u or U is
@@ -6159,21 +6530,27 @@ ci_escaped_identity() {
   # class (the shell, not a text escape, puts the character there). The last three are left for #319's
   # own follow-up, out of this round.
   if [[ "$d" == *\\* ]]; then
+    # Every line projected at once and each projection judged once, in order: three processes per
+    # line made a heredoc of a few hundred lines take a second (#404). A line with no marker projects
+    # to no `?`/`@` and is dropped, as before. Assigned before it is split, so a stage that fails
+    # stops the judge (set -e) instead of leaving nothing to judge: without awk, a command that gets
+    # here is denied.
     m="$(printf '%s\n' "$d" |
-      sed -E -e "s/\\\\([0-7xXuU])/"$'\002'"\\1/g" -e "s/\\\\([\$\`{}()]|\\[|\\])/"$'\003'"\\1/g")"
-    while IFS= read -r w; do
-      [[ "$w" == *$'\002'* || "$w" == *$'\003'* ]] || continue
-      proj="$(printf '%s' "$w" | tr -cd "${CI_ESC_NAME_LETTERS}"$'\002\003' | tr $'\002\003' '?@')"
-      [[ "$proj" == *[?@]* ]] || continue
+      sed -E -e "s/\\\\([0-7xXuU])/"$'\002'"\\1/g" -e "s/\\\\([\$\`{}()]|\\[|\\])/"$'\003'"\\1/g" |
+      tr -cd "${CI_ESC_NAME_LETTERS}"$'\002\003\n' | tr $'\002\003' '?@' | LC_ALL=C awk '/[?@]/ && !seen[$0]++')"
+    lines_of "$m"
+    ci_wild_ready
+    for proj in ${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"}; do
       if [[ "$proj" =~ $CI_ESC_V2_GH_RE || "$proj" =~ $CI_ESC_LEAD_GH_RE ]]; then
         deny_ci_escaped_identity "GITHUB_ACTIONS, read with an escape the guard cannot finish as any letter"
       fi
       if [[ "$proj" =~ $CI_ESC_V2_MWG_RE || "$proj" =~ $CI_ESC_LEAD_MWG_RE ]]; then
         deny_ci_escaped_identity "MWG_WRITE_TOKEN_KIND, read with an escape the guard cannot finish as any letter"
       fi
-    done <<< "$m"
+    done
   fi
-  lines_of "$(printf '%s\n' "$t" | sed -E "${CI_ESC_HIDE[@]}" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  m="$(printf '%s\n' "$t" | sed -E "${CI_ESC_HIDE[@]}" | tr -cd 'A-Z_#\n' | sed 's/^/#/')"
+  lines_of "$m"
   versions_h=(${SPLIT_LINES[@]+"${SPLIT_LINES[@]}"})
   # Should the two not line up, nothing counts as hidden: the stricter reading.
   [ "${#versions_h[@]}" -eq "${#versions_r[@]}" ] || versions_h=()
@@ -10549,7 +10926,14 @@ fi
 # directory with symlinks followed, and a Glob pattern rooted in it. Empty (the default): no rule.
 # Prints "<what touched it>\t<the entry>" for the first hit, nothing otherwise. TEST-ONLY override:
 # BASH_GUARD_HOME (the home `~` stands for).
-read -r -d '' FORBID_JS <<'JS' || true
+# Read with cat, not `read -d ''`: a heredoc that fits in a pipe reaches `read` one byte at a time,
+# about 18 ms for this one on every command (#404). Where the heredoc cannot be written (a full /tmp
+# on a bash that puts every heredoc in a file), FORBID_JS stays empty and check_forbidden_paths
+# denies. There is deliberately no second copy to read it from: a reader that cannot load keeps every
+# command out, and the guard does not go on judging in a state it cannot read itself in.
+FORBID_JS=""
+forbid_js_load() { FORBID_JS="$(cat)"; }
+forbid_js_load <<'JS' || true
 const fs = require("fs");
 const path = require("path");
 let d;
@@ -11274,6 +11658,8 @@ check_forbidden_paths_bare() {
 check_forbidden_paths() {
   local out what entry
   [ "${#FORBIDDEN_PATHS[@]}" -gt 0 ] || return 0
+  [ -n "$FORBID_JS" ] || deny "the guard could not load its reader for the paths this repository's guard.policy.json keeps out of every session (forbidden_paths), and a command it cannot read is not let through" \
+    "free some space in the temporary folder (/tmp) and try again"
   local rc=0
   out="$(printf '%s' "$INPUT" | node -e "$FORBID_JS" "${BASH_GUARD_HOME:-${HOME:-}}" "${FORBIDDEN_PATHS[@]}" 2>/dev/null)" || rc=$?
   # A reader that fails (a stack overflow on thousands of nested `"$(`, found in the independent
