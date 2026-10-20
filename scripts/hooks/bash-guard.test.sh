@@ -5,8 +5,9 @@
 # Runs the real guard (bash-guard.sh), feeding it via STDIN the exact JSON the
 # Claude Code harness sends, and compares the exit code with the expected
 # verdict (allow = 0, deny = 2). Assertions are on exit codes, not on message
-# text — so translating the guard's messages never moves a result. The one
-# exception is fp_msg (GROUP 7), which pins the five forbidden_paths wordings.
+# text — so translating the guard's messages never moves a result. The
+# exceptions are fp_msg (GROUP 7), which pins the five forbidden_paths wordings,
+# and msg_real (GROUP 29), which pins what a push deny names and offers.
 #
 # Table format: "<allow|deny>|<command>" — only the FIRST '|' separates (a
 # command may itself contain pipes).
@@ -80,6 +81,9 @@ TEST_OWN_REPO="owner/the-session-repo"
 # real one and exercise pr_base_branch FOR REAL instead of injecting its answer.
 TEST_PATH_PREFIX=""
 
+# Variables the guard is launched with, besides the ones each case sets (GROUP 28).
+TEST_ENV=()
+
 # Every case of GROUP 1, kept to replay it from the Monitor and PowerShell tools (GROUP 16).
 TEST_RECORD=0
 G1_REPLAY=()
@@ -107,6 +111,7 @@ run_case() {
     BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" \
     BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
     PATH="$path_for_case" \
+    ${TEST_ENV[@]+"${TEST_ENV[@]}"} \
     "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
@@ -955,13 +960,14 @@ if ! {
   echo "ERROR: could not build the GROUP 7 repositories" >&2
   exit 1
 fi
-merge_real() { # merge_real <allow|deny> <cwd> <command>
+merge_real() { # merge_real <allow|deny> <cwd> <command> [wrapper...]
   local expected="$1" cwd="$2" cmd="$3" out rc want
+  shift 3
   total=$((total + 1))
   out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
     -u GIT_COMMON_DIR -u BASH_GUARD_OWN_REPO -u BASH_GUARD_PR_BASE -u BASH_GUARD_PR_HEAD \
     BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
-    BASH_GUARD_PROJECT_ROOT="$G7PROPIO" PATH="$TMP/bin:$PATH" "$GUARD" 2>&1)"
+    BASH_GUARD_PROJECT_ROOT="$G7PROPIO" PATH="$TMP/bin:$PATH" "$@" "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
   if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
@@ -1051,12 +1057,13 @@ fi
 
 # push_real <allow|deny> <cwd> <command> — the branch resolves FOR REAL (no override),
 # and the protected repository is $PROJ.
-push_real() {
+push_real() { # push_real <allow|deny> <cwd> <command> [wrapper...]
   local expected="$1" cwd="$2" cmd="$3" out rc want
+  shift 3
   total=$((total + 1))
   out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
     -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH PATH="$TMP/bin:$PATH" \
-    BASH_GUARD_POLICY="$POL_PRISMA" BASH_GUARD_PROJECT_ROOT="$PROJ" "$GUARD" 2>&1)"
+    BASH_GUARD_POLICY="$POL_PRISMA" BASH_GUARD_PROJECT_ROOT="$PROJ" "$@" "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
   if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
@@ -1143,9 +1150,10 @@ push_real allow "$AJENO" "git push -u origin feature/x"
 # Its protected branch is whatever IT calls it: `trunk` there, and `main` is just a branch.
 push_real allow "$PROJ" "git -C $TRONCO push origin main"
 push_real deny  "$PROJ" "git -C $TRONCO push origin HEAD:trunk"
-# A policy that cannot be read (the API answers neither the file nor 404): strict default.
+# A policy that cannot be read (the API answers neither the file nor 404): which branch it
+# protects is unknown, so no push there goes, not even to a feature branch (GROUP 29).
 push_real deny  "$PROJ" "git -C $CAIDA push origin main"
-push_real allow "$PROJ" "git -C $CAIDA push origin HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $CAIDA push origin HEAD:feature/x"
 # A local destination: the policy its HEAD commits (never a working tree), or none.
 push_real deny  "$PROJ" "git -C $LOCPOL push origin HEAD:main"
 push_real allow "$PROJ" "git -C $LOCPOL push origin HEAD:feature/x"
@@ -2027,7 +2035,7 @@ wt_case() {
   out="$(input_with Bash "$(bash_input "$cmd")" "$cwd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
     -u GIT_COMMON_DIR BASH_GUARD_BRANCH=feature/999-pr-branch \
     BASH_GUARD_POLICY="$pol" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$WT_W" \
-    PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+    PATH="${NO_NET_BIN}:${PATH}" ${TEST_ENV[@]+"${TEST_ENV[@]}"} "$GUARD" 2>&1)"
   rc=$?
   if [ "$expected" = "allow" ]; then want=0; else want=2; fi
   if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
@@ -4504,7 +4512,10 @@ done
 # (exit 2) con ese texto. El prefijo envuelve al guard (`ulimit`, un PATH sin timeout).
 G15_RUN=(env BASH_GUARD_BRANCH=feature/x BASH_GUARD_POLICY="$POL_PRODUCT"
   BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO")
-G15_FULL_TMP=(bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
+# Los casos con /tmp lleno prueban que la orden se lee entera, no cuanto tarda: con un limite de 30 s,
+# una maquina cargada no los convierte en un DENY por tiempo (7000 segmentos tardan unos 7 s en local,
+# y en el runner de un consumidor pasaron de 10 el 2026-10-15, #404).
+G15_FULL_TMP=(env BASH_GUARD_SECONDS=30 bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
 g15_case() {
   local what="$1" want="$2" js="$3" out rc
   shift 3
@@ -5986,6 +5997,962 @@ G25_CASES=(
 for ((k = 0; k < ${#G25_CASES[@]}; k += 2)); do
   run_case "${G25_CASES[k]}" "${G25_CASES[k + 1]}"
 done
+
+# ============================================================================
+# GROUP 26 — LO QUE EL GUARD DEJO DE HACER EN CADA ORDEN PARA IR MAS RAPIDO (#404).
+# (1) Las dos lecturas con comodines del nombre (ci_wild_re2) se cortan del nombre escrito en vez de
+#     montarse letra a letra: el texto debe ser el mismo que da la definicion, letra a letra, en node.
+# (2) La lectura de escapes no arranca node si la entrada no tiene ni `\\` ni `\u`, porque en JSON una
+#     barra solo se escribe asi. Cada caso que se niega del GROUP 18 con una barra en la orden se
+#     repite con sus barras escritas `\`: debe negarse igual.
+# ============================================================================
+total=$((total + 1))
+G26_FN="$(awk '/^ci_wild_re2\(\) \{$/ { f = 1 } f { print } f && /^\}$/ { exit }' "$GUARD")"
+G26_GOT="$(bash -c "$G26_FN"$'\nfor n in GITHUB_ACTIONS MWG_WRITE_TOKEN_KIND A AB X_Y_Z; do ci_wild_re2 "$n"; printf "%s\\n" "$CI_WILD2_V2"; done')"
+G26_WANT="$(node -e '
+for (const n of ["GITHUB_ACTIONS", "MWG_WRITE_TOKEN_KIND", "A", "AB", "X_Y_Z"]) {
+  const alts = [];
+  for (let j = 0; j < n.length; j++) for (let k = j; k < n.length; k++) {
+    let a = "";
+    for (let i = 0; i < n.length; i++) {
+      if (i > 0) a += "[?]*";
+      a += i === j || i === k ? (i === n.length - 1 ? "[?]" : "[?@]") : n[i];
+    }
+    alts.push(a);
+  }
+  console.log(alts.join("|"));
+}')"
+if [ -n "$G26_FN" ] && [ "$G26_GOT" = "$G26_WANT" ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  printf 'FAIL  ci_wild_re2 no da el texto de su definicion (%d contra %d caracteres)\n' "${#G26_GOT}" "${#G26_WANT}"
+fi
+# g26_case <allow|deny> <command>: como run_case, con cada barra de la orden escrita `\` en el JSON.
+g26_case() {
+  local expected="$1" cmd="$2" out rc want
+  total=$((total + 1))
+  out="$(cd "$NOT_A_REPO" && node -e '
+const j = JSON.stringify({ session_id: "test-session", hook_event_name: "PreToolUse",
+  tool_name: "Bash", tool_input: { command: process.argv[1] } });
+process.stdout.write(j.replace(/\\(u[0-9a-fA-F]{4}|.)/g, (m) => (m === "\\\\" ? "\\u005c" : m)));
+' "$cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
+    BASH_GUARD_PR_BASE=develop BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" \
+    BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" PATH="${NO_NET_BIN}:${PATH}" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  [\\u005c] expected=%s (exit %d), got exit %d  ::  %s\n' "$expected" "$want" "$rc" "$cmd"
+  [ -n "$out" ] && printf '      output: %s\n' "$out"
+  return 0
+}
+G26_N=0
+for g26_line in "${G18_CASES[@]}" "${G18B_CASES[@]}" "${G18C_CASES[@]}" "${G18D_CASES[@]}" \
+  "${G18E_CASES[@]}" "${G18F_CASES[@]}" "${G18G_CASES[@]}" "${G18H_CASES[@]}" "${G18I_CASES[@]}" \
+  "${G18J_CASES[@]}"; do
+  [[ "$g26_line" == deny\|* && "$g26_line" == *\\* ]] || continue
+  g26_case deny "${g26_line#deny|}"
+  G26_N=$((G26_N + 1))
+done
+# Sin casos no se ha probado nada: los del GROUP 18 que se niegan con una barra son la mayoria de esas tablas.
+total=$((total + 1))
+if [ "$G26_N" -ge 50 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); printf 'FAIL  GROUP 26 repitio %d casos con \\u005c, menos de 50\n' "$G26_N"; fi
+# g26_run <allow|deny> <texto que debe salir, o ""> <politica> <orden> [prefijo...]: el guard con la
+# politica dada, el home falso del GROUP 7 y el prefijo delante (otro PATH, un /tmp lleno).
+g26_run() {
+  local expected="$1" want_text="$2" pol="$3" cmd="$4" out rc want
+  shift 4
+  total=$((total + 1))
+  out="$(cd "$NOT_A_REPO" && make_input "$cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch \
+    BASH_GUARD_POLICY="$pol" BASH_GUARD_HOME="$FH" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" \
+    BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" "$@" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ] && [[ "$out" == *"$want_text"* ]]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 26] expected=%s (exit %d), got exit %d  ::  %s\n      output: %s\n' "$expected" "$want" "$rc" "$cmd" "${out:0:300}"
+}
+# (3) Un /tmp lleno con un bash que escribe todo heredoc en un fichero (BASH_COMPAT=50, como el 3.2 de
+#     macOS): el lector de forbidden_paths no se puede cargar y, con forbidden_paths en la politica,
+#     toda orden se niega. Un `set -e` sobre el heredoc fallido acababa el guard con exit 1, y una
+#     orden con exit 1 del hook se ejecuta.
+G26_FULL=(env BASH_COMPAT=50 BASH_GUARD_SECONDS=30 PATH="${NO_NET_BIN}:${PATH}" bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
+g26_run deny "$G15_PUSH" "$POL_PRODUCT" 'git push --force origin main' "${G26_FULL[@]}"
+g26_run deny 'could not load its reader' "$POL_FP" 'cat ~/privado/notas.md' "${G26_FULL[@]}"
+g26_run deny 'could not load its reader' "$POL_FP" 'git status' "${G26_FULL[@]}"
+# (4) Una etapa de la proyeccion de ci_escaped_identity que falla (aqui, sin awk) para al juez: se niega.
+G26_NOAWK="$TMP/g26-sin-awk"
+mkdir -p "$G26_NOAWK"
+IFS=: read -r -a G26_DIRS <<< "$PATH"
+for g26_d in "${G26_DIRS[@]}"; do
+  for g26_f in "$g26_d"/*; do
+    g26_b="${g26_f##*/}"
+    case "$g26_b" in awk | gawk | mawk | nawk | busybox) continue ;; esac
+    [ -x "$g26_f" ] && [ ! -e "$G26_NOAWK/$g26_b" ] && ln -s "$g26_f" "$G26_NOAWK/$g26_b"
+  done
+done
+g26_run deny '' "$POL_PRODUCT" 'printf "export \x4${a:-7}ITHUB_ACTIONS=1; node x\n" | bash' env PATH="${NO_NET_BIN}:${G26_NOAWK}"
+# (5) Leer la orden una vez antes de cada subshell que juzga (un hijo de git rebase -x, la relectura de
+#     un alias): sin eso, cada subshell arrancaba su propio node para leerla, y 120 hijos pasaban del
+#     limite. Un node de pega cuenta las lecturas: como mucho una.
+G26_LOG="$TMP/g26-lecturas.log"
+G26_BIN="$TMP/g26-node"
+mkdir -p "$G26_BIN"
+printf '%s\n' '#!/bin/sh' "case \"\$2\" in *'d.tool_input.command : undefined'*) echo leida >> '$G26_LOG' ;; esac" \
+  "exec '$(command -v node)' \"\$@\"" > "$G26_BIN/node"
+chmod +x "$G26_BIN/node"
+G26_REBASE="git rebase"
+for ((k = 0; k < 30; k++)); do G26_REBASE+=" -x 'git co'"; done
+for g26_cmd in "$G26_REBASE main" \
+  "git -c 'alias.status=log \"--oneline\"' -c 'alias.log=diff \"--stat\"' -c 'alias.diff=show \"--stat\"' status"; do
+  : > "$G26_LOG"
+  (cd "$NOT_A_REPO" && make_input "$g26_cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$POL_PRODUCT" \
+    BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
+    PATH="${G26_BIN}:${NO_NET_BIN}:${PATH}" "$GUARD" >/dev/null 2>&1)
+  total=$((total + 1))
+  g26_reads="$(wc -l < "$G26_LOG" | tr -d ' ')"
+  if [ "$g26_reads" -le 1 ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    printf 'FAIL  [GROUP 26] la orden se leyo %s veces con node (como mucho 1)  ::  %s\n' "$g26_reads" "${g26_cmd:0:80}"
+  fi
+done
+# ============================================================================
+# GROUP 27 — CON UN LIMITE DE TAMANO DE FICHERO O /tmp LLENO, EL GUARD JUZGA IGUAL (#394).
+# (1) El guard ignora SIGXFSZ: con `ulimit -f` una escritura falla y la orden se juzga o se niega,
+#     nunca acaba el hook por la senal (exit 153). `env --default-signal` devuelve la senal a su
+#     valor por defecto aunque quien lanza la suite la ignore; el primer caso comprueba que la
+#     envoltura de verdad mata a un bash que escribe.
+# (2) Lo que el guard lee para juzgar no depende de que quepa un fichero en /tmp: ni las listas que
+#     recorre (lines_of, tsv_pair) ni la politica de otro repositorio o la publicada (por una
+#     tuberia). Cada caso de abajo es uno de los GROUPs 7, 8, 9 y 24 repetido con /tmp lleno y un
+#     bash que escribe en fichero lo que otros dejan en memoria (BASH_COMPAT=50, como el 3.2 de
+#     macOS), y con un limite de 0 bytes por fichero: da lo mismo que sin el.
+# (3) tsv_pair parte una linea como `IFS=$'\t' read -r key val`, en tiempo lineal.
+# (4) Un deny cuyo aviso no se puede escribir sale igual con exit 2.
+# (5) La politica de otro repositorio se lee igual que la lee su propio guard: aunque gh avise de algo
+#     por stderr al contestar bien, y byte a byte (un NUL la deja ilegible, y entonces no pasa ningun push
+#     a ese repositorio: GROUP 29), venga
+#     de su HEAD, de la API o de origin/HEAD; un 404 solo lo dice el stderr de gh, y una politica vacia en
+#     origin/HEAD sigue llevando a la API. Por la API, una sola llamada a gh por lectura.
+# ============================================================================
+if env --default-signal=XFSZ true 2>/dev/null; then
+  G27_SIG=(env --default-signal=XFSZ)
+else
+  G27_SIG=(env)
+fi
+G27_CERO=("${G27_SIG[@]}" bash -c 'ulimit -c 0; ulimit -f 0; exec bash "$@"' _)
+G27_CERO_COMPAT=("${G27_SIG[@]}" BASH_COMPAT=50 bash -c 'ulimit -c 0; ulimit -f 0; exec bash "$@"' _)
+G27_FULL=(env BASH_COMPAT=50 bash -c 'trap "" XFSZ; ulimit -f 32; exec bash "$@"' _)
+G27_CERO_IGN=(bash -c 'trap "" XFSZ; ulimit -f 0; exec bash "$@"' _)
+total=$((total + 1))
+g27_probe="$TMP/g27-probe.sh"
+printf '%s\n' 'printf x > "$1"' > "$g27_probe"
+("${G27_CERO[@]}" "$g27_probe" "$TMP/g27-probe.out"; exit $?) >/dev/null 2>&1
+g27_rc=$?
+if [ "$g27_rc" -eq 153 ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] la envoltura no mata con SIGXFSZ (exit %d, se esperaba 153): los casos de (1) no prueban nada\n' "$g27_rc"
+fi
+# g27_run <allow|deny> <texto esperado> <politica> <cwd> <tool> <tool_input JSON> <envoltura...>
+g27_run() {
+  local expected="$1" want_text="$2" pol="$3" cwd="$4" tool="$5" ti="$6" out rc want
+  shift 6
+  total=$((total + 1))
+  out="$(cd "$cwd" && input_with "$tool" "$ti" "$cwd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_POLICY="$pol" BASH_GUARD_HOME="$FH" \
+    BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" BASH_GUARD_SECONDS=30 \
+    PATH="${NO_NET_BIN}:${PATH}" "$@" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ] && [[ "$out" == *"$want_text"* ]]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] expected=%s (exit %d), got exit %d  ::  %s %s\n      output: %s\n' "$expected" "$want" "$rc" "$tool" "${ti:0:120}" "${out:0:300}"
+}
+# g27_merge <allow|deny> <command> <envoltura...>: la fila de run_case de los merges con --repo de otro
+# repositorio, cuya politica sirve el gh de pega.
+g27_merge() {
+  local expected="$1" cmd="$2" out rc want
+  shift 2
+  total=$((total + 1))
+  out="$(cd "$NOT_A_REPO" && make_input "$cmd" | env BASH_GUARD_BRANCH=feature/999-pr-branch \
+    BASH_GUARD_POLICY="$POL_PRODUCT" BASH_GUARD_PR_BASE="" BASH_GUARD_PR_HEAD="" \
+    BASH_GUARD_OWN_REPO="owner/the-session-repo" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" \
+    BASH_GUARD_SECONDS=30 PATH="$TMP/bin:$PATH" "$@" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$expected" = "allow" ]; then want=0; else want=2; fi
+  if [ "$rc" -eq "$want" ]; then pass=$((pass + 1)); return 0; fi
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] expected=%s (exit %d), got exit %d  ::  %s\n      output: %s\n' "$expected" "$want" "$rc" "$cmd" "${out:0:300}"
+}
+# (1) SIGXFSZ en su valor por defecto y un limite de 0 bytes.
+for g27_w in CERO CERO_COMPAT; do
+  case "$g27_w" in CERO) g27_wrap=("${G27_CERO[@]}") ;; *) g27_wrap=("${G27_CERO_COMPAT[@]}") ;; esac
+  g27_run deny "$G15_PUSH" "$POL_PRODUCT" "$NOT_A_REPO" Bash "$(bash_input 'git push --force origin main')" "${g27_wrap[@]}"
+  g27_run deny '' "$POL_FP" "$NOT_A_REPO" Bash "$(bash_input 'cat ~/privado/notas.md')" "${g27_wrap[@]}"
+  g27_run deny '' "$POL_FP" "$NOT_A_REPO" Read "{\"file_path\": \"$FH/privado/notas.md\"}" "${g27_wrap[@]}"
+done
+g27_run deny '~/privado' "$POL_FP" "$NOT_A_REPO" Bash "$(bash_input 'cat ~/privado/notas.md')" "${G27_CERO[@]}"
+# (2) Un repositorio local ajeno cuya politica, en su HEAD, protege `tronco` y no `main`.
+G27_LOC="$TMP/g27/local-tronco"; G27_LOCB="$TMP/g27/local-tronco.git"
+if ! {
+  git_h init -q "$G27_LOC" &&
+    mkdir -p "$G27_LOC/scripts/hooks" &&
+    printf '{"protected_branch":"tronco"}\n' > "$G27_LOC/scripts/hooks/guard.policy.json" &&
+    git_h -C "$G27_LOC" add -A && git_h -C "$G27_LOC" commit -q -m policy &&
+    git_h clone -q --bare "$G27_LOC" "$G27_LOCB" &&
+    git_h -C "$G27_LOC" remote add origin "$G27_LOCB"
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 27 repository" >&2
+  exit 1
+fi
+g27_long="$FD_REPO$(printf '/.%.0s' $(seq 1 16600))"
+for g27_w in LLENO CERO_IGN; do
+  case "$g27_w" in LLENO) g27_wrap=("${G27_FULL[@]}") ;; *) g27_wrap=("${G27_CERO_IGN[@]}") ;; esac
+  # GROUP 24: el remoto es el propio repo, escrito con una ruta larga o corta.
+  g27_run deny 'long-lived' "$POL_LR" "$FD_REPO" Bash "$(bash_input "git fetch $g27_long HEAD:develop")" "${g27_wrap[@]}"
+  g27_run deny 'long-lived' "$POL_LR" "$FD_REPO" Bash "$(bash_input "git fetch $FD_REPO HEAD:develop")" "${g27_wrap[@]}"
+  g27_run allow '' "$POL_LR" "$FD_REPO" Bash "$(bash_input 'git fetch origin develop')" "${g27_wrap[@]}"
+  # GROUP 8: la rama protegida de un push la dice la politica del repositorio al que llega.
+  push_real deny  "$PROJ" "git -C $TRONCO push origin HEAD:trunk" "${g27_wrap[@]}"
+  push_real allow "$PROJ" "git -C $TRONCO push origin main" "${g27_wrap[@]}"
+  push_real deny  "$PROJ" "git -C $G27_LOC push origin HEAD:tronco" "${g27_wrap[@]}"
+  push_real allow "$PROJ" "git -C $G27_LOC push origin HEAD:main" "${g27_wrap[@]}"
+  push_real deny  "$AJENO" "git -C $PROJ push origin main" "${g27_wrap[@]}"
+  push_real allow "$PROJ" "git -C $AJENO push origin HEAD:feature/x" "${g27_wrap[@]}"
+  # GROUP 7 y GROUP 4: de que repositorio es la PR, y la politica del ajeno.
+  merge_real allow "$G7PROPIO" 'gh pr merge 5 --squash' "${g27_wrap[@]}"
+  merge_real allow "$G7OTRO" 'gh pr merge 5 --repo github.com/OWNER/propio --squash' "${g27_wrap[@]}"
+  merge_real deny  "$G7OTRO" 'gh pr merge 5 --repo owner/reserved-to-human --squash' "${g27_wrap[@]}"
+  g27_merge allow 'gh pr merge 123 --repo owner/product-develop --squash' "${g27_wrap[@]}"
+  # GROUP 9: la politica publicada se lee de origin/HEAD.
+  pub_real allow "$PUB" "$PUB" 'curl https://reviewed.example' "${g27_wrap[@]}"
+  pub_real deny  "$PUB" "$PUB" 'curl https://tampered.example' "${g27_wrap[@]}"
+done
+# Ninguna lista se lee con un here-string ni con un heredoc (el unico here-string que queda es el de
+# mapfile_of, que niega si no puede), y el guard no crea ficheros temporales.
+total=$((total + 1))
+g27_hs="$(grep -nE '^[^#]*<<<[[:space:]]*"?\$' "$GUARD")"
+if [ "$(printf '%s\n' "$g27_hs" | grep -c .)" -eq 1 ] && [[ "$g27_hs" == *'mapfile -t MAPPED_LINES <<<"$1"'* ]]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] el guard lee con here-string fuera de mapfile_of:\n%s\n' "$g27_hs"
+fi
+total=$((total + 1))
+g27_tf="$(grep -nE '^[^#]*((^|[^\\])\$\(mktemp|done[[:space:]]*<<)' "$GUARD")"
+if [ -z "$g27_tf" ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] un fichero temporal o un bucle que lee un heredoc:\n%s\n' "$g27_tf"
+fi
+# (3) tsv_pair frente a read, linea a linea, y dos lineas seguidas en el mismo shell.
+G27_FN="$(awk '/^TSV_RE=/ { print } /^tsv_pair\(\) \{$/ { f = 1 } f { print } f && /^\}$/ { exit }' "$GUARD")"
+for g27_l in $'K\tV' $'\tK\tV' $'K\t\tV' $'K\t\t\tV' $'K\tV\t' $'K\tV1\tV2' $'K\t\tV1\t\tV2\t\t' 'K' $'K\t' $'\t' '' \
+  $'K V\tx y ' $'\t\tK' $'FORBID\t~/a b' $'LONGLIVED\t' $'K\t\xc3\t\xa9\t'; do
+  total=$((total + 1))
+  g27_got="$(bash -c "$G27_FN"$'\ntsv_pair "$1"; printf "[%s][%s]" "$TSV_KEY" "$TSV_VAL"' _ "$g27_l")"
+  IFS=$'\t' read -r g27_k g27_v <<< "$g27_l"
+  g27_want="[$g27_k][$g27_v]"
+  if [ "$g27_got" = "$g27_want" ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    printf 'FAIL  [GROUP 27] tsv_pair %q: %s, read da %s\n' "$g27_l" "$g27_got" "$g27_want"
+  fi
+done
+total=$((total + 1))
+g27_got="$(bash -c "$G27_FN"$'\ntsv_pair "$1"; tsv_pair "$2"; printf "[%s][%s]" "$TSV_KEY" "$TSV_VAL"' _ $'K\tV' 'L')"
+if [ "$g27_got" = '[L][]' ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] tsv_pair deja el valor de la linea anterior: %s\n' "$g27_got"
+fi
+# 20 000 tabuladores a cada lado de cada campo: en tiempo lineal es un instante; quitandolos de uno en
+# uno, mas de un minuto. El limite deja margen a una maquina cargada.
+total=$((total + 1))
+g27_tabs="$(printf '\t%.0s' $(seq 1 20000))"
+g27_t0=$SECONDS
+g27_got="$(bash -c "$G27_FN"$'\ntsv_pair "$1"; printf "[%s][%s]" "$TSV_KEY" "$TSV_VAL"' _ "${g27_tabs}PROTECTED${g27_tabs}main${g27_tabs}")"
+if [ "$g27_got" = '[PROTECTED][main]' ] && [ $((SECONDS - g27_t0)) -le 5 ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] tsv_pair con 20 000 tabuladores: %s en %d s\n' "${g27_got:0:40}" "$((SECONDS - g27_t0))"
+fi
+# (4) Un aviso que no se puede escribir (stderr es un fichero en su limite) sigue siendo un deny.
+total=$((total + 1))
+(cd "$NOT_A_REPO" && make_input 'git push --force origin main' | env BASH_GUARD_BRANCH=feature/999-pr-branch \
+  BASH_GUARD_POLICY="$POL_PRODUCT" BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" BASH_GUARD_SECONDS=30 \
+  PATH="${NO_NET_BIN}:${PATH}" "${G27_CERO_IGN[@]}" "$GUARD" >/dev/null 2>"$TMP/g27-stderr")
+g27_rc=$?
+if [ "$g27_rc" -eq 2 ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] con stderr sin sitio, el deny sale con exit %d\n' "$g27_rc"
+fi
+# (5) gh que avisa por stderr al contestar bien, y una politica con un byte NUL.
+mkdir -p "$TMP/g27-bin"
+printf '%s\n' '#!/bin/sh' 'echo "aviso: algo que gh cuenta por stderr" >&2' "exec '$TMP/bin/gh' \"\$@\"" > "$TMP/g27-bin/gh"
+chmod +x "$TMP/g27-bin/gh"
+push_real deny  "$PROJ" "git -C $TRONCO push origin HEAD:trunk" env PATH="$TMP/g27-bin:$TMP/bin:$PATH"
+push_real allow "$PROJ" "git -C $TRONCO push origin main" env PATH="$TMP/g27-bin:$TMP/bin:$PATH"
+G27_NUL="$TMP/g27/local-nul"; G27_NULB="$TMP/g27/local-nul.git"
+if ! {
+  git_h init -q "$G27_NUL" &&
+    mkdir -p "$G27_NUL/scripts/hooks" &&
+    printf '{"protected_branch":"tronco"}\n\0' > "$G27_NUL/scripts/hooks/guard.policy.json" &&
+    git_h -C "$G27_NUL" add -A && git_h -C "$G27_NUL" commit -q -m policy &&
+    git_h clone -q --bare "$G27_NUL" "$G27_NULB" &&
+    git_h -C "$G27_NUL" remote add origin "$G27_NULB"
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 27 NUL repository" >&2
+  exit 1
+fi
+push_real deny  "$PROJ" "git -C $G27_NUL push origin HEAD:main"
+push_real deny  "$PROJ" "git -C $G27_NUL push origin HEAD:tronco"
+# Un gh de pega para los repositorios de abajo; el resto, al de GROUP 4. Sin `--jq .content` contesta
+# el JSON entero, como el gh de verdad.
+mkdir -p "$TMP/g27-bin2"
+printf '{"protected_branch":"tronco"}\n\0' > "$TMP/g27-nul.json"
+printf '%s\n' "$POL_REVIEWED" > "$TMP/g27-reviewed.json"
+printf '{"protected_branch":"tronco"}\n' > "$TMP/g27-tronco.json"
+cat > "$TMP/g27-bin2/gh" <<G27GH
+#!/bin/sh
+ARGS=" \$* "
+contenido() {
+  case "\$ARGS" in
+    *" --jq .content "*) base64 < "\$1" ;;
+    *) printf '{"content":"%s"}\n' "\$(base64 < "\$1" | tr -d '\n')" ;;
+  esac
+}
+case "\$*" in
+  *repos/acme/g27-nul/contents/scripts/hooks/guard.policy.json*) contenido "$TMP/g27-nul.json"; exit 0 ;;
+  *repos/acme/g27-vacio/contents/scripts/hooks/guard.policy.json*) contenido "$TMP/g27-reviewed.json"; exit 0 ;;
+  *repos/acme/g27-caido/contents/scripts/hooks/guard.policy.json*)
+    echo 'un cuerpo que dice HTTP 404'; echo 'gh: Bad Gateway (HTTP 502)' >&2; exit 1 ;;
+  *repos/acme/g27-prohibido/contents/*) echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1 ;;
+  *repos/acme/g27-dijo404/contents/*) echo 'gh: HTTP 502: the upstream said 404' >&2; exit 1 ;;
+  *repos/acme/g27-nulerr/contents/*)
+    { printf 'gh: HTTP 4'; printf '\000'; printf '04 Bad Gateway (HTTP 502)\n'; } >&2; exit 1 ;;
+  *repos/acme/g27-blanco/contents/*) echo '  '; exit 0 ;;
+  *repos/acme/g27-avisa404/contents/*) echo 'aviso: esto no es un HTTP 404' >&2; contenido "$TMP/g27-tronco.json"; exit 0 ;;
+  *repos/acme/g27-fallo/contents/*) contenido "$TMP/g27-tronco.json"; echo 'gh: Bad Gateway (HTTP 502)' >&2; exit 1 ;;
+  *repos/acme/g27-unavez/contents/*)
+    echo x >> "$TMP/g27-unavez.n"
+    if [ "\$(wc -l < "$TMP/g27-unavez.n")" -eq 1 ]; then contenido "$TMP/g27-tronco.json"; exit 0; fi
+    echo 'gh: Bad Gateway (HTTP 502)' >&2; exit 1 ;;
+esac
+exec "$TMP/bin/gh" "\$@"
+G27GH
+chmod +x "$TMP/g27-bin2/gh"
+G27_PATH2=(env PATH="$TMP/g27-bin2:$TMP/bin:$PATH")
+g27_repo() { # g27_repo <dir> <origin url> [<policy file to commit>]
+  git_h init -q "$1" && git_h -C "$1" remote add origin "$2" &&
+    if [ -n "${3:-}" ]; then mkdir -p "$1/scripts/hooks" && cp "$3" "$1/scripts/hooks/guard.policy.json" &&
+      git_h -C "$1" add -A && git_h -C "$1" commit -q -m policy; else git_h -C "$1" commit -q --allow-empty -m init; fi &&
+    git_h -C "$1" update-ref refs/remotes/origin/develop HEAD &&
+    git_h -C "$1" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/develop
+}
+: > "$TMP/g27-vacio.json"
+printf '{"egress_allow":["localhost","nul.example"]}\n\0' > "$TMP/g27-pubnul.json"
+if ! {
+  g27_repo "$TMP/g27/api-nul" https://github.com/acme/g27-nul.git &&
+    g27_repo "$TMP/g27/api-caido" https://github.com/acme/g27-caido.git &&
+    g27_repo "$TMP/g27/pub-vacio" https://github.com/acme/g27-vacio.git "$TMP/g27-vacio.json" &&
+    g27_repo "$TMP/g27/pub-nul" https://github.com/acme/g27-pubnul.git "$TMP/g27-pubnul.json" &&
+    g27_repo "$TMP/g27/api-prohibido" https://github.com/acme/g27-prohibido.git &&
+    g27_repo "$TMP/g27/api-dijo404" https://github.com/acme/g27-dijo404.git &&
+    g27_repo "$TMP/g27/api-nulerr" https://github.com/acme/g27-nulerr.git &&
+    g27_repo "$TMP/g27/api-blanco" https://github.com/acme/g27-blanco.git &&
+    g27_repo "$TMP/g27/api-unavez" https://github.com/acme/g27-unavez.git &&
+    g27_repo "$TMP/g27/api-avisa404" https://github.com/acme/g27-avisa404.git &&
+    g27_repo "$TMP/g27/api-fallo" https://github.com/acme/g27-fallo.git
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 27 API repositories" >&2
+  exit 1
+fi
+push_real deny  "$PROJ" "git -C $TMP/g27/api-nul push origin HEAD:main" "${G27_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $TMP/g27/api-nul push origin HEAD:tronco" "${G27_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $TMP/g27/api-caido push origin HEAD:main" "${G27_PATH2[@]}"
+pub_real allow "$TMP/g27/pub-vacio" "$TMP/g27/pub-vacio" 'curl https://reviewed.example' "${G27_PATH2[@]}"
+pub_real deny  "$TMP/g27/pub-nul" "$TMP/g27/pub-nul" 'curl https://nul.example' "${G27_PATH2[@]}"
+# Solo un 404 dice que no hay politica: un 403, un aviso que nombra 404 sin ser uno, un NUL en medio
+# del codigo o un contenido en blanco dejan la politica sin leer, y no pasa ningun push (GROUP 29).
+for g27_r in prohibido dijo404 nulerr blanco; do
+  push_real deny "$PROJ" "git -C $TMP/g27/api-$g27_r push origin HEAD:main" "${G27_PATH2[@]}"
+done
+# Lo que decide es el codigo de salida de gh: un 404 en el stderr de una respuesta buena no la anula, y
+# una salida que se lee bien no cuenta si gh fallo.
+push_real deny  "$PROJ" "git -C $TMP/g27/api-avisa404 push origin HEAD:tronco" "${G27_PATH2[@]}"
+push_real allow "$PROJ" "git -C $TMP/g27/api-avisa404 push origin HEAD:main" "${G27_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $TMP/g27/api-fallo push origin HEAD:main" "${G27_PATH2[@]}"
+# Una politica se lee con una sola llamada: si la segunda fallara, ya no contaria lo que dijo la primera.
+rm -f "$TMP/g27-unavez.n"
+push_real deny "$PROJ" "git -C $TMP/g27/api-unavez push origin HEAD:tronco" "${G27_PATH2[@]}"
+total=$((total + 1))
+g27_n="$(wc -l < "$TMP/g27-unavez.n" 2>/dev/null)" || g27_n=0
+if [ "$g27_n" -eq 1 ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 27] leer una politica por la API hizo %s llamadas a gh, no 1\n' "$g27_n"
+fi
+# ============================================================================
+# GROUP 28 — EL GUARD JUZGA IGUAL AUNQUE QUIEN LO LANZA PIDA EL MODO POSIX DE BASH, O UN CDPATH.
+# Con POSIXLY_CORRECT, o posix en SHELLOPTS, en el entorno, bash arranca en modo POSIX. El guard lo
+# quita al empezar: uno de cada tres casos del GROUP 1, y uno de cada siete, dan el mismo veredicto
+# con cada una de las dos variables. Antes, una sonda comprueba que la variable de verdad pone a bash
+# en modo POSIX: si no, los casos no prueban nada. Con cada variable, su propio arranque lo deja sin
+# modo POSIX, sin inherit_errexit (el modo POSIX lo enciende y salir de el no lo apaga) y sin
+# POSIXLY_CORRECT ni CDPATH antes de juzgar nada. Con un CDPATH que lleva a su carpeta, lanzado por
+# una ruta relativa (como lo cablean los repositorios que lo copian) sigue leyendo su politica, y el
+# checkout compartido sigue siendo el compartido. Un CDPATH de solo lectura lo niega todo; un
+# POSIXLY_CORRECT de solo lectura no le impide salir del modo POSIX, y juzga como siempre.
+# ============================================================================
+TEST_POLICY="$POL_PRISMA"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""; TEST_TOOL=""
+total=$((total + 1))
+if [ "${#G1_REPLAY[@]}" -gt 300 ]; then pass=$((pass + 1)); else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 28] el GROUP 1 dejo solo %d casos que repetir\n' "$((${#G1_REPLAY[@]} / 3))"
+fi
+for g28_var in POSIXLY_CORRECT=1 SHELLOPTS=posix; do
+  total=$((total + 1))
+  if [ "$(env "$g28_var" bash -c 'shopt -qo posix && echo posix')" = posix ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    printf 'FAIL  [GROUP 28] %s no pone a bash en modo POSIX: los casos de abajo no prueban nada\n' "$g28_var"
+  fi
+done
+g28_arranque="$(sed -n '1,/^HERE=/p' "$GUARD" | sed '$d')"
+for g28_var in POSIXLY_CORRECT=1 SHELLOPTS=posix BASHOPTS=inherit_errexit CDPATH=.; do
+  total=$((total + 1))
+  g28_estado="$(env "$g28_var" bash -c "$g28_arranque"'
+shopt -qo posix && echo posix
+shopt -q inherit_errexit && echo inherit_errexit
+echo "${POSIXLY_CORRECT+POSIXLY_CORRECT }${CDPATH+CDPATH }fin"' 2>&1)"
+  if [ "$g28_estado" = fin ]; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    printf 'FAIL  [GROUP 28] con %s, el guard empieza a juzgar con: %s\n' "$g28_var" "${g28_estado//$'\n'/ }"
+  fi
+done
+TEST_ENV=(POSIXLY_CORRECT=1)
+for ((g28 = 0; g28 + 2 < ${#G1_REPLAY[@]}; g28 += 9)); do
+  run_case "${G1_REPLAY[g28]}" "${G1_REPLAY[g28+1]}" "${G1_REPLAY[g28+2]}"
+done
+TEST_ENV=(SHELLOPTS=posix)
+for ((g28 = 0; g28 + 2 < ${#G1_REPLAY[@]}; g28 += 21)); do
+  run_case "${G1_REPLAY[g28]}" "${G1_REPLAY[g28+1]}" "${G1_REPLAY[g28+2]}"
+done
+TEST_ENV=()
+G28_COPIA="$TMP/g28-copia"
+mkdir -p "$G28_COPIA/scripts/hooks"
+cp "$GUARD" "$G28_COPIA/scripts/hooks/bash-guard.sh"
+cp "$POL_FP" "$G28_COPIA/scripts/hooks/guard.policy.json"
+for g28_cdpath in '' . ".:$TMP" "$G28_COPIA"; do
+  total=$((total + 1))
+  g28_out="$(cd "$G28_COPIA" && input_with Read "$(fpath "$FH/privado/notas.md")" "$FREPO" |
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR CDPATH="$g28_cdpath" \
+      BASH_GUARD_BRANCH=feature/999-pr-branch BASH_GUARD_HOME="$FH" BASH_GUARD_OWN_REPO="$TEST_OWN_REPO" \
+      BASH_GUARD_PROJECT_ROOT="$TMP/no-es-un-repo" PATH="${NO_NET_BIN}:${PATH}" bash scripts/hooks/bash-guard.sh 2>&1)"
+  g28_rc=$?
+  if [ "$g28_rc" -eq 2 ] && [[ "$g28_out" == *'~/privado'* ]]; then pass=$((pass + 1)); else
+    fail=$((fail + 1))
+    printf 'FAIL  [GROUP 28] con CDPATH=%q, la copia lanzada por ruta relativa deja leer ~/privado (exit %d)\n      output: %s\n' \
+      "$g28_cdpath" "$g28_rc" "${g28_out:0:300}"
+  fi
+done
+TEST_ENV=(CDPATH=.)
+wt_case deny  "$WT_S" 'git checkout feature'
+wt_case allow "$WT_S" 'git checkout -- README.md'
+TEST_ENV=()
+printf 'readonly CDPATH=.\n' > "$TMP/g28-cdpath-ro.sh"
+printf 'readonly POSIXLY_CORRECT=1\n' > "$TMP/g28-posix-ro.sh"
+TEST_ENV=(BASH_ENV="$TMP/g28-cdpath-ro.sh")
+run_case deny  'ls'
+TEST_ENV=(BASH_ENV="$TMP/g28-posix-ro.sh")
+run_case deny  'git push origin main'
+run_case allow 'ls'
+TEST_ENV=()
+# ============================================================================
+# GROUP 29 — UN REPOSITORIO AJENO CUYA POLITICA EXISTE PERO NO SE PUEDE LEER NO ADMITE NINGUN PUSH.
+# Decision del dueno de 2026-10-16 (#431): cuando la politica de otro repositorio no se lee como tal,
+# no se sabe que rama protege, y suponerla (antes, `main`) no es la regla de ese repositorio. Ahora
+# se niega todo push a ese repositorio, a cualquier rama. "No se lee" es: un contenido que no es UN
+# objeto JSON (roto, una lista, un texto, un numero, null, vacio, solo blancos, con un NUL), un enlace
+# simbolico, una carpeta o un submodulo donde va el fichero (o en una carpeta de su camino), una
+# lectura que falla sin un 404 (red, limite de la API, 5xx, una respuesta que no decodifica) y un git
+# que no abre el repositorio o no lee el arbol de su HEAD. Al lado, lo que no cambia: una politica
+# legible protege su rama y deja las demas, y un repositorio que de verdad no tiene politica (404, o
+# un HEAD sin el fichero) no protege ninguna. La politica de la propia sesion se lee como siempre
+# aunque no sea un objeto.
+# ============================================================================
+G29="$TMP/g29"; mkdir -p "$G29"
+# g29_local <nombre> <orden que prepara su arbol>: un repositorio con ese commit y un origin
+# desnudo clonado de el; el push va a ese origin.
+g29_local() {
+  local d="$G29/$1"
+  git_h init -q "$d" && (cd "$d" && eval "$2") &&
+    git_h -C "$d" add -A && git_h -C "$d" commit -q --allow-empty -m g29 &&
+    git_h clone -q --bare "$d" "$d.git" && git_h -C "$d" remote add origin "$d.git"
+}
+g29_pol() { mkdir -p scripts/hooks && printf "$1" > scripts/hooks/guard.policy.json; }
+if ! {
+  g29_local roto "g29_pol '{\"protected_branch\":'" &&
+    g29_local lista "g29_pol '[\"main\"]'" &&
+    g29_local texto "g29_pol '\"main\"'" &&
+    g29_local numero "g29_pol '42'" &&
+    g29_local nulo "g29_pol 'null'" &&
+    g29_local vacio "g29_pol ''" &&
+    g29_local blancos "g29_pol ' \n\t\n'" &&
+    g29_local nul "g29_pol '{\"protected_branch\":\"tronco\"}\\0'" &&
+    g29_local enlace "mkdir -p scripts/hooks && ln -s '{}' scripts/hooks/guard.policy.json" &&
+    g29_local enlace-bueno "mkdir -p scripts/hooks pol && printf '{\"protected_branch\":\"tronco\"}' > pol/p.json && ln -s ../../pol/p.json scripts/hooks/guard.policy.json" &&
+    g29_local carpeta "mkdir -p scripts/hooks/guard.policy.json && printf '{}' > scripts/hooks/guard.policy.json/x" &&
+    g29_local carpeta-enlace "mkdir -p scripts real && printf '{\"protected_branch\":\"tronco\"}' > real/guard.policy.json && ln -s ../real scripts/hooks" &&
+    git_h init -q "$G29/submodulo" &&
+    git_h -C "$G29/submodulo" update-index --add --cacheinfo \
+      "160000,$(git_h -C "$PROJ" rev-parse HEAD),scripts/hooks/guard.policy.json" &&
+    git_h -C "$G29/submodulo" commit -q -m g29 && git_h clone -q --bare "$G29/submodulo" "$G29/submodulo.git" &&
+    git_h -C "$G29/submodulo" remote add origin "$G29/submodulo.git" &&
+    g29_local legible "g29_pol '{\"protected_branch\":\"tronco\"}'" &&
+    g29_local arbol-roto "g29_pol '{\"protected_branch\":\"tronco\"}'" &&
+    g29_arbol="$(git_h -C "$G29/arbol-roto.git" rev-parse 'HEAD^{tree}')" &&
+    rm -f "$G29/arbol-roto.git/objects/${g29_arbol:0:2}/${g29_arbol:2}" &&
+    g29_local sin-clave "g29_pol '{}'" &&
+    g29_local sin-politica ":" &&
+    g29_local scripts-fichero "printf x > scripts" &&
+    git_h init -q --bare "$G29/sin-commit.git" && git_h init -q "$G29/sin-commit" &&
+    git_h -C "$G29/sin-commit" remote add origin "$G29/sin-commit.git"
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 29 repositories" >&2
+  exit 1
+fi
+# La comprobacion de que de verdad hay un NUL, un enlace, un submodulo y un arbol que falta: si no, sus
+# casos no prueban nada.
+total=$((total + 1))
+if [ "$(git_h -C "$G29/nul.git" cat-file -s HEAD:scripts/hooks/guard.policy.json)" = 30 ] &&
+  git_h -C "$G29/enlace.git" ls-tree HEAD -- scripts/hooks/guard.policy.json | grep -q '^120000 ' &&
+  git_h -C "$G29/carpeta-enlace.git" ls-tree HEAD -- scripts/hooks | grep -q '^120000 ' &&
+  git_h -C "$G29/submodulo.git" ls-tree HEAD -- scripts/hooks/guard.policy.json | grep -q '^160000 ' &&
+  ! git_h -C "$G29/arbol-roto.git" cat-file -e 'HEAD^{tree}' 2>/dev/null; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 29] los repositorios de prueba no llevan el NUL, el enlace, el submodulo o el arbol roto que deben\n'
+fi
+# Ilegible en local: ningun push pasa, ni a una rama de trabajo, ni sin refspec, ni a la que diria.
+for g29_r in roto lista texto numero nulo vacio blancos nul enlace enlace-bueno carpeta carpeta-enlace submodulo; do
+  push_real deny "$PROJ" "git -C $G29/$g29_r push origin HEAD:feature/x"
+done
+push_real deny "$PROJ" "git -C $G29/nul push origin HEAD:main"
+push_real deny "$PROJ" "git -C $G29/roto push -u origin HEAD"
+push_real deny "$G29/lista" "git push origin HEAD:feature/x"
+push_real deny "$PROJ" "git -C $OTRO push $G29/texto.git HEAD:feature/x"
+# Un git que no lee el arbol de HEAD, o que no abre el repositorio de destino (aqui, uno de pega que
+# falla justo esa pregunta).
+push_real deny  "$PROJ" "git -C $G29/arbol-roto push origin HEAD:feature/x"
+mkdir -p "$TMP/g29-bin"
+cat > "$TMP/g29-bin/git" <<G29GIT
+#!/usr/bin/env bash
+case " \$* " in *" --git-dir=$G29/legible.git rev-parse --git-dir "*) echo "fatal: cannot open" >&2; exit 128 ;; esac
+exec "$(command -v git)" "\$@"
+G29GIT
+chmod +x "$TMP/g29-bin/git"
+push_real deny  "$PROJ" "git -C $G29/legible push origin HEAD:feature/x" env PATH="$TMP/g29-bin:$TMP/bin:$PATH"
+push_real allow "$PROJ" "git -C $G29/sin-politica push origin HEAD:main" env PATH="$TMP/g29-bin:$TMP/bin:$PATH"
+# Lo que no cambia en local: la politica legible protege su rama (y solo esa, aunque llegue por la misma
+# carpeta que en carpeta-enlace), una sin clave protege main, y sin politica no se protege nada.
+push_real allow "$PROJ" "git -C $G29/legible push origin HEAD:feature/x"
+push_real allow "$PROJ" "git -C $G29/legible push origin HEAD:main"
+push_real deny  "$PROJ" "git -C $G29/legible push origin HEAD:tronco"
+push_real allow "$PROJ" "git -C $G29/sin-clave push origin HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/sin-clave push origin HEAD:main"
+push_real allow "$PROJ" "git -C $G29/sin-politica push origin HEAD:main"
+push_real allow "$PROJ" "git -C $G29/scripts-fichero push origin HEAD:main"
+push_real allow "$PROJ" "git -C $G29/sin-commit push origin HEAD:main"
+# Por la API. Un gh de pega para estos; el resto, al de GROUP 4.
+G29_API="$G29/api"; mkdir -p "$G29_API" "$TMP/g29-bin2"
+printf '{"protected_branch":' > "$G29_API/roto"
+printf '["main"]' > "$G29_API/lista"
+printf '"main"' > "$G29_API/texto"
+printf '42' > "$G29_API/numero"
+printf 'null' > "$G29_API/nulo"
+printf ' \n\t\n' > "$G29_API/blancos"
+printf '{"protected_branch":"tronco"}\n\0' > "$G29_API/nul"
+cat > "$TMP/g29-bin2/gh" <<G29GH
+#!/bin/sh
+for a in roto lista texto numero nulo blancos nul; do
+  case "\$*" in *repos/acme/g29-\$a/contents/scripts/hooks/guard.policy.json*) base64 < "$G29_API/\$a"; exit 0 ;; esac
+done
+case "\$*" in
+  *repos/acme/g29-vacio/contents/*) exit 0 ;;
+  *repos/acme/g29-nobase64/contents/*) echo '%%% no es base64 %%%'; exit 0 ;;
+  *repos/acme/g29-enlace/contents/*) echo null; exit 0 ;;
+  *repos/acme/g29-carpeta/contents/*) echo 'expected an object but got: array' >&2; exit 1 ;;
+  *repos/acme/g29-limite/contents/*) echo 'gh: API rate limit exceeded for user ID 1. (HTTP 403)' >&2; exit 1 ;;
+  *repos/acme/g29-500/contents/*) echo 'gh: HTTP 500: Internal Server Error' >&2; exit 1 ;;
+  *repos/acme/g29-red/contents/*) echo 'error connecting to api.github.com' >&2; exit 1 ;;
+esac
+exec "$TMP/bin/gh" "\$@"
+G29GH
+chmod +x "$TMP/g29-bin2/gh"
+G29_PATH2=(env PATH="$TMP/g29-bin2:$TMP/bin:$PATH")
+for g29_r in roto lista texto numero nulo blancos nul vacio nobase64 enlace carpeta limite 500 red; do
+  if [ ! -d "$G29/api-$g29_r" ]; then
+    git_h init -q "$G29/api-$g29_r" && git_h -C "$G29/api-$g29_r" remote add origin "https://github.com/acme/g29-$g29_r.git"
+  fi >/dev/null 2>&1
+  push_real deny "$PROJ" "git -C $G29/api-$g29_r push origin HEAD:feature/x" "${G29_PATH2[@]}"
+done
+push_real deny "$PROJ" "git -C $OTRO push https://github.com/acme/g29-lista.git HEAD:feature/x" "${G29_PATH2[@]}"
+push_real deny "$PROJ" "git -C $G29/api-limite push -u origin HEAD" "${G29_PATH2[@]}"
+# Lo que no cambia por la API: legible (acme/ajeno-tronco) protege su rama, y un 404 (acme/otro) ninguna.
+push_real allow "$PROJ" "git -C $TRONCO push origin HEAD:feature/x" "${G29_PATH2[@]}"
+push_real allow "$PROJ" "git -C $TRONCO push origin main" "${G29_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $TRONCO push origin HEAD:trunk" "${G29_PATH2[@]}"
+push_real allow "$PROJ" "git -C $OTRO push origin main" "${G29_PATH2[@]}"
+push_real allow "$PROJ" "git -C $OTRO push origin HEAD:feature/x" "${G29_PATH2[@]}"
+# Un remoto con dos destinos: basta con que uno no se lea para negar el push.
+if ! { git_h init -q "$G29/doble" && git_h -C "$G29/doble" remote add origin https://github.com/acme/ajeno-tronco.git &&
+  git_h -C "$G29/doble" remote set-url --add --push origin https://github.com/acme/ajeno-tronco.git &&
+  git_h -C "$G29/doble" remote set-url --add --push origin https://github.com/acme/g29-roto.git; } >/dev/null 2>&1; then
+  echo "ERROR: could not build the GROUP 29 two-destination repository" >&2
+  exit 1
+fi
+push_real deny "$PROJ" "git -C $G29/doble push origin HEAD:feature/x" "${G29_PATH2[@]}"
+# La politica de la propia sesion: una lista no es una politica, y rigen los valores por defecto de siempre.
+printf '["main"]' > "$TMP/g29-sesion-lista.json"
+TEST_POLICY="$TMP/g29-sesion-lista.json"; TEST_PR_BASE=""; TEST_PR_HEAD=""; TEST_PATH_PREFIX=""
+run_case deny  'git push origin main'
+run_case allow 'git push origin HEAD'
+run_case deny  'curl https://example.com/x'
+# --- GROUP 29, segunda vuelta. Lo que la primera dejo pasar o nego de mas.
+# (1) Un HEAD que no es un commit: solo un HEAD sin nacer (la rama que nombra no existe) es "sin
+#     politica". Un HEAD que da un arbol se lee por ese arbol, como antes; uno que da un blob, un
+#     objeto que falta o una referencia que git no lee, no se lee.
+# (2) La politica se busca desde la raiz de su arbol, aunque el guard corra en una carpeta del
+#     arbol de trabajo de un git dir con core.worktree (el de todo submodulo).
+# (3) Un destino que no es local:<dir> ni owner/name no se puede consultar: protege main, como antes.
+# (4) Un remoto cuyos URL de push van a este repositorio y a otro: rigen las dos reglas.
+# (5) Un destino escrito como ruta relativa, ~/, file://localhost/ o un url/pushurl relativo es el
+#     repositorio que git encuentra ahi; si no se resuelve, cuenta como este repositorio, como antes.
+# (6) Mas formas de una politica que no se lee: un BOM, una carpeta scripts enlazada o submodulo. Un
+#     owner/name de otro host consultado en GitHub cuando gh no contesta protege main (tercera vuelta).
+# ============================================================================
+g29_bare_head() { # g29_bare_head <nombre> <orden en el repositorio desnudo $G29/<nombre>.git>
+  (cd "$G29/$1.git" && eval "$2")
+}
+if ! {
+  g29_local arbol-head "g29_pol '{\"protected_branch\":\"tronco\"}'" &&
+    g29_bare_head arbol-head 'git_h tag tt "$(git_h rev-parse "HEAD^{tree}")" && git_h symbolic-ref HEAD refs/tags/tt' &&
+    g29_local arbol-id "g29_pol '{}'" &&
+    g29_bare_head arbol-id 'git_h rev-parse "HEAD^{tree}" > HEAD.nuevo && mv HEAD.nuevo HEAD' &&
+    g29_local etiqueta-blob "g29_pol '{\"protected_branch\":\"tronco\"}'" &&
+    g29_bare_head etiqueta-blob 'git_h tag tb "$(printf x | git_h hash-object -w --stdin)" && git_h symbolic-ref HEAD refs/tags/tb' &&
+    g29_local commit-falta "g29_pol '{\"protected_branch\":\"tronco\"}'" &&
+    g29_bare_head commit-falta 'git_h update-ref -d refs/heads/main && mkdir -p refs/heads && printf "%040d\n" 7 > refs/heads/main' &&
+    g29_local ref-rota "g29_pol '{\"protected_branch\":\"tronco\"}'" &&
+    g29_bare_head ref-rota 'git_h update-ref -d refs/heads/main && mkdir -p refs/heads && printf "basura\n" > refs/heads/main' &&
+    g29_local cwt "g29_pol '{\"protected_branch\":\"tronco\"}' && mkdir -p docs && printf x > docs/x" &&
+    git_h -C "$G29/cwt" config core.worktree "$G29/cwt" &&
+    g29_local cwt-enlace "mkdir -p real/hooks docs && printf '{\"protected_branch\":\"tronco\"}' > real/hooks/guard.policy.json && ln -s real scripts && printf x > docs/x" &&
+    git_h -C "$G29/cwt-enlace" config core.worktree "$G29/cwt-enlace" &&
+    git_h init -q "$G29/ajenos" &&
+    git_h -C "$G29/ajenos" remote add srv git@myserver:project.git &&
+    git_h -C "$G29/ajenos" remote add web https://git.example.com/project.git &&
+    git_h -C "$G29/ajenos" remote add nas ssh://git@nas/repo.git &&
+    git_h -C "$G29/ajenos" remote add lab-caido https://gitlab.example.com/acme/g29-limite.git &&
+    git_h -C "$G29/ajenos" remote add lab-sin https://gitlab.example.com/acme/otro.git &&
+    git_h -C "$G29/ajenos" remote add propio-roto https://github.com/acme/proyecto.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push propio-roto https://github.com/acme/proyecto.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push propio-roto https://github.com/acme/g29-roto.git &&
+    git_h -C "$G29/ajenos" remote add propio-tronco https://github.com/acme/proyecto.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push propio-tronco https://github.com/acme/proyecto.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push propio-tronco https://github.com/acme/ajeno-tronco.git &&
+    git_h -C "$G29/ajenos" remote add tronco-propio https://github.com/acme/ajeno-tronco.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push tronco-propio https://github.com/acme/ajeno-tronco.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push tronco-propio https://github.com/acme/proyecto.git &&
+    git_h -C "$G29/ajenos" remote add incierto-roto ../no-existe.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push incierto-roto ../no-existe.git &&
+    git_h -C "$G29/ajenos" remote set-url --add --push incierto-roto https://github.com/acme/g29-roto.git &&
+    mkdir -p "$G29/roto/sub" "$G29/hondo/a" &&
+    git_h init -q "$G29/relativo" && git_h -C "$G29/relativo" remote add rel ../roto.git &&
+    git_h init -q "$G29/propio" && git_h -C "$G29/propio" commit -q --allow-empty -m g29 &&
+    git_h clone -q --bare "$G29/propio" "$G29/propio.git" && git_h -C "$G29/propio" remote add origin ../propio.git &&
+    g29_local bom "printf '\\357\\273\\277{\"protected_branch\":\"tronco\"}' > p && mkdir -p scripts/hooks && mv p scripts/hooks/guard.policy.json" &&
+    g29_local scripts-enlace "mkdir -p real/hooks && printf '{\"protected_branch\":\"tronco\"}' > real/hooks/guard.policy.json && ln -s real scripts" &&
+    git_h init -q "$G29/scripts-sub" &&
+    git_h -C "$G29/scripts-sub" update-index --add --cacheinfo "160000,$(git_h -C "$PROJ" rev-parse HEAD),scripts" &&
+    git_h -C "$G29/scripts-sub" commit -q -m g29 && git_h clone -q --bare "$G29/scripts-sub" "$G29/scripts-sub.git" &&
+    git_h -C "$G29/scripts-sub" remote add origin "$G29/scripts-sub.git"
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the second GROUP 29 repositories" >&2
+  exit 1
+fi
+# Que cada repositorio de prueba es lo que dice: si no, sus casos no prueban nada.
+total=$((total + 1))
+if [ "$(git_h -C "$G29/arbol-head.git" cat-file -t HEAD)" = tree ] &&
+  [ "$(git_h -C "$G29/arbol-head.git" symbolic-ref HEAD)" = refs/tags/tt ] &&
+  [ "$(git_h -C "$G29/arbol-id.git" cat-file -t HEAD)" = tree ] &&
+  ! git_h -C "$G29/arbol-id.git" symbolic-ref -q HEAD >/dev/null &&
+  [ "$(git_h -C "$G29/etiqueta-blob.git" cat-file -t HEAD)" = blob ] &&
+  git_h -C "$G29/commit-falta.git" rev-parse -q --verify HEAD >/dev/null &&
+  ! git_h -C "$G29/commit-falta.git" cat-file -e HEAD 2>/dev/null &&
+  ! git_h -C "$G29/ref-rota.git" rev-parse -q --verify HEAD >/dev/null 2>&1 &&
+  ! git_h -C "$G29/sin-commit.git" rev-parse -q --verify HEAD >/dev/null 2>&1 &&
+  [ "$(cd "$G29/cwt/docs" && git_h --git-dir="$G29/cwt/.git" rev-parse --show-prefix)" = docs/ ] &&
+  [ -z "$(cd "$G29/cwt/docs" && git_h --git-dir="$G29/cwt/.git" ls-tree HEAD -- scripts/hooks/guard.policy.json)" ] &&
+  [ "$(head -c 3 "$G29/bom/scripts/hooks/guard.policy.json" | od -An -tx1 | tr -d ' ')" = efbbbf ] &&
+  git_h -C "$G29/scripts-enlace.git" ls-tree HEAD -- scripts | grep -q '^120000 ' &&
+  git_h -C "$G29/scripts-sub.git" ls-tree HEAD -- scripts | grep -q '^160000 '; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 29] los repositorios de prueba de la segunda vuelta no son lo que dicen\n'
+fi
+# (1) Un HEAD que da un arbol (una etiqueta a un arbol, o el id de un arbol escrito en HEAD): su
+# politica rige, como en base.
+push_real deny  "$PROJ" "git -C $G29/arbol-head push origin HEAD:tronco"
+push_real allow "$PROJ" "git -C $G29/arbol-head push origin HEAD:feature/x"
+push_real allow "$PROJ" "git -C $G29/arbol-head push origin HEAD:main"
+push_real deny  "$PROJ" "git -C $G29/legible push $G29/arbol-head.git HEAD:tronco"
+push_real deny  "$PROJ" "git -C $G29/arbol-id push origin HEAD:main"
+push_real allow "$PROJ" "git -C $G29/arbol-id push origin HEAD:feature/x"
+# Un HEAD que da un blob, que nombra un commit que falta o una referencia que git no lee: no se lee.
+push_real deny  "$PROJ" "git -C $G29/etiqueta-blob push origin HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/commit-falta push origin HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/ref-rota push origin HEAD:feature/x"
+# Un git (como alguno mas viejo) que nombra la rama de HEAD aunque no la lea: la rama existe, y no
+# se lee. Sin nacer, la misma pregunta deja el push como siempre.
+mkdir -p "$TMP/g29-bin3"
+cat > "$TMP/g29-bin3/git" <<G29GIT3
+#!/usr/bin/env bash
+case " \$* " in *" --git-dir=$G29/ref-rota.git symbolic-ref -q HEAD "*) echo refs/heads/main; exit 0 ;; esac
+exec "$(command -v git)" "\$@"
+G29GIT3
+chmod +x "$TMP/g29-bin3/git"
+push_real deny  "$PROJ" "git -C $G29/ref-rota push origin HEAD:feature/x" env PATH="$TMP/g29-bin3:$TMP/bin:$PATH"
+push_real allow "$PROJ" "git -C $G29/sin-commit push origin HEAD:main" env PATH="$TMP/g29-bin3:$TMP/bin:$PATH"
+# (2) El guard en una carpeta del arbol de trabajo de un destino con core.worktree.
+push_real deny  "$G29/cwt/docs" "git -C $G29/sin-politica push $G29/cwt HEAD:tronco"
+push_real allow "$G29/cwt/docs" "git -C $G29/sin-politica push $G29/cwt HEAD:feature/x"
+push_real deny  "$G29/cwt-enlace/docs" "git -C $G29/sin-politica push $G29/cwt-enlace HEAD:feature/x"
+# (3) Un destino que no se puede consultar: main protegida, las demas ramas libres.
+for g29_r in srv web nas; do
+  push_real allow "$PROJ" "git -C $G29/ajenos push $g29_r HEAD:feature/x"
+  push_real deny  "$PROJ" "git -C $G29/ajenos push $g29_r HEAD:main"
+done
+# (4) Un remoto que va a este repositorio y a otro: la regla de cada uno.
+push_real deny  "$PROJ" "git -C $G29/ajenos push propio-roto HEAD:feature/x" "${G29_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $G29/ajenos push propio-tronco HEAD:trunk" "${G29_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $G29/ajenos push propio-tronco HEAD:main" "${G29_PATH2[@]}"
+push_real allow "$PROJ" "git -C $G29/ajenos push propio-tronco HEAD:feature/x" "${G29_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $G29/ajenos push tronco-propio HEAD:trunk" "${G29_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $G29/ajenos push tronco-propio HEAD:main" "${G29_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $G29/ajenos push incierto-roto HEAD:feature/x" "${G29_PATH2[@]}"
+# (5) Rutas que git resuelve: relativa (desde la raiz del arbol de trabajo, o desde la carpeta en
+# que corre fuera de el), ~/, file://localhost/, y un url o pushurl relativo.
+push_real deny  "$PROJ" "git -C $G29/legible push ../roto.git HEAD:feature/x"
+push_real deny  "$G29/roto/sub" "git push ../roto.git HEAD:feature/x"
+push_real deny  "$G29/legible.git/refs" "git push ../../roto.git HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/legible push ~/roto.git HEAD:feature/x" env HOME="$G29"
+push_real deny  "$PROJ" "git -C $G29/legible push file://localhost$G29/roto.git HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/relativo push rel HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/legible -c remote.origin.pushurl=../roto.git push origin HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/legible push ../arbol-head.git HEAD:tronco"
+push_real allow "$PROJ" "git -C $G29/legible push ../arbol-head.git HEAD:feature/x"
+# Con --git-dir de un repositorio desnudo, la ruta sale de la carpeta en que corre git.
+push_real allow "$G29/hondo/a" "git --git-dir=$G29/legible.git push ../roto.git HEAD:feature/x"
+push_real deny  "$G29/hondo/a" "git --git-dir=$G29/legible.git push ../../roto.git HEAD:feature/x"
+# Un remoto de este repositorio escrito como ruta relativa sigue siendo de este repositorio.
+push_real deny  "$G29/legible" "git push $G29/propio.git HEAD:main" env BASH_GUARD_PROJECT_ROOT="$G29/propio"
+push_real deny  "$G29/legible" "git push ../propio.git HEAD:main" env BASH_GUARD_PROJECT_ROOT="$G29/propio"
+# (6) Un BOM, una carpeta scripts enlazada o submodulo, y otro host consultado en GitHub (main).
+push_real deny  "$PROJ" "git -C $G29/bom push origin HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/scripts-enlace push origin HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/scripts-sub push origin HEAD:feature/x"
+push_real allow "$PROJ" "git -C $G29/ajenos push lab-caido HEAD:feature/x" "${G29_PATH2[@]}"
+push_real deny  "$PROJ" "git -C $G29/ajenos push lab-caido HEAD:main" "${G29_PATH2[@]}"
+push_real allow "$PROJ" "git -C $G29/ajenos push lab-sin HEAD:main" "${G29_PATH2[@]}"
+# --- GROUP 29, tercera vuelta. Lo que la segunda dejo pasar que base negaba, o nego de mas.
+# (7) Una ruta que el guard resuelve el mismo (relativa, ~, ~/, file://localhost/, un url o pushurl
+#     relativo) se juzga como este repositorio, igual que en base, Y, si llega a otro, tambien por la
+#     regla de ese otro: el guard puede no saber desde que carpeta, ni con que HOME, corre el push.
+#     La carpeta es la de git: la raiz del arbol de trabajo si se esta dentro; si no, la carpeta en
+#     que corre (tras -C), sea un git dir, un repositorio desnudo o un core.worktree en otra parte.
+# (8) Un `git push` sin remoto va al remoto que git elige (branch.<rama>.pushRemote,
+#     remote.pushDefault, branch.<rama>.remote, origin): solo una politica ilegible de ese remoto
+#     niega todo push. Los demas remotos se leen como en base (una politica ilegible protege main).
+# (9) Un owner/name de un host que no es GitHub se lee como en base: si gh falla, main protegida.
+#     Solo github.com (y un alias de ssh que lleva alli) niega todo push con una politica ilegible.
+# (10) El mensaje nombra el repositorio y la salida; una politica ejecutable (100755) se lee; un URL
+#     que es solo `~`; la raiz propia desnuda; y la etiqueta del ajeno no va en un deny de lo propio.
+# ============================================================================
+G3="$G29/vuelta3"
+mkdir -p "$G3/h1" "$G3/casa2" "$G3/h3/cwt/inner" "$G3/h3/fuera" "$G3/h4/cwt/inner"
+if ! {
+  git_h init -q "$G3/h1/propia" && git_h -C "$G3/h1/propia" commit -q --allow-empty -m g29 &&
+    git_h clone -q "$G3/h1/propia" "$G3/h1/clon" && git_h clone -q --bare "$G3/h1/propia" "$G3/h1/clon.git" &&
+    git_h -C "$G3/h1/clon" checkout -q -b trabajo && git_h -C "$G3/h1/clon" branch -q -D main &&
+    git_h -C "$G3/h1/clon" remote add t '~/propia' &&
+    git_h clone -q --bare "$G29/sin-politica" "$G3/propia" &&
+    git_h clone -q --bare "$G29/sin-politica" "$G3/casa2/propia" &&
+    git_h init -q "$G3/h3/x" && git_h -C "$G3/h3/x" commit -q --allow-empty -m g29 &&
+    git_h clone -q --bare "$G29/sin-politica" "$G3/h3/cwt/x" &&
+    git_h init -q "$G3/h3/cw" && git_h -C "$G3/h3/cw" config core.worktree "$G3/h3/cwt/inner" &&
+    git_h -C "$G3/h3/cw" checkout -q -b trabajo && git_h -C "$G3/h3/cw" commit -q --allow-empty -m g29 &&
+    git_h -C "$G3/h3/cw" remote add x ../x &&
+    git_h clone -q --bare "$G29/roto" "$G3/h4/cwt/y.git" &&
+    git_h clone -q --bare "$G29/sin-politica" "$G3/h4/y.git" &&
+    git_h init -q "$G3/h4/cw" && git_h -C "$G3/h4/cw" config core.worktree "$G3/h4/cwt/inner" &&
+    git_h init -q "$G29/raiz-rel" && git_h -C "$G29/raiz-rel" remote add up ../legible.git &&
+    git_h clone -q --bare "$G29/sin-politica" "$G29/espejo-sin.git" &&
+    git_h clone -q --bare "$G29/sin-politica" "$G29/raiz-desnuda.git" &&
+    git_h -C "$G29/raiz-desnuda.git" remote add espejo ../espejo-sin.git &&
+    g29_local ejecutable "g29_pol '{\"protected_branch\":\"tronco\"}' && chmod +x scripts/hooks/guard.policy.json" &&
+    git_h init -q "$G3/bifurca" && git_h -C "$G3/bifurca" commit -q --allow-empty -m g29 &&
+    git_h -C "$G3/bifurca" checkout -q -b feat &&
+    git_h -C "$G3/bifurca" remote add origin https://github.com/acme/otro.git &&
+    git_h -C "$G3/bifurca" remote add upstream https://github.com/acme/g29-500.git &&
+    git_h -C "$G3/bifurca" config branch.feat.remote origin &&
+    git_h init -q "$G3/bifurca2" && git_h -C "$G3/bifurca2" commit -q --allow-empty -m g29 &&
+    git_h -C "$G3/bifurca2" remote add origin https://github.com/acme/otro.git &&
+    git_h -C "$G3/bifurca2" remote add upstream https://github.com/acme/g29-500.git
+} >/dev/null 2>&1; then
+  echo "ERROR: could not build the third GROUP 29 repositories" >&2
+  exit 1
+fi
+total=$((total + 1))
+if git_h -C "$G29/ejecutable.git" ls-tree HEAD -- scripts/hooks/guard.policy.json | grep -q '^100755 ' &&
+  [ "$(git_h -C "$G3/bifurca" branch --show-current)" = feat ] &&
+  [ "$(git_h -C "$G3/h1/clon" branch --list main)" = "" ] &&
+  [ "$(git_h -C "$G3/h3/cw" branch --list main)" = "" ] &&
+  [ "$(git_h -C "$G3/bifurca2" branch --show-current)" = main ] &&
+  [ "$(cd "$G3/h3/cw" && git_h rev-parse --is-inside-work-tree)" = false ]; then
+  pass=$((pass + 1))
+else
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 29] los repositorios de prueba de la tercera vuelta no son lo que dicen\n'
+fi
+G3_RAIZ=(env BASH_GUARD_PROJECT_ROOT="$G3/h1/propia")
+# (7) Desde dentro de un git dir, git resuelve la ruta desde la carpeta en que corre: aqui llega a
+# este repositorio ($G3/h1/propia), y desde el git dir llegaria a otro sin politica ($G3/propia).
+push_real deny  "$G3/h1/clon/.git/hooks" "git push ../../../propia HEAD:main" "${G3_RAIZ[@]}"
+push_real deny  "$G3/h1/clon.git/refs" "git push ../../propia HEAD:main" "${G3_RAIZ[@]}"
+push_real deny  "$G3/h1/clon" "git -C .git/hooks push ../../../propia HEAD:main" "${G3_RAIZ[@]}"
+push_real deny  "$G29/roto/.git/hooks" "git push ../../../roto.git HEAD:feature/x"
+push_real allow "$G29/legible.git/refs" "git push ../roto.git HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29/roto.git/refs push ../../roto.git HEAD:feature/x"
+push_real deny  "$PROJ" "git -C $G29 -C roto.git/refs push ../../roto.git HEAD:feature/x"
+# El HOME de la orden no es el del guard: `~` es este repositorio para git, otro para el guard.
+push_real deny  "$G3/h1/clon" "HOME=$G3/h1 git push '~/propia' HEAD:main" env HOME="$G3/casa2" BASH_GUARD_PROJECT_ROOT="$G3/h1/propia"
+push_real deny  "$G3/h1/clon" "env HOME=$G3/h1 git push t HEAD:main" env HOME="$G3/casa2" BASH_GUARD_PROJECT_ROOT="$G3/h1/propia"
+push_real deny  "$G3/h1/clon" "export HOME=$G3/h1; git push t HEAD:main" env HOME="$G3/casa2" BASH_GUARD_PROJECT_ROOT="$G3/h1/propia"
+push_real deny  "$G3/h1/clon" "HOME=$G3/h1 git push t HEAD:main" env HOME="$G3/casa2" BASH_GUARD_PROJECT_ROOT="$G3/h1/propia"
+# core.worktree en otra parte, o --git-dir con --work-tree desde fuera: git resuelve desde la carpeta.
+push_real deny  "$G3/h3/cw" "git push ../x HEAD:main" env BASH_GUARD_PROJECT_ROOT="$G3/h3/x"
+push_real deny  "$G3/h3/fuera" "git --git-dir=$G3/h3/cw/.git --work-tree=$G3/h3/cwt/inner push ../x HEAD:main" env BASH_GUARD_PROJECT_ROOT="$G3/h3/x"
+push_real deny  "$G3/h3/fuera" "git --git-dir=$G3/h3/cw/.git --work-tree=$G3/h3/cwt/inner push x HEAD:main" env BASH_GUARD_PROJECT_ROOT="$G3/h3/x"
+push_real allow "$G3/h4/cw" "git push ../y.git HEAD:feature/x"
+push_real deny  "$G3/h4/cw" "git push ../cwt/y.git HEAD:feature/x"
+# Un destino ajeno escrito asi: la regla de este repositorio (main) y la suya, las dos.
+push_real deny  "$PROJ" "git -C $G29/legible push ../sin-politica.git HEAD:main"
+push_real deny  "$PROJ" "git -C $G29/legible push ../arbol-head.git HEAD:main"
+push_real deny  "$PROJ" "git -C $G3/h1/clon push file://localhost$G29/sin-politica.git HEAD:main"
+push_real deny  "$PROJ" "git -C $G3/h1/clon push '~/sin-politica.git' HEAD:main" env HOME="$G29"
+push_real allow "$PROJ" "git -C $G29/legible push ../sin-politica.git HEAD:feature/x"
+# Un remoto de este repositorio escrito como ruta relativa: este repositorio Y el suyo.
+push_real deny  "$G29/sin-politica" "git push $G29/legible.git HEAD:tronco" env BASH_GUARD_PROJECT_ROOT="$G29/raiz-rel"
+push_real deny  "$G29/sin-politica" "git push $G29/legible.git HEAD:main" env BASH_GUARD_PROJECT_ROOT="$G29/raiz-rel"
+push_real allow "$G29/sin-politica" "git push $G29/legible.git HEAD:feature/x" env BASH_GUARD_PROJECT_ROOT="$G29/raiz-rel"
+# (8) El remoto que git elige. origin no tiene politica (404); upstream no contesta (500).
+push_real allow "$G3/bifurca" "git push" "${G29_PATH2[@]}"
+push_real allow "$G3/bifurca" "git push -u" "${G29_PATH2[@]}"
+push_real allow "$G3/bifurca" "git -c remote.pushDefault=upstream -c branch.feat.pushRemote=origin push" "${G29_PATH2[@]}"
+push_real deny  "$G3/bifurca" "git push upstream HEAD:feature/x" "${G29_PATH2[@]}"
+push_real deny  "$G3/bifurca" "git -c branch.feat.pushRemote=upstream push" "${G29_PATH2[@]}"
+push_real deny  "$G3/bifurca" "git -c remote.pushDefault=upstream push" "${G29_PATH2[@]}"
+push_real deny  "$G3/bifurca" "git -c branch.feat.remote=upstream push" "${G29_PATH2[@]}"
+# Si no se sabe a que remoto va (un remote que no es un remoto configurado), cuentan todos.
+push_real deny  "$G3/bifurca" "git -c branch.feat.remote=. push" "${G29_PATH2[@]}"
+# Sin remoto de la rama, origin; y los demas remotos protegen main, como en base.
+push_real deny  "$G3/bifurca2" "git push" "${G29_PATH2[@]}"
+push_real allow "$PROJ" "git -C $G3/bifurca2 push origin HEAD:feature/x" "${G29_PATH2[@]}"
+# (9) Otro host, con gh sin sesion: como en base. GitHub, o un alias de ssh hacia el: no pasa nada.
+mkdir -p "$TMP/g29-bin5"
+cat > "$TMP/g29-bin5/gh" <<'G29GH5'
+#!/bin/sh
+echo 'To get started with GitHub CLI, please run:  gh auth login' >&2
+exit 4
+G29GH5
+# The guard must never run ssh to resolve an alias: ssh reads the user's config, whose `Match exec`
+# runs commands. This ssh only leaves a mark; the mark must not exist after the cases below.
+G29_SSH_MARK="$TMP/g29-ssh-ran"
+cat > "$TMP/g29-bin5/ssh" <<G29SSH
+#!/bin/sh
+: > "$G29_SSH_MARK"
+exit 255
+G29SSH
+chmod +x "$TMP/g29-bin5/gh" "$TMP/g29-bin5/ssh"
+G29_SINSESION=(env PATH="$TMP/g29-bin5:$TMP/bin:$PATH")
+push_real allow "$PROJ" "git -C $OTRO push https://gitlab.com/grp/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push https://gitlab.com/grp/foo.git HEAD:main" "${G29_SINSESION[@]}"
+push_real allow "$PROJ" "git -C $OTRO push git@bitbucket.org:team/repo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real allow "$PROJ" "git -C $OTRO push ssh://git@gitlab.example.com:2222/grp/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+# A host alias (no dot) is not resolved and may be GitHub: with its policy unreadable, every push denies.
+push_real deny  "$PROJ" "git -C $OTRO push otro-alias:acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push https://github.com/acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push https://GitHub.com:443/acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push git@github.com:acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push ssh://git@ssh.github.com:443/acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push gh-alias:acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+# Not resolved either, and GitHub by name: the multi-account alias, a dotted alias naming github,
+# brackets and a trailing dot, which git and ssh drop.
+push_real deny  "$PROJ" "git -C $OTRO push git@github.com-work:acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push work.github:acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push [github.com]:acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push ssh://git@[github.com]/acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push git@github.com.:acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+push_real deny  "$PROJ" "git -C $OTRO push https://github.com./acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+# An IPv6 literal is a host, not an alias: as in base.
+push_real allow "$PROJ" "git -C $OTRO push ssh://git@[::1]/acme/foo.git HEAD:feature/x" "${G29_SINSESION[@]}"
+total=$((total + 1))
+if [ -e "$G29_SSH_MARK" ]; then
+  fail=$((fail + 1))
+  echo "FAIL  [GROUP 29] the guard ran ssh to resolve a host alias (ssh's config can run commands)"
+else
+  pass=$((pass + 1))
+fi
+# Una politica legible de otro host se aplica, como en base.
+push_real deny  "$PROJ" "git -C $OTRO push https://gitlab.example.com/acme/ajeno-tronco.git HEAD:trunk"
+push_real allow "$PROJ" "git -C $OTRO push https://gitlab.example.com/acme/ajeno-tronco.git HEAD:main"
+# (10) El mensaje: nombra el repositorio y dice la salida. La etiqueta del ajeno solo en lo suyo.
+# msg_real <cwd> <orden> <texto que debe salir> <texto que no debe salir, o ''> [envoltura...]: un deny.
+msg_real() {
+  local cwd="$1" cmd="$2" want="$3" unwanted="$4" out rc
+  shift 4
+  total=$((total + 1))
+  out="$(cd "$cwd" && make_input "$cmd" | env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+    -u GIT_COMMON_DIR -u BASH_GUARD_BRANCH PATH="$TMP/bin:$PATH" \
+    BASH_GUARD_POLICY="$POL_PRISMA" BASH_GUARD_PROJECT_ROOT="$PROJ" "$@" "$GUARD" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 2 ] && [[ "$out" == *"$want"* ]] && { [ -z "$unwanted" ] || [[ "$out" != *"$unwanted"* ]]; }; then
+    pass=$((pass + 1))
+    return 0
+  fi
+  fail=$((fail + 1))
+  printf 'FAIL  [GROUP 29] deny con "%s" y sin "%s", got exit %d  ::  %s\n      output: %s\n' \
+    "$want" "$unwanted" "$rc" "$cmd" "${out:0:400}"
+}
+g29_roto_dir="$(cd "$G29/roto.git" && pwd -P)"
+msg_real "$PROJ" "git -C $G29/roto push origin HEAD:feature/x" \
+  "git push to ${g29_roto_dir}, whose scripts/hooks/guard.policy.json could not be read as a policy" ''
+msg_real "$PROJ" "git -C $G29/roto push origin HEAD:feature/x" \
+  "Alternative: fix that repository's scripts/hooks/guard.policy.json, which must be one JSON object in a regular file; if the read itself failed (network, rate limit), retry; or ask the user to push it" ''
+msg_real "$PROJ" "git -C $G29/api-500 push origin HEAD:feature/x" "git push to acme/g29-500, whose" '' "${G29_PATH2[@]}"
+msg_real "$PROJ" "git -C $G29/legible push ../sin-clave.git HEAD:main" \
+  "push targeting main is forbidden (main is protected for humans)" "by that repository's own guard.policy.json"
+msg_real "$PROJ" "git -C $G29/legible push ../arbol-head.git HEAD:tronco" \
+  "by that repository's own guard.policy.json" ''
+# Una politica ejecutable se lee como cualquier otra.
+push_real allow "$PROJ" "git -C $G29/ejecutable push origin HEAD:feature/x"
+push_real allow "$PROJ" "git -C $G29/ejecutable push origin HEAD:main"
+push_real deny  "$PROJ" "git -C $G29/ejecutable push origin HEAD:tronco"
+# Un URL que es solo `~`: el HOME.
+push_real deny  "$PROJ" "git -C $G29/legible push '~' HEAD:feature/x" env HOME="$G29/roto.git"
+push_real allow "$PROJ" "git -C $G29/legible push '~' HEAD:feature/x" env HOME="$G29/sin-politica.git"
+# La raiz propia desnuda: su remoto relativo sale de ella.
+push_real deny  "$G29/legible" "git push $G29/espejo-sin.git HEAD:main" env BASH_GUARD_PROJECT_ROOT="$G29/raiz-desnuda.git"
 echo "----------------------------------------"
 if [ "$fail" -eq 0 ]; then echo "OK: ${pass}/${total} cases pass"; exit 0; fi
 echo "FAILURES: ${fail}/${total} cases (${pass} OK)"
