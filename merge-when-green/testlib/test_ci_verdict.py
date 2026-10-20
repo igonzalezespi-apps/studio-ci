@@ -61,14 +61,14 @@ verdict("failure in one run, success in ANOTHER run of the same workflow, stays 
          run(2, "ci.yml", PR, B, SHA, [job("test")], created="2026-10-01T10:10:00Z")], "red")
 verdict("...unless the workflow re-reads live state (state_workflows): the latest run wins",
         [run(1, "ci.yml", PR, B, SHA, [job("test")]),
-         run(2, "pr-tldr.yml", PR, B, SHA, [job("check-pr-tldr", "failure")], created="2026-10-01T10:00:00Z"),
-         run(3, "pr-tldr.yml", PR, B, SHA, [job("check-pr-tldr")], created="2026-10-01T10:10:00Z")],
-        "green", state=["pr-tldr.yml"])
+         run(2, "require-semver-label.yml", PR, B, SHA, [job("require-semver-label", "failure")], created="2026-10-01T10:00:00Z"),
+         run(3, "require-semver-label.yml", PR, B, SHA, [job("require-semver-label")], created="2026-10-01T10:10:00Z")],
+        "green", state=["require-semver-label.yml"])
 verdict("state workflow whose latest run is red",
         [run(1, "ci.yml", PR, B, SHA, [job("test")]),
-         run(2, "pr-tldr.yml", PR, B, SHA, [job("check-pr-tldr")], created="2026-10-01T10:00:00Z"),
-         run(3, "pr-tldr.yml", PR, B, SHA, [job("check-pr-tldr", "failure")], created="2026-10-01T10:10:00Z")],
-        "red", state=["pr-tldr.yml"])
+         run(2, "require-semver-label.yml", PR, B, SHA, [job("require-semver-label")], created="2026-10-01T10:00:00Z"),
+         run(3, "require-semver-label.yml", PR, B, SHA, [job("require-semver-label", "failure")], created="2026-10-01T10:10:00Z")],
+        "red", state=["require-semver-label.yml"])
 verdict("an old cancelled run superseded by a newer success is green",
         [run(1, "ci.yml", PR, B, SHA, [job("test", "cancelled")], created="2026-10-01T10:00:00Z"),
          run(2, "ci.yml", PR, B, SHA, [job("test")], created="2026-10-01T10:10:00Z")], "green")

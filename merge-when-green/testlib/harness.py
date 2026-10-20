@@ -78,7 +78,7 @@ class World:
             "max_auto_class": 0,
             "required_checks": [{"workflow": "ci.yml", "job": "test"}],
             "required_push_checks": [{"workflow": "ci.yml", "job": "test"}],
-            "state_workflows": ["pr-tldr.yml"],
+            "state_workflows": ["require-semver-label.yml"],
             "settle_seconds": 120,
             "app_slug": APP,
             "verdict_authors": ["owner"],

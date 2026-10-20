@@ -60,7 +60,7 @@ RULES = [
     (3, "ci", [".github/workflows/**", ".github/actions/**", ".github/CODEOWNERS", "CODEOWNERS",
                "docs/CODEOWNERS"], [], "CI and ownership: credentials, minutes and what judges a PR"),
     (3, "merge-gate", ["**/risk-class/**", "**/merge-when-green/**", "**/develop-health/**",
-                       "**/revert-merge/**", "**/check-pr-tldr/**", "**/ci-gate/**",
+                       "**/revert-merge/**", "**/ci-gate/**",
                        ".github/merge-when-green.json", "**/pr-score/scripts/**"], [],
      "the merge gate itself: a PR must not relax its own gate"),
     (3, "guard", ["**/guard.policy.json", "scripts/hooks/**", ".githooks/**", "bootstrap.sh",

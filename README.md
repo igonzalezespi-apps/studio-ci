@@ -163,60 +163,19 @@ jobs:
 > the gate fails open with extra coverage runs, never silently off. If your job sets an explicit
 > `name:`, pass that display name — it is what the jobs API reports.
 
-### `check-pr-tldr`
-
-A PR flagged for a **human** to read and merge must open with its own `## TL;DR`, and that section
-must stand alone. The flag (`revision-humana` by default) means "a person merges this one"; that
-person does not read the diff, they read that section — so a TL;DR that says «see below» or cites an
-ADR it does not bring along defeats the flag. Six violation classes: no `## TL;DR`, not the first
-section, under 200 characters of prose, points elsewhere, cites a source without a link or a line,
-or is missing the merge command **for this PR**. A PR without the flag is not judged (exit 0, and it
-says so), so the check can be wired in every repo without becoming noise.
-
-```yaml
-on:
-  pull_request:
-    types: [opened, edited, labeled, unlabeled, synchronize, ready_for_review]
-
-permissions:
-  contents: read
-  pull-requests: read
-
-jobs:
-  tldr:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: igonzalezespi-apps/studio-ci/check-pr-tldr@vX.Y.Z
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-```
-
-No checkout needed: it reads the PR through the API. `label` changes the flag; `pr-number`/`repo`
-default to the event's.
-
-**Promotion mode** (opt-in, `promotion: "true"`): a PR from `integration-branch` (default `develop`)
-into `protected-branch` (default `main`) is a release that a person always reads, flagged or not. It
-is judged with the six classes **plus** the release-summary rules: the four fields (**Qué notarán
-los usuarios:**, **Qué puede salir mal y cómo se deshace:**, **Decisiones tuyas que van dentro:**,
-**Qué NO se ha comprobado:**) filled in, no inline code or file paths in the TL;DR prose (say it by
-its effect), and exactly `gh pr merge <n> --repo <owner>/<name> --merge` in a bash block. A flagged
-PR that is not a promotion is judged exactly as before. Locally:
-`check.sh --body F --pr N --repo R --labels "" --promotion --base-ref main --head-ref develop`.
-
 ### `pr-body`
 
-A deterministic PR body from git and three short texts, so bodies stop being written by hand.
+A deterministic PR body from git and a few short texts, so bodies stop being written by hand.
 Not an action: a script the session runs (`pr-body/pr-body.sh --help`).
 
 | mode | for | sections |
 |---|---|---|
-| `work` | the normal PR an agent integrates | no TL;DR (only where a person decides) · Qué y por qué (≤ 600 characters) · Verificación (required) · Riesgo (`riesgo:N`, from `risk-class` when present) · Commits · Ficheros (diff --stat, ≤ 40 lines) · Merge method: Squash |
-| `human` | `revision-humana` | `## TL;DR` first (your text + `gh pr merge N --repo R --squash`), then the `work` sections |
-| `promotion` | `develop` → `main` | `## TL;DR` with the four release fields + `gh pr merge N --repo R --merge`, the PRs of the range (`git log --first-parent`), Merge method: merge commit |
+| `work` | the normal PR an agent integrates | Qué y por qué (≤ 600 characters) · Verificación (required) · Riesgo (`riesgo:N`, from `risk-class` when present) · Commits · Ficheros (diff --stat, ≤ 40 lines) · Merge method: Squash |
+| `human` | `revision-humana` | first, before any heading, why a person is needed (`--why-file`, required) + the squash merge command of this PR in a bash block, then the `work` sections |
+| `promotion` | `develop` → `main` | optional `--why-file` text + the merge-commit merge command of this PR in a bash block, the PRs of the range (`git log --first-parent`), Merge method: merge commit |
 
-Two phases: render, create the PR, render again with `--repo R --pr N` and `gh pr edit` (that fires
-`edited`, which the TL;DR check listens to). With `--pr`, the `human` and `promotion` bodies are run
-through `check-pr-tldr` before they are printed: exit 1 if the body the script wrote would fail it.
+Two phases: render, create the PR, render again with `--repo R --pr N` and `gh pr edit`, so the
+merge command names the PR.
 
 ### `risk-class`
 
@@ -229,7 +188,7 @@ classes (`risk_paths` in `.github/merge-when-green.json`, `reserved_paths` → 2
 | class | what puts a PR there (excerpt; the full table is `risk-class/risk_class.py`) | review |
 |---|---|---|
 | 4 | promotion into the protected branch · a person's `semver:major` · migrations, `*.sql`, `schema.prisma` · key material (`*.pem`, `*.key`, `.env*`) · `*.tf`/`*.tfvars` | owner; never automatic |
-| 3 | a long-lived head · `.github/workflows/**`, `CODEOWNERS` · the guard, hooks, `security/**`, `.claude/settings.json` and every repo script its hooks or status line run · the merge gate itself (`risk-class/`, `merge-when-green/`, `develop-health/`, `revert-merge/`, `check-pr-tldr/`, `ci-gate/`) · Renovate config, `.npmrc`, `pnpm-workspace.yaml`, install scripts / `overrides` in `package.json` · `LICENSE` · a major dependency update · an important (security) check that failed at any point | owner (`revision-humana`) |
+| 3 | a long-lived head · `.github/workflows/**`, `CODEOWNERS` · the guard, hooks, `security/**`, `.claude/settings.json` and every repo script its hooks or status line run · the merge gate itself (`risk-class/`, `merge-when-green/`, `develop-health/`, `revert-merge/`, `ci-gate/`) · Renovate config, `.npmrc`, `pnpm-workspace.yaml`, install scripts / `overrides` in `package.json` · `LICENSE` · a major dependency update · an important (security) check that failed at any point | owner (`revision-humana`) |
 | 2 | `CLAUDE.md`, `AGENTS.md`, specs, `infra/**` · `.claude/**`, plugin skills/agents/commands · `action.yml` · `package.json`, `.nvmrc`, `Dockerfile`, a lockfile edited by a person (3 if it adds a source outside the registry) · test/lint/type configs (`tsconfig*`, `vitest.config.*`, `eslint.config.*`) · other `.github/**` · a person's `semver:minor` · more than 200 changed lines of code | Opus-high owner-decision lens |
 | 1 | code, 200 lines or fewer · existing tests edited or removed · a bot bumping action pins only | Sonnet-high review |
 | 0 | docs, `*.md` outside prompt surfaces, change proposals · **added** tests and fixtures · templates, `.gitignore` · an empty diff | none |
@@ -645,7 +604,8 @@ Each run classifies the open PRs first and spends its CI budget (`max_candidates
 then on the PRs it could merge, then on riesgo-3/4 to escalate; a riesgo-1/2 above
 `max_auto_class` is decided without reading CI and costs nothing.
 A riesgo-3/4 PR by a person, with CI green and no `revision-humana`, gets that label **from the App**
-so the `labeled` event wakes the TL;DR check; a bot's PR is never labelled.
+(a live-mode act, like the merge; unlike a `GITHUB_TOKEN` label, it still fires `labeled` for any
+workflow the repo hangs on it); a bot's PR is never labelled.
 
 **Lens verdict (riesgo-1/2).** The session reviews the PR (Sonnet-high for 1, Opus-high for 2) and
 posts a comment from an account in `verdict_authors`. The current form, `agent-verdict v2`, carries
@@ -699,8 +659,8 @@ jobs once; red again → freezes automatic merging (an issue labelled `merge-fre
 first red push after the last green **only if** it is one single-parent commit, merged by the merge
 App, whose commit trailer says riesgo-0..2, is not itself a revert, and fewer than
 `max_reverts_per_day` reverts happened in 24 h. Otherwise it escalates: the freeze issue gets
-`revision-humana` and a TL;DR (once: an escalated freeze is not rewritten on every run). A person's
-merge is never reverted automatically. The revert is opened by the App (`revert: <title> (#N)`, a
+`revision-humana` and a plain-language body (once: an escalated freeze is not rewritten on every
+run). A person's merge is never reverted automatically. The revert is opened by the App (`revert: <title> (#N)`, a
 `revert-of` marker) and merged by `merge-when-green` through its own path, exempt from the freeze
 it lifts, only while the branch is still red with the freeze open, and only if it is exactly what
 GitHub wrote for the App: one signed commit by the App, the same files as the original (old and
@@ -734,7 +694,7 @@ on the code); never in the self-test.
      "max_auto_class": 0,
      "required_checks": [{"workflow": "ci.yml", "job": "typecheck + test"}],
      "required_push_checks": [{"workflow": "ci.yml", "job": "typecheck + test"}],
-     "state_workflows": ["pr-tldr.yml", "require-semver-label.yml", "pr-title-lint.yml"],
+     "state_workflows": ["require-semver-label.yml", "pr-title-lint.yml"],
      "settle_seconds": 120,
      "app_slug": "<the merge App's slug>",
      "verdict_authors": ["<the account that posts lens verdicts>"]
@@ -753,7 +713,7 @@ on the code); never in the self-test.
    on:
      workflow_run:
        # the `name:` of every workflow that reports on a PR, plus the push CI of the integration branch
-       workflows: ["CI", "PR TL;DR", "pr-title-lint", "Require semver label"]
+       workflows: ["CI", "pr-title-lint", "Require semver label"]
        types: [completed]
      workflow_dispatch:
        inputs:
