@@ -96,6 +96,12 @@ jobs:
             filters: ""
             functional: "true"
             docs: "true"
+          - name: a non-Markdown file under openspec
+            add: [openspec/changes/demo/.openspec.yaml]
+            delete: []
+            filters: ""
+            functional: "true"
+            docs: "false"
           - name: a deleted script
             add: []
             delete: [bootstrap.sh]

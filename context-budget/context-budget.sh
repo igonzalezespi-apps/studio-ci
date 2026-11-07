@@ -119,8 +119,8 @@ DEFAULTS = {
 
 CHECKS = ["size", "descriptions", "dated", "marketplace", "output-style", "user-keys", "agents"]
 BUDGET_CHECKS = {"size", "descriptions", "dated"}  # las que la etiqueta puede aprobar
-# Retiradas: una configuracion que aun las nombre (clave o en warn_checks/skip_checks) no falla,
-# se ignora. `pact` vigilaba la linea del pacto del tablero (TASKS.md), que la flota ya no usa.
+# Retired checks: a config that still names one (as a key or in warn_checks/skip_checks) does not
+# fail, it is ignored. `pact` watched the TASKS.md board's pact line, which the fleet no longer uses.
 RETIRED_CHECKS = {"pact"}
 # Los integrados de Claude Code 2.1.286, con sus mayusculas (ademas de «default»).
 BUILTIN_STYLES = {"Proactive", "Concise", "Explanatory", "Learning"}
@@ -348,7 +348,7 @@ if cfg_path:
         die("clave(s) desconocida(s) en %s: %s" % (cfg_path, ", ".join(unknown)))
     for k, v in user_cfg.items():
         if k.startswith("_") or k in RETIRED_CHECKS:
-            continue  # comentarios ("_por_que": "...") y claves de checks retirados
+            continue  # comments ("_por_que": "...") and keys of retired checks
         if isinstance(DEFAULTS[k], dict) and isinstance(v, dict):
             merged = dict(cfg[k])
             merged.update(v)

@@ -253,8 +253,8 @@ caso 1 "limites propios en la configuracion" "FAIL  [size] CLAUDE.md" \
   'echo "{\"limits\": [{\"glob\": \"CLAUDE.md\", \"max_bytes\": 100}]}" > .github/context-budget.json'
 
 # --- no se puede medir: exit 2, nunca un 0 silencioso -----------------------------------------
-# `pact` (el pacto del tablero, TASKS.md) se retiro: su clave y su nombre en warn/skip_checks
-# se ignoran, para que una configuracion vieja no rompa; un nombre que nunca existio sigue en 2.
+# `pact` (the TASKS.md board's pact) is retired: its key and its name in warn/skip_checks are
+# ignored so an old config does not break; a name that never existed still exits 2.
 caso 0 "clave de un check retirado (pact): se ignora" "$LIMPIO" \
   'echo "{\"pact\": {\"required\": true}, \"warn_checks\": [\"pact\"], \"skip_checks\": [\"pact\"]}" > .github/context-budget.json'
 caso 2 "configuracion ilegible" "configuracion ilegible" 'echo "{ roto" > .github/context-budget.json'
