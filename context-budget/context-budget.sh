@@ -9,7 +9,7 @@
 # falla en silencio: un `outputStyle` que no resuelve cae a Default sin avisar, y un
 # marketplace declarado sin `ref` sigue la rama por defecto del remoto, no lo publicado.
 #
-# OCHO comprobaciones, cada una con su nombre (el que sale entre corchetes):
+# SIETE comprobaciones, cada una con su nombre (el que sale entre corchetes):
 #
 #   size          limites por fichero, en bytes o en caracteres (CLAUDE.md, estilos, contrato)
 #   descriptions  `description` (+ `when_to_use`) de cada skill, comando y agente <= N
@@ -24,13 +24,10 @@
 #   user-keys     ninguna clave personal en el settings versionado del repo
 #   agents        cada agente declara `model` y `effort`, y ninguno de solo lectura lleva
 #                 `memory` (que concede Read/Write/Edit por su cuenta)
-#   pact          si el repo usa el tablero, exactamente una linea del pacto en CLAUDE.md y
-#                 ninguna copia. Lo decide `pact.required` o, sin el, lo versionado (no solo
-#                 un `TASKS.md` en disco, que los consumidores ignoran en git)
 #
 # Las tres primeras son de PRESUPUESTO: la etiqueta de aprobacion (por defecto
 # `presupuesto-contexto-aprobado`, que pone una persona) las deja pasar sin ocultarlas. Las
-# otras cinco son de CONFIGURACION: una etiqueta no hace que un estilo inexistente exista.
+# otras cuatro son de CONFIGURACION: una etiqueta no hace que un estilo inexistente exista.
 #
 # Uso:
 #   context-budget.sh [--root DIR] [--config FICHERO] [--mode enforce|warn]
@@ -48,7 +45,7 @@
 #   --annotations       ademas, lineas `::error`/`::warning` para GitHub Actions
 #   --staged            mide lo que se va a commitear: los ficheros del indice de git con el
 #                       contenido añadido, no el arbol de trabajo. Lo que no esta en el indice
-#                       (sin añadir, o ignorado como `settings.local.json` o `TASKS.md`) no
+#                       (sin añadir, o ignorado como `settings.local.json`) no
 #                       existe, como en el checkout de CI. Exige que --root sea la raiz de un
 #                       repo git
 #   --quiet             solo hallazgos: nada si no hay ninguno; si los hay, sus lineas
@@ -107,15 +104,6 @@ DEFAULTS = {
     "output_style_expected": "",
     "forbidden_settings_keys": ["model", "effortLevel", "autoCompactWindow"],
     "allowed_plugin_marketplaces": [],
-    "pact": {
-        # true: aplica siempre; false: no aplica; null: se deduce (ver `pact_applies`).
-        "required": None,
-        "plugin": "tablero",
-        "tasks_file": "TASKS.md",
-        "marker": "contrato TASKS v2",
-        "aliases": ["pacto tablero", "tablero pact"],
-        "copy_globs": ["**/CLAUDE.md", "CLAUDE.local.md", "**/AGENTS.md", ".claude/rules/**/*.md"],
-    },
     "warn_checks": [],
     "skip_checks": [],
     "exclude": [
@@ -129,8 +117,11 @@ DEFAULTS = {
     ],
 }
 
-CHECKS = ["size", "descriptions", "dated", "marketplace", "output-style", "user-keys", "agents", "pact"]
+CHECKS = ["size", "descriptions", "dated", "marketplace", "output-style", "user-keys", "agents"]
 BUDGET_CHECKS = {"size", "descriptions", "dated"}  # las que la etiqueta puede aprobar
+# Retired checks: a config that still names one (as a key or in warn_checks/skip_checks) does not
+# fail, it is ignored. `pact` watched the TASKS.md board's pact line, which the fleet no longer uses.
+RETIRED_CHECKS = {"pact"}
 # Los integrados de Claude Code 2.1.286, con sus mayusculas (ademas de «default»).
 BUILTIN_STYLES = {"Proactive", "Concise", "Explanatory", "Learning"}
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
@@ -351,12 +342,13 @@ if cfg_path:
         die("configuracion ilegible (%s): %s" % (cfg_path, exc))
     if not isinstance(user_cfg, dict):
         die("la configuracion (%s) no es un objeto JSON" % cfg_path)
-    unknown = sorted(k for k in user_cfg if k not in DEFAULTS and not k.startswith("_"))
+    unknown = sorted(k for k in user_cfg if k not in DEFAULTS and k not in RETIRED_CHECKS
+                     and not k.startswith("_"))
     if unknown:
         die("clave(s) desconocida(s) en %s: %s" % (cfg_path, ", ".join(unknown)))
     for k, v in user_cfg.items():
-        if k.startswith("_"):
-            continue  # comentarios: "_por_que": "..."
+        if k.startswith("_") or k in RETIRED_CHECKS:
+            continue  # comments ("_por_que": "...") and keys of retired checks
         if isinstance(DEFAULTS[k], dict) and isinstance(v, dict):
             merged = dict(cfg[k])
             merged.update(v)
@@ -372,14 +364,12 @@ for key in ("warn_checks", "skip_checks", "exclude", "dated_globs", "forbidden_s
             "allowed_plugin_marketplaces", "plugin_description_sum_kinds"):
     if not isinstance(cfg[key], list):
         die("'%s' tiene que ser una lista" % key)
-# `is None`/bool y no `in (None, True, False)`: en Python 0 == False y 1 == True.
-_req = cfg["pact"].get("required") if isinstance(cfg["pact"], dict) else None
-if not (_req is None or isinstance(_req, bool)):
-    die("'pact.required' tiene que ser true, false o no estar; no vale %s" % json.dumps(_req))
 
 MODE = opt["mode"] or cfg.get("mode") or "enforce"
 if MODE not in ("enforce", "warn"):
     die("modo desconocido '%s' (enforce o warn)" % MODE)
+for key in ("warn_checks", "skip_checks"):
+    cfg[key] = [c for c in cfg[key] if c not in RETIRED_CHECKS]
 for name in list(cfg["warn_checks"]) + list(cfg["skip_checks"]):
     if name not in CHECKS:
         die("comprobacion desconocida '%s' (validas: %s)" % (name, ", ".join(CHECKS)))
@@ -975,91 +965,9 @@ def check_agents():
                     "Read/Write/Edit por su cuenta" % mem)
 
 
-# ---------------------------------------------------------------------------------------------
-# pact — si el repo usa el tablero, una linea del pacto en CLAUDE.md y ninguna copia
-# ---------------------------------------------------------------------------------------------
-# Una entrada de lista (`- `, `* `, `+ `, `1. `), tambien dentro de una cita. En CLAUDE.md un
-# alias solo cuenta como copia del pacto si encabeza una ENTRADA: las copias v1 reales son
-# siempre una regla de la lista, y una frase que solo nombra el pacto (al contar que inyecta el
-# contrato, p. ej.) no lo copia. En los demas ficheros cualquier linea cuenta, como antes: ahi
-# el pacto no pinta nada, y una regla por ruta suele ir en prosa.
-LIST_ITEM_RX = re.compile(r"^\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s+")
-
-
-def pact_line(ln, marker, alias_rx):
-    """La linea es del pacto: lleva el marcador, o es una entrada de lista con un alias."""
-    return bool(marker and marker in ln) or (bool(LIST_ITEM_RX.match(ln)) and any(r.search(ln) for r in alias_rx))
-
-
-def pact_applies(pc, main, lines, marker, alias_rx):
-    """(aplica, motivo). `pact.required` manda; sin el, se deduce del repo.
-
-    POR QUE NO BASTA `TASKS.md`. Es un fichero local de cada maquina y los consumidores lo
-    llevan en `.gitignore`: en el checkout de CI no existe nunca, y el check no actuaba. Por eso
-    cuenta tambien lo VERSIONADO: el plugin del tablero habilitado en `.claude/settings.json`
-    (no en `settings.local.json`, que es personal y tampoco llega a CI) o el pacto ya escrito en
-    CLAUDE.md, para que una copia duplicada o v1 se vea aunque no haya `TASKS.md`. Con
-    `--staged` tambien `TASKS.md` se busca en el indice: lo ignorado no cuenta, como en CI."""
-    req = pc.get("required")
-    if req is not None:
-        return req, "pact.required es %s" % ("true" if req else "false")
-    tasks = pc.get("tasks_file") or "TASKS.md"
-    plugin = pc.get("plugin") or "tablero"
-    why = []
-    if SRC.isfile(tasks):
-        why.append("%s %s" % (tasks, SRC.where))
-    st = SETTINGS.get(".claude/settings.json")
-    ep = st.get("enabledPlugins") if isinstance(st, dict) else None
-    if isinstance(ep, dict):
-        on = sorted(k for k, v in ep.items() if v and "@" in k and k.rsplit("@", 1)[0] == plugin)
-        if on:
-            why.append("%s habilitado en .claude/settings.json" % on[0])
-    for n, ln in enumerate(lines, 1):
-        if ALLOW_MARK not in ln and pact_line(ln, marker, alias_rx):
-            why.append("%s:%d lleva el pacto" % (main, n))
-            break
-    if why:
-        return True, ", ".join(why)
-    return False, "sin %s: no aplica (tampoco hay %s habilitado ni el pacto en %s)" % (tasks, plugin, main)
-
-
-def check_pact():
-    pc = cfg["pact"]
-    marker = pc.get("marker") or ""
-    alias_rx = [re.compile(re.escape(a), re.I) for a in pc.get("aliases") or []]
-    main = "CLAUDE.md" if SRC.isfile("CLAUDE.md") else ".claude/CLAUDE.md"
-    has_main = SRC.isfile(main)
-    lines = read_text(main).split("\n") if has_main else []
-    applies, why = pact_applies(pc, main, lines, marker, alias_rx)
-    if not applies:
-        notes["pact"].append(why if why.startswith("sin ") else "no aplica: " + why)
-        return
-    examined["pact"] += 1
-    notes["pact"].append("aplica: " + why)
-    if not has_main:
-        add("pact", "CLAUDE.md", 0, "no hay CLAUDE.md con la linea del pacto (aplica: %s)" % why)
-        return
-    marked = [n for n, ln in enumerate(lines, 1) if marker in ln]
-    if len(marked) != 1:
-        add("pact", main, marked[1] if len(marked) > 1 else 0,
-            "%d linea(s) con «%s»: tiene que haber exactamente una (aplica: %s)" % (len(marked), marker, why))
-    for n, ln in enumerate(lines, 1):
-        if n not in marked and ALLOW_MARK not in ln and pact_line(ln, "", alias_rx):
-            add("pact", main, n, "copia vieja del pacto fuera de la linea «%s»" % marker)
-    for f in FILES:
-        if f == main or not matches(f, pc.get("copy_globs") or []):
-            continue
-        for n, ln in enumerate(read_text(f).split("\n"), 1):
-            if ALLOW_MARK in ln:
-                continue
-            if (marker and marker in ln) or any(r.search(ln) for r in alias_rx):
-                add("pact", f, n, "otra copia del pacto: el texto vive solo en %s" % main)
-                break
-
-
 RUNNERS = {"size": check_size, "descriptions": check_descriptions, "dated": check_dated,
            "marketplace": check_marketplace, "output-style": check_output_style,
-           "user-keys": check_user_keys, "agents": check_agents, "pact": check_pact}
+           "user-keys": check_user_keys, "agents": check_agents}
 
 for c in CHECKS:
     if c not in cfg["skip_checks"]:

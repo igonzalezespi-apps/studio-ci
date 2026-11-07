@@ -1,6 +1,6 @@
 # Fixture `limpio`
 
-Un repo que pasa las ocho comprobaciones de `context-budget` en modo `enforce`. Los tests lo
+Un repo que pasa las siete comprobaciones de `context-budget` en modo `enforce`. Los tests lo
 copian a un directorio temporal, le aplican UNA mutacion por caso y comprueban que falla por
 esa regla (y que la pareja sin mutar pasa).
 

@@ -83,8 +83,7 @@ functional on purpose (fail-safe: a workflow or lockfile change can break the bu
 full suite).
 
 The default `docs` is documentation only, never something a build, a test or a script runs or
-reads: Markdown anywhere, `docs/`, the content of OpenSpec (`openspec/changes/`, `openspec/specs/`;
-its config and schemas are functional), Cursor's rule files (`.cursor/rules/**/*.mdc`) and licence
+reads: Markdown anywhere, `docs/`, Cursor's rule files (`.cursor/rules/**/*.mdc`) and licence
 texts (`LICENSE*`). Agent folders are not documentation as a whole: their hooks, settings and
 scripts are functional, only their Markdown is docs. The default `code` also holds test folders and
 fixtures, whatever their extension (`test/`, `tests/`, `__tests__/`, `integration_test/`, `e2e/`,
@@ -189,9 +188,9 @@ classes (`risk_paths` in `.github/merge-when-green.json`, `reserved_paths` → 2
 |---|---|---|
 | 4 | promotion into the protected branch · a person's `semver:major` · migrations, `*.sql`, `schema.prisma` · key material (`*.pem`, `*.key`, `.env*`) · `*.tf`/`*.tfvars` | owner; never automatic |
 | 3 | a long-lived head · `.github/workflows/**`, `CODEOWNERS` · the guard, hooks, `security/**`, `.claude/settings.json` and every repo script its hooks or status line run · the merge gate itself (`risk-class/`, `merge-when-green/`, `develop-health/`, `revert-merge/`, `ci-gate/`) · Renovate config, `.npmrc`, `pnpm-workspace.yaml`, install scripts / `overrides` in `package.json` · `LICENSE` · a major dependency update · an important (security) check that failed at any point | owner (`revision-humana`) |
-| 2 | `CLAUDE.md`, `AGENTS.md`, specs, `infra/**` · `.claude/**`, plugin skills/agents/commands · `action.yml` · `package.json`, `.nvmrc`, `Dockerfile`, a lockfile edited by a person (3 if it adds a source outside the registry) · test/lint/type configs (`tsconfig*`, `vitest.config.*`, `eslint.config.*`) · other `.github/**` · a person's `semver:minor` · more than 200 changed lines of code | Opus-high owner-decision lens |
+| 2 | `CLAUDE.md`, `AGENTS.md`, `openspec/project.md` and `openspec/specs/**` (while a repo still keeps the guard's config or the owner's decisions there), `infra/**` · `.claude/**`, plugin skills/agents/commands · `action.yml` · `package.json`, `.nvmrc`, `Dockerfile`, a lockfile edited by a person (3 if it adds a source outside the registry) · test/lint/type configs (`tsconfig*`, `vitest.config.*`, `eslint.config.*`) · other `.github/**` · a person's `semver:minor` · more than 200 changed lines of code | Opus-high owner-decision lens |
 | 1 | code, 200 lines or fewer · existing tests edited or removed · a bot bumping action pins only | Sonnet-high review |
-| 0 | docs, `*.md` outside prompt surfaces, change proposals · **added** tests and fixtures · templates, `.gitignore` · an empty diff | none |
+| 0 | docs, `*.md` outside prompt surfaces · **added** tests and fixtures · templates, `.gitignore` · an empty diff | none |
 
 A dependency bot's PR that only bumps versions — every commit the bot's **and signed** (the bot's
 name alone is just an e-mail address), `package.json` changing only the versions of packages it
@@ -217,7 +216,7 @@ a `package.json` it could not read counts as one with install scripts (3).
 ### `context-budget`
 
 What Claude Code loads into every session has a budget, and the repo configuration that decides
-*what* is loaded must resolve to something that exists. Eight checks, each named in the output:
+*what* is loaded must resolve to something that exists. Seven checks, each named in the output:
 
 | check | what fails it |
 |---|---|
@@ -228,7 +227,6 @@ What Claude Code loads into every session has a budget, and the repo configurati
 | `output-style` | an `outputStyle` that does not resolve — Claude Code silently falls back to Default: a plugin style whose plugin is not enabled in the repo, a plugin that does not ship it, a project style that does not exist, or a name that only matches with different capitalisation; optionally, not the agreed one |
 | `user-keys` | a personal key in the committed `.claude/settings.json` (`model`, `effortLevel`, `autoCompactWindow`, or a plugin from a marketplace the repo does not declare) |
 | `agents` | an agent without `model` or `effort` (Haiku is exempt from `effort`), or a read-only agent with `memory` — which grants Read/Write/Edit on its own |
-| `pact` | when the pact applies, not exactly one `contrato TASKS v2` line in `CLAUDE.md`, an old copy (a list entry with an alias such as `Tablero pact`) or another copy of the pact elsewhere |
 
 **How a style name resolves** — exactly as Claude Code resolves it (verified on 2.1.286, in the
 binary and with a live `claude -p` run): the lookup is **case-sensitive**, and a style is named
@@ -241,8 +239,8 @@ other capitalisation, the failure line says which one.
 
 `size`, `descriptions` and `dated` are **budget** checks: the approval label (default
 `presupuesto-contexto-aprobado`, set by a person) lets an excess through, still listed as `APROB`.
-The other five are **configuration** checks, and no label makes a missing style exist. A line with
-`context-budget: allow` is skipped by `dated`, `marketplace` and `pact`. Exit `0` clean (warnings
+The other four are **configuration** checks, and no label makes a missing style exist. A line with
+`context-budget: allow` is skipped by `dated` and `marketplace`. Exit `0` clean (warnings
 do not count), `1` violations, `2` could not measure (bad config, unknown flag) — never a silent `0`.
 
 ```yaml
@@ -284,15 +282,10 @@ each one **replaces** the default (a list replaces the whole list):
 ```
 
 The rest (`dated_globs`, `marketplace`, `forbidden_settings_keys`, `allowed_plugin_marketplaces`,
-`pact`, `plugin_description_sum_kinds`) is documented in the defaults at the top of
-`context-budget/context-budget.sh`. An unknown key is an error, not a silent no-op.
-
-**When `pact` applies** — `"pact": {"required": true}` always, `false` never. Without the key it is
-inferred from what is committed, because `TASKS.md` is usually in `.gitignore` and never reaches a
-CI checkout: it applies if there is a `TASKS.md` on disk, if the committed `.claude/settings.json`
-enables `tablero@<marketplace>`, or if `CLAUDE.md` already carries the marker or an alias on a list
-entry (so a duplicated or v1 pact is caught without `TASKS.md`). The check's line says why it
-applies, or why not.
+`plugin_description_sum_kinds`) is documented in the defaults at the top of
+`context-budget/context-budget.sh`. An unknown key is an error, not a silent no-op — except the
+key of a retired check (`pact`, which watched the TASKS.md board's pact line), ignored like its
+name in `warn_checks`/`skip_checks`, so an old config keeps working.
 
 **Locally or as a pre-commit** (a repo without CI) — the script is self-contained, so one copy is
 enough:
@@ -310,7 +303,7 @@ non-ignored files, with their content on disk.
 
 - `--staged` measures **what the commit will record**: the files in the git index, read from the
   index (`git cat-file`), not from disk. A file that is not in the index does not exist for it
-  (unstaged, or ignored such as `.claude/settings.local.json` or `TASKS.md`), which is the view a
+  (unstaged, or ignored such as `.claude/settings.local.json`), which is the view a
   CI checkout gets after the push. So an oversized `CLAUDE.md` left unstaged no longer blocks a
   commit that does not touch it, and one that is fine on disk but oversized in the index no
   longer slips through. The config file is read from the index too (an explicit `--config` that
