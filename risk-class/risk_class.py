@@ -73,8 +73,10 @@ RULES = [
                          "**/.yarnrc", "**/.yarnrc.yml", "**/pnpm-workspace.yaml"], [],
      "where dependencies come from and how they install"),
     (3, "license", ["LICENSE", "LICENSE.*", "LICENSE-*", "COPYING"], [], "the licence"),
-    # openspec/project.md: some repos still keep the guard's `parte:` money-alarm config there
-    (2, "contract", ["**/CLAUDE.md", "**/AGENTS.md", "openspec/project.md"], [],
+    # openspec/project.md: some repos still keep the guard's `parte:` money-alarm config there.
+    # openspec/specs/**: owner decisions still written there until each repo moves them out;
+    # they leave this list when no repo has the folder, never before.
+    (2, "contract", ["**/CLAUDE.md", "**/AGENTS.md", "openspec/project.md", "openspec/specs/**"], [],
      "a contract, or config the guard reads"),
     (2, "infra", ["infra/**"], [], "infrastructure (spend: the lens decides)"),
     (2, "agent-cabling", [".claude/**", "plugins/*/skills/**", "plugins/*/agents/**",
