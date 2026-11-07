@@ -17,7 +17,7 @@ inputs:
 
 outputs:
   docs:
-    description: "Documentation: Markdown, docs/, OpenSpec changes and specs, Cursor rules, licence texts."
+    description: "Documentation: Markdown, docs/, Cursor rules, licence texts."
     value: ${{ steps.filter.outputs.docs }}
   ci:
     description: "Workflows / Dockerfiles / compose."
@@ -53,7 +53,7 @@ runs:
       # `docs` is an EXCLUSION list: whatever it does not match is functional (see the last step),
       # so a path missing from every bucket runs the suite instead of skipping it. Only
       # documentation goes here: what people and agents read, and what only documentation tooling
-      # reads with it (images under docs/, OpenSpec's change metadata); nothing a build, a test or
+      # reads with it (images under docs/); nothing a build, a test or
       # a script runs or reads as input. So no whole agent folder: .claude/, .agents/ and .cursor/
       # also hold hooks, settings and scripts that CI runs, and only their Markdown and Cursor's
       # rule files are documentation. A Markdown file under another bucket's path
@@ -64,8 +64,6 @@ runs:
         docs:
           - '**/*.md'
           - 'docs/**'
-          - 'openspec/changes/**'
-          - 'openspec/specs/**'
           - '.cursor/rules/**/*.mdc'
           - '**/LICENSE*'
         ci:

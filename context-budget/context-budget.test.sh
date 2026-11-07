@@ -57,8 +57,6 @@ open(p, "w", encoding="utf-8").write(t)
 PYD
 }
 
-# grande <fichero> <bytes>: un CLAUDE.md de N bytes que conserva la linea del pacto
-grande() { python3 -c 'import sys;h="- contrato TASKS v2\n";open(sys.argv[1],"w").write(h+"x"*(int(sys.argv[2])-len(h)))' "$1" "$2"; }
 # indexa: convierte el fixture en un repo git con todo en el indice (basta el indice, sin commit)
 indexa() { git init -q && git add -A; }
 
@@ -84,14 +82,14 @@ LIMPIO="context-budget: 0 violacion(es), 0 aviso(s)"
 caso 0 "fixture limpio: 0 violaciones" "$LIMPIO" ":"
 prepara
 out="$(bash "$CHECK" --root "$R" 2>&1)"
-for c in size descriptions dated marketplace output-style user-keys agents pact; do
+for c in size descriptions dated marketplace output-style user-keys agents; do
   if printf '%s\n' "$out" | grep -qE "^OK    \[$c\] [1-9]"; then pass=$((pass + 1)); else
     fail=$((fail + 1)); printf 'FAIL  el fixture limpio no ejercita [%s] (0 revisados): un OK sin mirar nada\n%s\n' "$c" "$out"; fi
 done
 
 # --- size -------------------------------------------------------------------------------------
-caso 1 "CLAUDE.md de 3.001 B" "FAIL  [size] CLAUDE.md: 3.001 B > 3.000 B" 'rellena CLAUDE.md 3001; echo "Pacto contrato TASKS v2" >> /dev/null'
-caso 0 "CLAUDE.md de 3.000 B justos (sin pacto: se quita TASKS.md)" "" 'rellena CLAUDE.md 3000; rm TASKS.md'
+caso 1 "CLAUDE.md de 3.001 B" "FAIL  [size] CLAUDE.md: 3.001 B > 3.000 B" 'rellena CLAUDE.md 3001'
+caso 0 "CLAUDE.md de 3.000 B justos" "" 'rellena CLAUDE.md 3000'
 caso 1 "estilo de salida de 5.001 B" "FAIL  [size] plugins/nucleo/output-styles/dueno.md: 5.001 B" \
   'python3 -c "import sys;p=sys.argv[1];t=open(p).read();open(p,\"w\").write(t+\"y\"*(5001-len(t.encode())))" plugins/nucleo/output-styles/dueno.md'
 # contract-core se mide en CARACTERES: 3.999 caracteres con tildes son mas de 4.000 bytes y pasan
@@ -121,7 +119,7 @@ caso 1 "description con dos puntos sin comillas se mide igual" "description de 2
   'sed -i "s/^description: Resume.*/description: nota: $(printf "z%.0s" $(seq 1 254))/" .claude/skills/resumen/SKILL.md'
 
 # --- dated ------------------------------------------------------------------------------------
-caso 1 "linea con fecha ISO en CLAUDE.md" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «2026-09-29»)" \
+caso 1 "linea con fecha ISO en CLAUDE.md" "FAIL  [dated] CLAUDE.md:12: parrafo fechado (fecha: «2026-09-29»)" \
   'printf "\nMedido el 2026-09-29 con el comando de siempre.\n" >> CLAUDE.md'
 caso 1 "nota de correccion sin fecha" "nota de correccion" 'printf "\n*(Corregido: antes decia otra cosa.)*\n" >> CLAUDE.md'
 caso 1 "«esta linea decia» sin fecha" "antes decia" 'printf "\nHasta hoy esta regla decia lo contrario.\n" >> CLAUDE.md'
@@ -132,13 +130,13 @@ caso 0 "una fecha dentro de un bloque de codigo no cuenta" "" 'printf "\n\`\`\`\
 caso 0 "una fecha en un README no es un fichero de reglas" "" 'echo "Publicado el 2026-09-29." >> README.md'
 # una fecha pegada a una letra sigue siendo una fecha; un numero mas largo no lo es. Un caso
 # por extremo de cada fecha numerica: cada limite tiene su mutante abajo.
-caso 1 "fecha ISO pegada a una hora (2026-09-29T10:00)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «2026-09-29»)" \
+caso 1 "fecha ISO pegada a una hora (2026-09-29T10:00)" "FAIL  [dated] CLAUDE.md:12: parrafo fechado (fecha: «2026-09-29»)" \
   'printf "\nCerrado el 2026-09-29T10:00 por una incidencia.\n" >> CLAUDE.md'
-caso 1 "fecha ISO pegada a una letra delante (informe_2026-09-29)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «2026-09-29»)" \
+caso 1 "fecha ISO pegada a una letra delante (informe_2026-09-29)" "FAIL  [dated] CLAUDE.md:12: parrafo fechado (fecha: «2026-09-29»)" \
   'printf "\nLos datos salen de informe_2026-09-29.md.\n" >> CLAUDE.md'
-caso 1 "fecha DD-MM-AAAA pegada a una letra (informe_29-09-2026)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «29-09-2026»)" \
+caso 1 "fecha DD-MM-AAAA pegada a una letra (informe_29-09-2026)" "FAIL  [dated] CLAUDE.md:12: parrafo fechado (fecha: «29-09-2026»)" \
   'printf "\nLos datos salen de informe_29-09-2026.md.\n" >> CLAUDE.md'
-caso 1 "fecha DD-MM-AAAA pegada a una hora (29-09-2026T10:00)" "FAIL  [dated] CLAUDE.md:13: parrafo fechado (fecha: «29-09-2026»)" \
+caso 1 "fecha DD-MM-AAAA pegada a una hora (29-09-2026T10:00)" "FAIL  [dated] CLAUDE.md:12: parrafo fechado (fecha: «29-09-2026»)" \
   'printf "\nCierre 29-09-2026T10:00 por una incidencia.\n" >> CLAUDE.md'
 caso 0 "un numero mas largo no es una fecha (12026-09-29, 2026-09-291, 129/09/2026, 29/09/20261)" "" \
   'printf "\nLotes 12026-09-29 y 2026-09-291, piezas 129/09/2026 y 29/09/20261.\n" >> CLAUDE.md'
@@ -236,54 +234,13 @@ caso 1 "memory con tools en lista YAML sin indentar" "memory: local en un agente
 caso 1 "agente sin frontmatter" "sin frontmatter" 'echo "solo prosa" > plugins/nucleo/agents/rastreador.md'
 caso 0 "un agente bajo tests/ no se revisa" "" 'mkdir -p tests/.claude/agents && echo "sin nada" > tests/.claude/agents/x.md'
 
-# --- pact -------------------------------------------------------------------------------------
-caso 1 "pacto duplicado en CLAUDE.md" "2 linea(s) con «contrato TASKS v2»" \
-  'echo "- Otra vez el contrato TASKS v2." >> CLAUDE.md'
-caso 1 "sin la linea del pacto" "0 linea(s) con «contrato TASKS v2»" 'sed -i "/contrato TASKS v2/d" CLAUDE.md'
-caso 1 "copia vieja del pacto (v1) junto a la buena" "copia vieja del pacto" \
-  'echo "- **Tablero pact** — registro por repo y traspaso en TASKS.md." >> CLAUDE.md'
-caso 1 "copia del pacto en una regla por ruta" "FAIL  [pact] .claude/rules/tablero.md:1: otra copia del pacto" \
-  'mkdir -p .claude/rules && echo "Pacto Tablero: deja la entrada en A medias." > .claude/rules/tablero.md'
-caso 0 "sin TASKS.md, sin tablero y sin marcador el pacto no aplica" "sin TASKS.md: no aplica" 'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md'
-# `TASKS.md` va en el .gitignore de los consumidores: en CI no existe nunca. Lo que decide es
-# lo versionado (el tablero habilitado, el pacto en CLAUDE.md) o `pact.required`.
-caso 1 "sin TASKS.md y con el tablero habilitado: falta la linea" "0 linea(s) con «contrato TASKS v2»: tiene que haber exactamente una (aplica: tablero@ivan habilitado" \
-  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; jqset .claude/settings.json "d[\"enabledPlugins\"][\"tablero@ivan\"]=True"'
-caso 0 "sin TASKS.md y con el tablero habilitado: la linea esta" "OK    [pact] 1 revisado(s): aplica: tablero@ivan habilitado" \
-  'rm TASKS.md; jqset .claude/settings.json "d[\"enabledPlugins\"][\"tablero@ivan\"]=True"'
-caso 0 "el tablero deshabilitado (false) no hace aplicar el pacto" "sin TASKS.md: no aplica" \
-  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; jqset .claude/settings.json "d[\"enabledPlugins\"][\"tablero@ivan\"]=False"'
-caso 0 "el tablero en settings.local.json (personal, no llega a CI) no cuenta" "sin TASKS.md: no aplica" \
-  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; echo "{\"enabledPlugins\": {\"tablero@ivan\": true}}" > .claude/settings.local.json'
-caso 1 "sin TASKS.md y con pact.required true: aplica" "(aplica: pact.required es true)" \
-  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; echo "{\"pact\": {\"required\": true}}" > .github/context-budget.json'
-caso 1 "pact.required true sin CLAUDE.md" "no hay CLAUDE.md con la linea del pacto (aplica: pact.required es true)" \
-  'rm TASKS.md CLAUDE.md; echo "{\"pact\": {\"required\": true}}" > .github/context-budget.json'
-caso 0 "pact.required false: no aplica aunque haya TASKS.md y copias" "no aplica: pact.required es false" \
-  'echo "- Otra vez el contrato TASKS v2." >> CLAUDE.md; echo "{\"pact\": {\"required\": false}}" > .github/context-budget.json'
-caso 2 "pact.required que no es booleano" "'pact.required' tiene que ser true, false o no estar" \
-  'echo "{\"pact\": {\"required\": \"si\"}}" > .github/context-budget.json'
-caso 1 "sin TASKS.md, un pacto duplicado en CLAUDE.md se ve igual" "2 linea(s) con «contrato TASKS v2»" \
-  'rm TASKS.md; echo "- Otra vez el contrato TASKS v2." >> CLAUDE.md'
-caso 1 "sin TASKS.md, un pacto v1 en CLAUDE.md se ve igual" "FAIL  [pact] CLAUDE.md:11: copia vieja del pacto" \
-  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; echo "- **Tablero pact** — registro por repo y traspaso en TASKS.md." >> CLAUDE.md'
-# Un alias en CLAUDE.md solo es copia si encabeza una entrada de lista. Una frase que nombra el
-# pacto al contar lo que inyecta el contrato no lo copia; su pareja es el caso «copia vieja» de
-# arriba, que es una entrada y falla.
-caso 0 "una frase que nombra el pacto no es una copia" "OK    [pact] 1 revisado(s)" \
-  'printf "\n> The contract (hard core, rules, language, tablero pact) is injected every session.\n" >> CLAUDE.md'
-caso 0 "una frase que nombra el pacto no hace aplicar el check" "sin TASKS.md: no aplica" \
-  'rm TASKS.md; sed -i "/contrato TASKS v2/d" CLAUDE.md; printf "\n> The contract (hard core, rules, language, tablero pact) is injected.\n" >> CLAUDE.md'
-caso 1 "un alias en una entrada de lista dentro de una cita si es copia" "copia vieja del pacto" \
-  'printf "\n> - Tablero pact: registro por repo.\n" >> CLAUDE.md'
-
 # --- etiqueta de aprobacion y modos -----------------------------------------------------------
 caso 0 "exceso de presupuesto CON la etiqueta: aprobado y visible" "APROB [size] CLAUDE.md" \
-  'rellena CLAUDE.md 4000; echo "contrato TASKS v2" >> CLAUDE.md' --labels "semver:none,presupuesto-contexto-aprobado"
+  'rellena CLAUDE.md 4000' --labels "semver:none,presupuesto-contexto-aprobado"
 caso 1 "la etiqueta no arregla la configuracion" "FAIL  [output-style]" \
   'jqset .claude/settings.json "d[\"outputStyle\"]=\"largo\""' --labels "presupuesto-contexto-aprobado"
 caso 1 "otra etiqueta no aprueba nada" "FAIL  [size] CLAUDE.md" \
-  'rellena CLAUDE.md 4000; echo "contrato TASKS v2" >> CLAUDE.md' --labels "revision-humana"
+  'rellena CLAUDE.md 4000' --labels "revision-humana"
 caso 0 "modo warn: avisa y no falla" "context-budget: 0 violacion(es), 1 aviso(s)" \
   'jqset .claude/settings.json "d[\"model\"]=\"opus\""' --mode warn
 caso 0 "warn_checks en la configuracion" "WARN  [user-keys]" \
@@ -296,18 +253,22 @@ caso 1 "limites propios en la configuracion" "FAIL  [size] CLAUDE.md" \
   'echo "{\"limits\": [{\"glob\": \"CLAUDE.md\", \"max_bytes\": 100}]}" > .github/context-budget.json'
 
 # --- no se puede medir: exit 2, nunca un 0 silencioso -----------------------------------------
+# `pact` (el pacto del tablero, TASKS.md) se retiro: su clave y su nombre en warn/skip_checks
+# se ignoran, para que una configuracion vieja no rompa; un nombre que nunca existio sigue en 2.
+caso 0 "clave de un check retirado (pact): se ignora" "$LIMPIO" \
+  'echo "{\"pact\": {\"required\": true}, \"warn_checks\": [\"pact\"], \"skip_checks\": [\"pact\"]}" > .github/context-budget.json'
 caso 2 "configuracion ilegible" "configuracion ilegible" 'echo "{ roto" > .github/context-budget.json'
 caso 2 "clave desconocida en la configuracion" "clave(s) desconocida(s)" 'echo "{\"limite\": 1}" > .github/context-budget.json'
 caso 2 "comprobacion desconocida" "comprobacion desconocida" 'echo "{\"warn_checks\": [\"G3\"]}" > .github/context-budget.json'
 caso 2 "un limite mal escrito" "cada limite es" 'echo "{\"limits\": [\"CLAUDE.md\"]}" > .github/context-budget.json'
 caso 2 "una lista que no es lista" "tiene que ser una lista" 'echo "{\"exclude\": \"**/x/**\"}" > .github/context-budget.json'
 # un fallo interno sale con 2 («no se pudo medir»), nunca con 1 («hay violaciones»)
-caso 2 "fallo interno: exit 2 y lo dice" "error interno" 'echo "{\"pact\": {\"aliases\": 7}}" > .github/context-budget.json'
+caso 2 "fallo interno: exit 2 y lo dice" "error interno" 'echo "{\"marketplace\": {\"legacy_repos\": 7}}" > .github/context-budget.json'
 caso 2 "argumento desconocido" "argumento desconocido" ":" --nada
 caso 2 "modo desconocido" "modo desconocido" ":" --mode estricto
 
 # --- anotaciones para GitHub ------------------------------------------------------------------
-caso 1 "--annotations saca ::error con fichero y linea" "::error file=CLAUDE.md,line=13,title=context-budget [dated]::" \
+caso 1 "--annotations saca ::error con fichero y linea" "::error file=CLAUDE.md,line=12,title=context-budget [dated]::" \
   'printf "\nMedido el 2026-09-29.\n" >> CLAUDE.md' --annotations
 
 # --- en un repo git, lo ignorado no se mide ---------------------------------------------------
@@ -325,13 +286,13 @@ if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF ".claude/rules/local.md:1"; 
 # Cada caso con su pareja SIN --staged sobre el mismo arbol: la diferencia es la fuente, no el
 # fixture.
 caso 0 "--staged: un CLAUDE.md grande en disco y SIN añadir no bloquea" "$LIMPIO" \
-  'indexa && grande CLAUDE.md 4000' --staged
+  'indexa && rellena CLAUDE.md 4000' --staged
 caso 1 "sin --staged, el mismo CLAUDE.md en disco si cuenta" "FAIL  [size] CLAUDE.md: 4.000 B > 3.000 B" \
-  'indexa && grande CLAUDE.md 4000'
+  'indexa && rellena CLAUDE.md 4000'
 caso 1 "--staged: un CLAUDE.md grande añadido cuenta aunque el disco este bien" "FAIL  [size] CLAUDE.md: 4.000 B > 3.000 B" \
-  'cp CLAUDE.md ../bien.md && grande CLAUDE.md 4000 && indexa && cp ../bien.md CLAUDE.md' --staged
+  'cp CLAUDE.md ../bien.md && rellena CLAUDE.md 4000 && indexa && cp ../bien.md CLAUDE.md' --staged
 caso 0 "sin --staged, el mismo caso mide el disco, que esta bien" "$LIMPIO" \
-  'cp CLAUDE.md ../bien.md && grande CLAUDE.md 4000 && indexa && cp ../bien.md CLAUDE.md'
+  'cp CLAUDE.md ../bien.md && rellena CLAUDE.md 4000 && indexa && cp ../bien.md CLAUDE.md'
 caso 0 "--staged: la linea del resumen dice que mide el indice" "fichero(s) en el indice)." 'indexa' --staged
 caso 1 "--staged: los ajustes se leen del indice" '"model" es un ajuste personal' \
   'cp .claude/settings.json ../s.json && jqset .claude/settings.json "d[\"model\"]=\"opus\"" && indexa && cp ../s.json .claude/settings.json' --staged
@@ -357,20 +318,15 @@ caso 0 "--staged: una configuracion sin añadir no cuenta" "$LIMPIO" \
   'indexa && echo "{\"limits\": [{\"glob\": \"CLAUDE.md\", \"max_bytes\": 100}]}" > .github/context-budget.json' --staged
 caso 1 "--staged: la misma configuracion, añadida, si" "FAIL  [size] CLAUDE.md" \
   'echo "{\"limits\": [{\"glob\": \"CLAUDE.md\", \"max_bytes\": 100}]}" > .github/context-budget.json && indexa' --staged
-caso 0 "--staged: un TASKS.md ignorado no hace aplicar el pacto (como en CI)" "sin TASKS.md: no aplica" \
-  'sed -i "/contrato TASKS v2/d" CLAUDE.md && echo TASKS.md > .gitignore && indexa' --staged
-caso 1 "sin --staged, el mismo TASKS.md en disco si" "0 linea(s) con «contrato TASKS v2»: tiene que haber exactamente una (aplica: TASKS.md en disco" \
-  'sed -i "/contrato TASKS v2/d" CLAUDE.md && echo TASKS.md > .gitignore && indexa'
-caso 0 "--staged: un TASKS.md añadido si hace aplicar el pacto" "aplica: TASKS.md en el indice" 'indexa' --staged
 # un CLAUDE.md que es un enlace simbolico se sigue DENTRO del indice: cuenta el destino añadido
 caso 1 "--staged: un CLAUDE.md enlace simbolico mide el destino del indice" "FAIL  [size] CLAUDE.md: 4.000 B" \
-  'mkdir -p docs && grande docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && grande docs/raiz.md 2000' --staged
+  'mkdir -p docs && rellena docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && rellena docs/raiz.md 2000' --staged
 caso 0 "sin --staged, el mismo enlace mide el destino en disco" "$LIMPIO" \
-  'mkdir -p docs && grande docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && grande docs/raiz.md 2000'
-caso 1 "--staged: un enlace a algo que no esta en el indice no existe (como en CI)" "no hay CLAUDE.md con la linea del pacto" \
-  'mkdir -p docs && grande docs/raiz.md 2000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && echo docs/ > .gitignore && indexa' --staged
-caso 0 "sin --staged, el mismo enlace se sigue en disco" "$LIMPIO" \
-  'mkdir -p docs && grande docs/raiz.md 2000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && echo docs/ > .gitignore && indexa'
+  'mkdir -p docs && rellena docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && indexa && rellena docs/raiz.md 2000'
+caso 0 "--staged: un enlace a algo que no esta en el indice no existe (como en CI)" "$LIMPIO" \
+  'mkdir -p docs && rellena docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && echo docs/ > .gitignore && indexa' --staged
+caso 1 "sin --staged, el mismo enlace se sigue en disco" "FAIL  [size] CLAUDE.md: 4.000 B" \
+  'mkdir -p docs && rellena docs/raiz.md 4000 && rm CLAUDE.md && ln -s docs/raiz.md CLAUDE.md && echo docs/ > .gitignore && indexa'
 # el estilo se llama por su `name:` (corto), no por el fichero: hace falta LEERLO a traves del enlace
 caso 0 "--staged: un directorio de estilos enlazado se sigue dentro del indice" "corto (.claude/output-styles)" \
   'mv .claude/output-styles estilos && printf -- "---\nname: corto\n---\nx\n" > estilos/largo.md && ln -s ../estilos .claude/output-styles && jqset .claude/settings.json "d[\"outputStyle\"]=\"corto\"" && indexa' --staged
@@ -435,17 +391,17 @@ corre ":" --quiet
 comprueba "--quiet con todo limpio: exit 0 y ni una linea" '[ "$rc" -eq 0 ] && [ -z "$out" ]'
 corre ":"
 comprueba "sin --quiet, lo de siempre: una linea OK por comprobacion y el resumen" \
-  '[ "$rc" -eq 0 ] && [ "$(printf "%s\n" "$out" | grep -c "^OK    \[")" -eq 8 ] && printf "%s\n" "$out" | grep -qF "$LIMPIO"'
+  '[ "$rc" -eq 0 ] && [ "$(printf "%s\n" "$out" | grep -c "^OK    \[")" -eq 7 ] && printf "%s\n" "$out" | grep -qF "$LIMPIO"'
 corre 'jqset .claude/settings.json "d[\"model\"]=\"opus\""' --quiet
 comprueba "--quiet con una violacion: su linea y el resumen, nada mas" \
   '[ "$rc" -eq 1 ] && [ "$(lineas)" -eq 2 ] && printf "%s\n" "$out" | head -1 | grep -q "^FAIL  \[user-keys\]" && printf "%s\n" "$out" | tail -1 | grep -qF "context-budget: 1 violacion(es), 0 aviso(s)"'
 corre 'jqset .claude/settings.json "d[\"model\"]=\"opus\""' --quiet --mode warn
 comprueba "--quiet con un aviso: WARN y el resumen" \
   '[ "$rc" -eq 0 ] && [ "$(lineas)" -eq 2 ] && printf "%s\n" "$out" | head -1 | grep -q "^WARN  \[user-keys\]"'
-corre 'grande CLAUDE.md 4000' --quiet --labels presupuesto-contexto-aprobado
+corre 'rellena CLAUDE.md 4000' --quiet --labels presupuesto-contexto-aprobado
 comprueba "--quiet con un exceso aprobado: APROB y el resumen" \
   '[ "$rc" -eq 0 ] && [ "$(lineas)" -eq 2 ] && printf "%s\n" "$out" | head -1 | grep -q "^APROB \[size\] CLAUDE.md"'
-corre 'grande CLAUDE.md 4000' --quiet
+corre 'rellena CLAUDE.md 4000' --quiet
 comprueba "--quiet con un exceso sin aprobar: FAIL, resumen y como se aprueba; ni OK ni --" \
   '[ "$rc" -eq 1 ] && [ "$(lineas)" -eq 3 ] && printf "%s\n" "$out" | grep -q "solo lo aprueba una persona" && ! printf "%s\n" "$out" | grep -qE "^(OK|--)"'
 corre 'echo "{ roto" > .github/context-budget.json' --quiet
@@ -478,7 +434,7 @@ confirma() { # confirma <exit-esperado> <etiqueta> <texto-o-vacio> <args de git 
 }
 g init -q && g config core.hooksPath .githooks && g add -A
 confirma 0 "el commit limpio entra sin imprimir nada" "" -m inicial
-grande "$R/CLAUDE.md" 4000
+rellena "$R/CLAUDE.md" 4000
 echo "otra linea" >> "$R/README.md"; g add README.md
 confirma 0 "un CLAUDE.md grande sin añadir no bloquea un commit que no lo toca" "" -m "toca el README"
 confirma 1 "commit -a se lleva el CLAUDE.md grande: se rechaza" "FAIL  [size] CLAUDE.md: 4.000 B" -a -m todo

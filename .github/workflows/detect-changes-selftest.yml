@@ -40,9 +40,8 @@ jobs:
       matrix:
         include:
           - name: documentation only
-            add: [README.md, docs/guide/shot.png, openspec/changes/demo/.openspec.yaml, openspec/specs/demo/spec.md,
-                  .claude/rules/demo.md, .claude/skills/demo/SKILL.md, .agents/skills/demo/SKILL.md,
-                  .cursor/rules/demo.mdc, .cursor/rules/team/style.mdc]
+            add: [README.md, docs/guide/shot.png, .claude/rules/demo.md, .claude/skills/demo/SKILL.md,
+                  .agents/skills/demo/SKILL.md, .cursor/rules/demo.mdc, .cursor/rules/team/style.mdc]
             delete: [LICENSE]
             filters: ""
             functional: "false"
@@ -97,12 +96,6 @@ jobs:
             filters: ""
             functional: "true"
             docs: "true"
-          - name: OpenSpec configuration
-            add: [openspec/config.yaml]
-            delete: []
-            filters: ""
-            functional: "true"
-            docs: "false"
           - name: a deleted script
             add: []
             delete: [bootstrap.sh]

@@ -73,8 +73,9 @@ RULES = [
                          "**/.yarnrc", "**/.yarnrc.yml", "**/pnpm-workspace.yaml"], [],
      "where dependencies come from and how they install"),
     (3, "license", ["LICENSE", "LICENSE.*", "LICENSE-*", "COPYING"], [], "the licence"),
-    (2, "contract", ["**/CLAUDE.md", "**/AGENTS.md", "openspec/specs/**", "openspec/project.md"], [],
-     "a contract or an architectural spec"),
+    # openspec/project.md: some repos still keep the guard's `parte:` money-alarm config there
+    (2, "contract", ["**/CLAUDE.md", "**/AGENTS.md", "openspec/project.md"], [],
+     "a contract, or config the guard reads"),
     (2, "infra", ["infra/**"], [], "infrastructure (spend: the lens decides)"),
     (2, "agent-cabling", [".claude/**", "plugins/*/skills/**", "plugins/*/agents/**",
                           "plugins/*/commands/**", "plugins/*/output-styles/**",
@@ -423,9 +424,6 @@ def classify(facts, policy, cfg):
                     else:
                         hit(1, "tests-changed", "existing tests edited or removed (a red can turn green)", name)
                         c = 1
-                elif name.startswith("openspec/changes/"):
-                    hit(0, "change-proposal", "a change proposal (not yet a spec)", name)
-                    c = 0
                 elif is_doc(name):
                     hit(0, "docs", "documentation", name)
                     c = 0

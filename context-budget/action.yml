@@ -3,7 +3,7 @@ description: >-
   Lo que Claude Code carga en cada sesion tiene presupuesto (CLAUDE.md, estilo, contrato,
   descripciones de skills y agentes, parrafos fechados) y la configuracion que decide que se
   carga resuelve a algo que existe (marketplace canonico con ref, outputStyle, claves personales,
-  model/effort de los agentes, pacto unico). La etiqueta de aprobacion deja pasar un exceso de
+  model/effort de los agentes). La etiqueta de aprobacion deja pasar un exceso de
   presupuesto; nunca un error de configuracion. Stack-agnostico: bash + python3, sin red.
 
 inputs:
