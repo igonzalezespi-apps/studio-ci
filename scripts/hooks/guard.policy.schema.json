@@ -62,7 +62,34 @@
     "set_phase_cmd": {
       "type": "string",
       "default": "",
-      "description": "How sdd-gate.sh names the sanctioned phase mutator in its deny messages. Absent → it names the core-dev plugin's scripts/opsx/set-phase.sh, which is the right answer for a repo on the plugin-only engine. Set it only where the repo still vendors its own mutator and the deny must point somewhere else."
+      "description": "Retired with the SDD phase gate (sdd-gate.sh), which left the canonical guard on 2026-11-07: nothing reads it. Still accepted so a policy that carries it validates; remove it from the policy."
+    },
+    "parte": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Config of parte-rules.sh, the pre-push notifier that flags the changes whose owner is a human (money, data model). Read from the merge-base, never from the working tree; a change to this value trips its own alarm. Absent → parte-rules.sh reads the legacy fenced `parte:` yaml block of openspec/project.md, and with neither it says the money rule did NOT run. Adopting it is a measurement over the repo's merged PRs, not a copy.",
+      "properties": {
+        "money_symbols": {
+          "type": "array",
+          "description": "Identifiers that move a balance, as regex alternatives. [] = measured as none: silent. Absent = nobody looked: the money rule does not run and says so.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "money_patterns": {
+          "type": "array",
+          "description": "Raw regex alternatives for a balance written without a function to name (e.g. 'balance: newValue'), kept verbatim.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "code_ext": {
+          "type": "array",
+          "description": "Production source extensions scanned by the money rule, without the dot. Absent → [\"ts\"]. Test files are derived, never configured.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "ddl_paths": {
+          "type": "array",
+          "description": "Regex alternatives for the data-model surface; REPLACES the default (migrations/, *.sql, schema.prisma).",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
     },
     "reserved_paths": {
       "type": "array",

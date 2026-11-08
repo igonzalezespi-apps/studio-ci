@@ -18,9 +18,9 @@
 #      is the only one that proves the guard FIRES, closing the fail-open blind
 #      spot the plugin cannot otherwise detect.
 #
-# Plus, ONLY when the repo has adopted the SDD phase gate (a vendored sdd-gate.sh
-# is present), a 4th check: sdd-gate PARITY + WIRING (its behaviour is covered by
-# the vendored sdd-gate.test.sh). Repos without the gate skip it silently.
+# A vendored sdd-gate.sh left over from before the SDD phase gate was retired
+# (2026-11-07, with OpenSpec) only draws a WARN: it is no longer canonical, so
+# there is nothing to compare it with.
 #
 # Usage: guard-parity.test.sh <path-to-canonical-bash-guard.sh> [<repo-root>]
 #   <canonical>  the core-dev copy (e.g. from the installed plugin cache).
@@ -130,63 +130,12 @@ if [ -f "$POLICY" ]; then
   fi
 fi
 
-# --- 4. SDD phase-gate: parity + wiring (only if the repo adopted it) -------
-# sdd-gate.sh is the portable half of the phase gate — it reads only branch+phase
-# from the state file, so it travels byte-for-byte like bash-guard. A repo that
-# vendored it must keep it identical to the core AND cabled, or the gate silently
-# stops governing. Skipped entirely for a repo that never adopted the gate.
-# Behaviour is covered by the vendored sdd-gate.test.sh; this is the integrity +
-# wiring smoke, matching what checks 1-2 do for bash-guard.
-SDD_VENDORED="$ROOT/scripts/hooks/sdd-gate.sh"
-SDD_CANON="$(dirname "$CANON")/sdd-gate.sh"
-if [ -f "$SDD_VENDORED" ]; then
-  if [ ! -f "$SDD_CANON" ]; then
-    echo "WARN  sdd-gate vendored but canonical not found next to $CANON — parity unchecked"
-  elif ! diff -q "$SDD_CANON" "$SDD_VENDORED" >/dev/null 2>&1; then
-    echo "FAIL  vendored sdd-gate.sh has diverged from the canonical core:"
-    diff "$SDD_CANON" "$SDD_VENDORED" | head -20
-    fail=$((fail + 1))
-  else
-    echo "OK    parity: vendored sdd-gate == canonical"
-  fi
-
-  if [ ! -f "$SETTINGS" ]; then
-    echo "FAIL  no $SETTINGS (sdd-gate wiring uncheckable)"; fail=$((fail + 1))
-  elif ! node -e '
-    const fs = require("fs");
-    const s = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const pre = (s.hooks && s.hooks.PreToolUse) || [];
-    const groups = pre.filter(g =>
-      (g.hooks || []).some(h => typeof h.command === "string" && h.command.includes("sdd-gate.sh")));
-    // Where it judges Bash it must judge Monitor and PowerShell too: they run commands as well (#311).
-    const on = (tool) => groups.some(g => routes(g.matcher, tool));
-    process.exit(groups.length && (!on("Bash") || (on("Monitor") && on("PowerShell"))) ? 0 : 1);
-  '"$MATCHER_JS" "$SETTINGS" 2>/dev/null; then
-    echo "FAIL  sdd-gate.sh is vendored but not cabled as a PreToolUse hook in settings.json, or cabled for Bash without Monitor and PowerShell (re-run guard-sync.sh: it adds the missing ones)"
-    fail=$((fail + 1))
-  else
-    echo "OK    wiring: sdd-gate cabled as PreToolUse"
-  fi
-
-  # The suite's fixtures must be here too. sdd-gate.test.sh skips its
-  # fixture-driven cases with a plain `[ -f ... ]` guard, so a consumer missing
-  # them runs a SMALLER suite and still reports OK — the two cases lost are the
-  # ones taken from a real session transcript, which is exactly the evidence a
-  # consumer cannot reconstruct on its own. Silent shrinkage, green output.
-  SDD_FIX_CANON="$(dirname "$CANON")/fixtures"
-  if [ -d "$SDD_FIX_CANON" ]; then
-    missing=""
-    for f in "$SDD_FIX_CANON"/*.json; do
-      [ -e "$f" ] || continue
-      [ -f "$ROOT/scripts/hooks/fixtures/$(basename "$f")" ] || missing="$missing $(basename "$f")"
-    done
-    if [ -n "$missing" ]; then
-      echo "FAIL  sdd-gate is vendored but its test fixtures are not:$missing (re-run guard-sync.sh)"
-      fail=$((fail + 1))
-    else
-      echo "OK    fixtures: sdd-gate suite has its fixtures, full case count runs"
-    fi
-  fi
+# --- 4. A leftover of the retired SDD phase gate ---------------------------
+# sdd-gate.sh left the canonical set with OpenSpec. A copy still here is not
+# compared nor required to be cabled: it is named, so the repo removes it with
+# its PreToolUse hook. Not a failure: the guard itself is unaffected.
+if [ -f "$ROOT/scripts/hooks/sdd-gate.sh" ]; then
+  echo "WARN  scripts/hooks/sdd-gate.sh is a leftover of the retired SDD phase gate: remove it, its suite, scripts/hooks/fixtures/ and its PreToolUse hook"
 fi
 
 echo "----------------------------------------"
