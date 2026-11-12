@@ -11,14 +11,16 @@
 # scanned messages on the way out.
 #
 # Scans two surfaces of the outgoing commits: the files they change, and their messages.
-# The denylist is private (studio repo only; $STUDIO_ROOT, by default ~/projects/studio);
-# this is a no-op off-studio, e.g. on a fork.
+# The checker and its denylist live on the maintainer's machine, never here; see
+# private-refs-checker.sh for the lookup and when it fails closed (a fork stays a no-op).
 #
-# Enable per clone via bootstrap.sh (git config core.hooksPath .githooks).
+# Enable per clone: git config core.hooksPath .githooks
 set -eu
 
-GUARD="${STUDIO_ROOT:-$HOME/projects/studio}/security/check-private-refs.sh"
-[ -x "$GUARD" ] || exit 0
+# shellcheck source=private-refs-checker.sh
+. "$(dirname -- "$0")/private-refs-checker.sh"
+[ -n "$PRIVATE_REFS_CHECKER" ] || exit 0
+GUARD="$PRIVATE_REFS_CHECKER"
 
 git fetch origin main --quiet 2>/dev/null || true
 # No upstream yet (fresh repo / detached): nothing to compare against, so nothing to gate.

@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 
-# Claude Code: track .claude/settings.json only; keep per-machine / transient state out
-# (per-task git worktrees).
+# Claude Code: keep per-machine / transient state out (local settings, per-task git worktrees).
 .claude/settings.local.json
 .claude/worktrees/

@@ -1,24 +1,30 @@
 #!/usr/bin/env sh
-# Public repo — private-reference guard.
+# Public repo — commit-time gates on the staged files.
 #
-# Blocks any reference to a private project before it is committed. The denylist
-# is PRIVATE (it lives only in the maintainer's studio repo), so this guard is a
-# no-op off-studio — on a fork or any machine without that checkout ($STUDIO_ROOT,
-# by default ~/projects/studio) it exits 0 and lets the commit through. It carries
-# no private names itself.
+# 1. Secret scan (gitleaks, staged diff only). If the binary is absent, warn and go on: CI runs
+#    the same scan on every PR and push. A real detection always blocks.
+# 2. Private-reference check: blocks any reference to a private project before it is committed.
+#    The checker and its denylist live on the maintainer's machine, never here; see
+#    private-refs-checker.sh for the lookup and when it fails closed.
 #
-# Armed per clone by bootstrap.sh (`git config core.hooksPath .githooks`); run that after
-# cloning, or set it by hand if you skip the bootstrap.
+# Enable per clone: git config core.hooksPath .githooks
 set -eu
 
-GUARD="${STUDIO_ROOT:-$HOME/projects/studio}/security/check-private-refs.sh"
-if [ -x "$GUARD" ]; then
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --redact --no-banner || exit 1
+else
+  echo "pre-commit: gitleaks not installed; skipping local secret scan (CI enforces it)" >&2
+fi
+
+# shellcheck source=private-refs-checker.sh
+. "$(dirname -- "$0")/private-refs-checker.sh"
+
+if [ -n "$PRIVATE_REFS_CHECKER" ]; then
   STAGED=$(git diff --cached --name-only --diff-filter=ACM)
-  # Explicit if, not `[ -n ... ] && guard`: that one-liner was the LAST command of the
-  # script, so an empty STAGED (e.g. `git commit --allow-empty`) made the whole hook exit 1
-  # and abort a commit it had nothing to scan. Same latent bug already fixed in the sibling
-  # public repo's pre-push.
+  # Explicit if, not `[ -n ... ] && checker`: as the last command of the script, that one-liner
+  # made an empty STAGED (e.g. `git commit --allow-empty`) abort a commit it had nothing to scan.
   if [ -n "$STAGED" ]; then
-    "$GUARD" $STAGED
+    # shellcheck disable=SC2086 # deliberate word splitting: one path per argument
+    "$PRIVATE_REFS_CHECKER" $STAGED
   fi
 fi
