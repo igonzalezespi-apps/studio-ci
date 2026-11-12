@@ -20,7 +20,7 @@ fi
 . "$(dirname -- "$0")/private-refs-checker.sh"
 
 if [ -n "$PRIVATE_REFS_CHECKER" ]; then
-  STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+  STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
   # Explicit if, not `[ -n ... ] && checker`: as the last command of the script, that one-liner
   # made an empty STAGED (e.g. `git commit --allow-empty`) abort a commit it had nothing to scan.
   if [ -n "$STAGED" ]; then

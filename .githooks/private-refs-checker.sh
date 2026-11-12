@@ -23,7 +23,7 @@ done
 if [ -z "$PRIVATE_REFS_CHECKER" ]; then
   _origin=$(git remote get-url origin 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
   case "$_origin" in
-    *github.com[:/]igonzalezespi-apps/*)
+    *[:/]igonzalezespi-apps/*)
       echo "private-refs: checker not found, refusing to continue (fail closed)." >&2
       echo "  Looked for /opt/claude-gestionado/guarda/check-private-refs.sh" >&2
       echo "  and \$HOME/projects/studio/security/check-private-refs.sh." >&2

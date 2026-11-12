@@ -29,7 +29,7 @@ git rev-parse --verify --quiet origin/main >/dev/null 2>&1 || exit 0
 RANGE="origin/main..HEAD"
 
 # 1. Files touched by the outgoing commits.
-CHANGED=$(git diff --name-only --diff-filter=ACM "origin/main...HEAD" 2>/dev/null || true)
+CHANGED=$(git diff --name-only --diff-filter=ACMR "origin/main...HEAD" 2>/dev/null || true)
 if [ -n "$CHANGED" ]; then
   # shellcheck disable=SC2086 # deliberate word splitting: one path per argument
   "$GUARD" $CHANGED
