@@ -7,6 +7,10 @@
 # Solo en las PRs que tocan esos ficheros, y el heartbeat sin ping (`ping: false`): una PR no marca
 # casillas en el dashboard; el ping es cosa de la ejecucion programada de cada consumidor.
 #
+# Sin autotest de merge-when-green.yml ni de develop-health.yml: en modo selftest leen la politica
+# de la guarda de la rama por defecto de este repo, y este repo ya no la tiene; sus suites locales
+# (`*.test.sh`) y el job `hosted-image-expression` siguen cubriendolos.
+#
 # Sin `concurrency` a proposito: el reutilizable trae el suyo, y `caller-guard` rechazaria uno aqui
 # en cuanto este workflow escuchara eventos de etiqueta.
 name: reusables-selftest
@@ -19,10 +23,6 @@ on:
       - .github/workflows/reusables-selftest.yml
       - .github/workflows/merge-when-green.yml
       - .github/workflows/develop-health.yml
-      - risk-class/**
-      - merge-when-green/**
-      - develop-health/**
-      - revert-merge/**
 
 permissions:
   contents: read
@@ -39,43 +39,10 @@ jobs:
     with:
       ping: false
 
-  # Autonomous merging, DRY and with no write at all (`selftest: true`): proves in GitHub what the
-  # local suites cannot — the code checked out at `job.workflow_sha`, the sparse read of this repo's
-  # default branch, the real API answers for this very PR and for `develop`. The calling jobs grant
-  # write scopes only because a called job may not ask for more than its caller; in self-test
-  # nothing is written (no comment, no label, no merge job: `live` is never true on a PR).
-  merge-when-green:
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-      actions: read
-      checks: read
-      statuses: read
-    uses: ./.github/workflows/merge-when-green.yml
-    with:
-      selftest: true
-      mode: dry
-      pr: "${{ github.event.pull_request.number }}"
-      comment: false
-
-  develop-health:
-    permissions:
-      contents: read
-      actions: write
-      issues: write
-      pull-requests: write
-      checks: read
-      statuses: read
-    uses: ./.github/workflows/develop-health.yml
-    with:
-      selftest: true
-      mode: dry
-
-  # The hosted-image test in the `if:` of the plan and assess jobs above only runs in a private
-  # repository, so GitHub never evaluates it here. This job has GitHub's own evaluator compute the
-  # same expression over the runner values that matter (a label, a JSON list, capitals, an own label
-  # that merely contains a hosted prefix). merge-autonomo.test.sh checks that it is the same
+  # The hosted-image test in the `if:` of the plan job of merge-when-green.yml and the assess job
+  # of develop-health.yml only runs in a private repository, so GitHub never evaluates it here. This
+  # job has GitHub's own evaluator compute the same expression over the runner values that matter (a
+  # label, a JSON list, capitals, an own label that merely contains a hosted prefix). merge-autonomo.test.sh checks that it is the same
   # expression as in both workflows, with `inputs.runs-on` read from the matrix.
   hosted-image-expression:
     name: hosted image? ${{ matrix.label }}

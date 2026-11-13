@@ -1,0 +1,80 @@
+name: hygiene
+
+# Repo-hygiene checks that run on EVERY pull request and every push to the long-lived branches,
+# whatever the PR touches: a secret scan over the whole history, a size cap on CLAUDE.md and the
+# pin audit of this repo's own workflows. Public repo, so GitHub-hosted runners only.
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+# Same rule as ci.yml: only a run that a NEW commit made stale is cancelled (`opened`/`synchronize`
+# of a PR share a group); any other event and every push get a group of their own.
+# `concurrency.test.sh` evaluates these expressions event by event.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && contains(fromJSON('["opened","synchronize"]'), github.event.action) }}
+
+jobs:
+  gitleaks:
+    name: secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history so gitleaks scans every commit
+          persist-credentials: false
+
+      # The binary, not gitleaks/gitleaks-action: the action requires a paid licence for repos
+      # owned by an organization. Version pinned AND the tarball checked against the sha256 from
+      # the project's published checksums file, so a swapped release asset cannot run here.
+      - name: Scan for secrets (gitleaks, pinned binary)
+        env:
+          GITLEAKS_VERSION: 8.24.3
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+        run: |
+          set -euo pipefail
+          TARBALL="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$TARBALL" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${TARBALL}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/${TARBALL}" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" gitleaks
+          # --redact so a finding never prints the secret itself into a public log.
+          "$RUNNER_TEMP/gitleaks" detect --source . --redact --verbose --no-banner
+
+  claude-md-size:
+    name: CLAUDE.md size cap
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Target is 3 KB; CI fails above 6 KB so the file cannot quietly grow back.
+      - name: CLAUDE.md is at most 6144 bytes
+        run: |
+          echo "CLAUDE.md: $(wc -c < CLAUDE.md) bytes (cap 6144)"
+          test "$(wc -c < CLAUDE.md)" -le 6144
+
+  action-pins:
+    name: action pins
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Every third-party action pinned by full SHA with its exact tag as a comment (not a
+      # floating alias like `# v7`). Exit 0 clean, 1 a violation, 2 could not measure: only 0
+      # passes.
+      - name: No action pinned to a floating alias
+        uses: igonzalezespi-apps/studio-ci/check-action-pins@9868e6ce3f6c67c3a2923bef5ce603cf17bfd032 # v0.12.0
+        with:
+          github-token: ${{ github.token }}

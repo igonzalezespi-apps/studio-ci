@@ -104,7 +104,7 @@ jobs:
             docs: "false"
           - name: a deleted script
             add: []
-            delete: [bootstrap.sh]
+            delete: [.githooks/pre-push]
             filters: ""
             functional: "true"
             docs: "false"
